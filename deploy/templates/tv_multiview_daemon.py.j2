@@ -1,0 +1,62 @@
+"""
+Managed by Ansible — edits here will be overwritten on next playbook run.
+
+Holds one persistent bscpylgtv connection to the TV, subscribes to live
+multiViewStatus changes (so it stays correct whether side-by-side was
+entered from a script or the physical remote), and exposes a tiny HTTP
+API for lan-mouse's enter_hook on any of the three machines to call.
+
+First run will trigger a one-time pairing prompt on the TV itself —
+that has to be accepted by hand, Ansible can't do it.
+"""
+import asyncio
+from aiohttp import web
+from bscpylgtv import WebOsClient
+from bscpylgtv import endpoints as ep
+
+TV_IP = "{{ tv_ip }}"
+INPUTS = {
+{%- for name, hdmi in tv_inputs.items() %}
+    "{{ name }}": "{{ hdmi }}",
+{%- endfor %}
+}
+
+state = {"mode": "fullscreen"}  # "fullscreen" | "sxs"
+
+
+async def on_multiview_change(payload):
+    status = payload.get("settings", {}).get("multiViewStatus")
+    if status is not None:
+        state["mode"] = "sxs" if status == "on" else "fullscreen"
+        print(f"TV mode -> {state['mode']}", flush=True)
+
+
+async def enter(request):
+    target = request.match_info["target"]
+    if target in INPUTS and state["mode"] == "fullscreen":
+        await request.app["client"].set_input(INPUTS[target])
+    return web.Response(text=state["mode"])
+
+
+async def main():
+    client = await WebOsClient.create(TV_IP, ping_interval=None, states=[])
+    await client.connect()
+    await client.subscribe(
+        on_multiview_change,
+        ep.GET_SYSTEM_SETTINGS,
+        payload={"category": "option", "keys": ["multiViewStatus"]},
+    )
+
+    app = web.Application()
+    app["client"] = client
+    app.router.add_get("/enter/{target}", enter)
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+    await web.TCPSite(runner, "0.0.0.0", {{ daemon_port }}).start()
+    print(f"tv-multiview daemon listening on :{{ daemon_port }}", flush=True)
+    await asyncio.Event().wait()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

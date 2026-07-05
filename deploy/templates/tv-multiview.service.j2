@@ -1,0 +1,12 @@
+[Unit]
+Description=TV multiview-aware HDMI input switch daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart={{ ansible_env.HOME }}/.local/share/tv-multiview/venv/bin/python3 {{ ansible_env.HOME }}/.local/share/tv-multiview/tv_multiview_daemon.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

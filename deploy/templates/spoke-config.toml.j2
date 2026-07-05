@@ -1,0 +1,11 @@
+# Managed by Ansible — edits here will be overwritten on next playbook run.
+# This machine never owns input, only receives it. enter_hook fires when
+# the cursor returns to Linux, and has to reach the daemon over LAN since
+# the TV connection lives on {{ linux_hostname }}, not here.
+
+[[clients]]
+hostname = "{{ linux_hostname }}"
+ips = [ "{{ linux_ip }}" ]
+position = "left"
+activate_on_startup = true
+enter_hook = "curl -s http://{{ linux_ip }}:{{ daemon_port }}/enter/linux"

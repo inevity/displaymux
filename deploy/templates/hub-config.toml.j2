@@ -1,0 +1,18 @@
+# Managed by Ansible — edits here will be overwritten on next playbook run.
+# This is the hub: Linux always owns the physical mouse/keyboard.
+# enter_hook calls the tv-multiview daemon on localhost, which only touches
+# the TV's input if it isn't currently in side-by-side mode.
+
+[[clients]]
+hostname = "{{ mac_hostname }}"
+ips = [ "{{ mac_ip }}" ]
+position = "right"
+activate_on_startup = true
+enter_hook = "curl -s http://localhost:{{ daemon_port }}/enter/mac"
+
+[[clients]]
+hostname = "{{ windows_hostname }}"
+ips = [ "{{ windows_ip }}" ]
+position = "left"
+activate_on_startup = true
+enter_hook = "curl -s http://localhost:{{ daemon_port }}/enter/windows"
