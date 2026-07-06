@@ -56,13 +56,25 @@
         chdir: "{{ ansible_env.HOME }}/.cache/lan-mouse-pkgbuild"
       changed_when: true
 
-    - name: Install python for tv-multiview daemon
-      become: true
-      community.general.pacman:
-        name:
-          - python
-          - python-pip
-        state: present
+    - name: Ensure ~/.local/bin exists
+      ansible.builtin.file:
+        path: "{{ ansible_env.HOME }}/.local/bin"
+        state: directory
+        mode: "0755"
+
+    - name: Build tv-multiview (Rust daemon)
+      ansible.builtin.command:
+        cmd: cargo build --release
+        chdir: "{{ playbook_dir }}/../tv-multiview"
+      register: tv_multiview_build
+      changed_when: true
+
+    - name: Install tv-multiview binary
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/../tv-multiview/target/release/tv-multiview"
+        dest: "{{ ansible_env.HOME }}/.local/bin/tv-multiview"
+        mode: "0755"
+        remote_src: false
 
     - name: Ensure lingering is enabled (so user services survive without an active login)
       become: true
@@ -97,31 +109,13 @@
         lan_mouse_binary: "/usr/bin/lan-mouse"
       register: lm_service_template
 
-    - name: Ensure tv-multiview install dir exists
-      ansible.builtin.file:
-        path: "{{ ansible_env.HOME }}/.local/share/tv-multiview"
-        state: directory
-        mode: "0755"
-
-    - name: Install aiohttp into LG_Buddy's venv (bscpylgtv already there)
-      become: true
-      ansible.builtin.pip:
-        name: aiohttp
-        virtualenv: /usr/bin/LG_Buddy_PIP
-        state: present
-
-    - name: Deploy tv-multiview daemon script
-      ansible.builtin.template:
-        src: templates/tv_multiview_daemon.py.j2
-        dest: "{{ ansible_env.HOME }}/.local/share/tv-multiview/tv_multiview_daemon.py"
-        mode: "0644"
-      register: daemon_script_template
-
     - name: Deploy tv-multiview systemd user unit
       ansible.builtin.template:
         src: templates/tv-multiview.service.j2
         dest: "{{ ansible_env.HOME }}/.config/systemd/user/tv-multiview.service"
         mode: "0644"
+      vars:
+        tv_multiview_binary: "{{ ansible_env.HOME }}/.local/bin/tv-multiview"
       register: daemon_service_template
 
     - name: Reload systemd user daemon and restart services (only if something changed)
@@ -129,7 +123,7 @@
         pkgbuild_template.changed
         or hub_config_template.changed
         or lm_service_template.changed
-        or daemon_script_template.changed
+        or tv_multiview_build.changed
         or daemon_service_template.changed
       block:
         - name: Reload systemd user daemon

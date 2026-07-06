@@ -2,59 +2,365 @@
 Managed by Ansible — edits here will be overwritten on next playbook run.
 
 Holds one persistent bscpylgtv connection to the TV, subscribes to live
-multiViewStatus changes (so it stays correct whether side-by-side was
-entered from a script or the physical remote), and exposes a tiny HTTP
-API for lan-mouse's enter_hook on any of the three machines to call.
+multiViewStatus changes, and exposes an HTTP API for lan-mouse's enter_hook
+plus multiView toggle (side-by-side / PIP).
 
 First run will trigger a one-time pairing prompt on the TV itself —
-that has to be accepted by hand, Ansible can't do it.
+accept it on the TV. The key file is shared with LG_Buddy at
+~/.config/lg-buddy/.aiopylgtv.sqlite (via WorkingDirectory in the
+systemd unit).
 """
 import asyncio
+import json
+import os
+import signal
+import sys
+import time
 from aiohttp import web
 from bscpylgtv import WebOsClient
 from bscpylgtv import endpoints as ep
 
 TV_IP = "{{ tv_ip }}"
+DAEMON_PORT = {{ daemon_port }}
 INPUTS = {
 {%- for name, hdmi in tv_inputs.items() %}
     "{{ name }}": "{{ hdmi }}",
 {%- endfor %}
 }
 
-state = {"mode": "fullscreen"}  # "fullscreen" | "sxs"
+# ---- TLA+ State Variables ----
+# | TLA+          | Python         |
+# | tv_mode       | _tv_mode       |
+# | tv_input      | _tv_input      |
+# | daemon_healthy| _healthy       |
+# | pending_switch| _pending       |
+# | reconnect_cnt | _reconnect_cnt |
+
+_tv_mode = "unknown"       # "fullscreen" | "multiview" | "unknown"
+_tv_input = "unknown"      # "linux" | "mac" | "windows" | "unknown"
+_healthy = False
+_pending = None            # None | "linux" | "mac" | "windows" | "multiview_on"
+_reconnect_total = 0
+_switch_count = {"linux": 0, "mac": 0, "windows": 0}
+_last_error = None
+_start_time = time.time()
 
 
+def log_event(event, **kwargs):
+    """Structured JSON logging per Phase 3/O3.1."""
+    record = {"ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+              "event": event}
+    record.update(kwargs)
+    print(json.dumps(record), flush=True)
+
+
+# ---- Transition: on_multiview_change (TvRemoteOverride) ----
 async def on_multiview_change(payload):
+    """Subscribe callback. TV remote changed multiView mode."""
+    global _tv_mode, _pending
     status = payload.get("settings", {}).get("multiViewStatus")
-    if status is not None:
-        state["mode"] = "sxs" if status == "on" else "fullscreen"
-        print(f"TV mode -> {state['mode']}", flush=True)
+    if status is None:
+        return
+    new_mode = "multiview" if status == "on" else "fullscreen"
+    if _tv_mode != new_mode:
+        log_event("mode_change", from_=_tv_mode, to=new_mode, source="subscribe")
+        _tv_mode = new_mode
+        _pending = None  # C4 fix: TvRemoteOverride clears pending_switch
 
 
+# ---- HTTP: /enter/{target} (EnterOtherHost, EnterMultiViewHost, ReturnToLinux) ----
 async def enter(request):
+    """lan-mouse enter_hook handler."""
+    global _tv_input, _tv_mode, _pending, _switch_count
+
     target = request.match_info["target"]
-    if target in INPUTS and state["mode"] == "fullscreen":
-        await request.app["client"].set_input(INPUTS[target])
-    return web.Response(text=state["mode"])
+    if target not in INPUTS:
+        return web.Response(text="unknown target", status=400)
+
+    # P0.4: Return 503 when daemon is dead
+    if not _healthy:
+        return web.Response(text="tv disconnected", status=503)
+
+    client = request.app.get("client")
+    if client is None:
+        return web.Response(text="tv disconnected", status=503)
+
+    # P0.3 / C6: pending_switch gate (debounce)
+    if _pending is not None:
+        log_event("enter", target=target, mode=_tv_mode, action="skip",
+                  reason="pending_switch", pending=_pending)
+        return web.Response(text=_tv_mode)
+
+    # C6: no-op if already on target input
+    if _tv_mode == "fullscreen" and target == _tv_input:
+        log_event("enter", target=target, mode=_tv_mode, action="noop")
+        return web.Response(text="fullscreen")
+
+    # EnterMultiViewHost: cursor moves between remote hosts in multiView
+    if _tv_mode == "multiview":
+        log_event("enter", target=target, mode=_tv_mode, action="skip",
+                  reason="multiview_active")
+        return web.Response(text="multiview")
+
+    # ReturnToLinux: cursor returns to linux
+    if target == "linux":
+        # C1 fix: route through transitioning with pending_switch
+        _pending = "linux"
+        _tv_input = "linux"
+        log_event("enter", target=target, mode=_tv_mode,
+                  action="switch", input=INPUTS["linux"])
+        _switch_count["linux"] += 1
+        try:
+            await asyncio.wait_for(
+                client.set_input(INPUTS["linux"]), timeout=10
+            )
+        except Exception as e:
+            log_event("switch_failed", target=target, error=str(e))
+            _last_error = str(e)
+            _pending = None
+            return web.Response(text=f"error: {e}", status=502)
+        _tv_mode = "fullscreen"
+        _pending = None
+        log_event("switch_complete", mode="fullscreen", input="linux")
+        return web.Response(text="fullscreen")
+
+    # EnterOtherHost: switch to remote host (mac or windows)
+    _pending = target
+    _tv_input = target
+    _tv_mode = "transitioning"
+    log_event("enter", target=target, mode="fullscreen",
+              action="switch", input=INPUTS[target])
+    _switch_count[target] += 1
+    try:
+        await asyncio.wait_for(
+            client.set_input(INPUTS[target]), timeout=10
+        )
+    except Exception as e:
+        log_event("switch_failed", target=target, error=str(e))
+        _last_error = str(e)
+        _pending = None
+        _tv_mode = "fullscreen"
+        _tv_input = "unknown"
+        return web.Response(text=f"error: {e}", status=502)
+    # SwitchComplete
+    _tv_mode = "fullscreen"
+    _pending = None
+    log_event("switch_complete", mode="fullscreen", input=target)
+    return web.Response(text="fullscreen")
 
 
+# ---- HTTP: /multiview/on (EnterMultiView) ----
+async def multiview_on(request):
+    """Enable multiView (side-by-side or PIP). Atomic SSAP call."""
+    global _tv_mode, _pending, _last_error
+
+    if not _healthy:
+        return web.Response(text="tv disconnected", status=503)
+
+    client = request.app.get("client")
+    if client is None:
+        return web.Response(text="tv disconnected", status=503)
+
+    if _pending is not None:
+        return web.Response(text=_tv_mode)
+
+    if _tv_mode == "multiview":
+        return web.Response(text="multiview")
+
+    # C1 fix: atomic toggle, no transitioning
+    _pending = "multiview_on"
+    log_event("multiview", action="on")
+    try:
+        await asyncio.wait_for(
+            client.set_system_settings(
+                "commercial", {"splitscreenEnable": "on"}
+            ), timeout=10
+        )
+    except Exception as e:
+        log_event("multiview_failed", action="on", error=str(e))
+        _last_error = str(e)
+        _pending = None
+        return web.Response(text=f"error: {e}", status=502)
+    # The subscribe callback (on_multiview_change) will set _tv_mode.
+    # If it doesn't fire immediately, assume success.
+    if _tv_mode != "multiview":
+        _tv_mode = "multiview"
+    _pending = None
+    return web.Response(text=_tv_mode)
+
+
+# ---- HTTP: /multiview/off (ExitMultiView) ----
+async def multiview_off(request):
+    """Disable multiView, return to fullscreen. Atomic SSAP call."""
+    global _tv_mode, _pending, _last_error
+
+    if not _healthy:
+        return web.Response(text="tv disconnected", status=503)
+
+    client = request.app.get("client")
+    if client is None:
+        return web.Response(text="tv disconnected", status=503)
+
+    if _pending is not None:
+        return web.Response(text=_tv_mode)
+
+    if _tv_mode == "fullscreen":
+        return web.Response(text="fullscreen")
+
+    # C1 fix: atomic toggle, no transitioning
+    _pending = "multiview_off"
+    log_event("multiview", action="off")
+    try:
+        await asyncio.wait_for(
+            client.set_system_settings(
+                "commercial", {"splitscreenEnable": "off"}
+            ), timeout=10
+        )
+    except Exception as e:
+        log_event("multiview_failed", action="off", error=str(e))
+        _last_error = str(e)
+        _pending = None
+        return web.Response(text=f"error: {e}", status=502)
+    _tv_mode = "fullscreen"
+    _pending = None
+    return web.Response(text=_tv_mode)
+
+
+# ---- HTTP: /status (Observability) ----
+async def status(request):
+    """Return full daemon state as JSON."""
+    return web.json_response({
+        "mode": _tv_mode,
+        "input": _tv_input,
+        "healthy": _healthy,
+        "pending_switch": _pending,
+        "uptime_seconds": int(time.time() - _start_time),
+        "reconnect_total": _reconnect_total,
+        "switch_count": _switch_count,
+        "last_error": _last_error,
+    })
+
+
+# ---- HTTP: /health (Liveness probe) ----
+async def health(request):
+    """Always 200 if process is alive."""
+    return web.Response(text="ok")
+
+
+# ---- Connection lifecycle (DaemonDies, ReconnectFails, DaemonReconnects) ----
+async def connect_tv():
+    """Connect to TV with exponential backoff."""
+    delay = 1
+    while True:
+        try:
+            client = await WebOsClient.create(
+                TV_IP, ping_interval=5, states=[]
+            )
+            await client.connect()
+            return client
+        except Exception as e:
+            log_event("connect_failed", error=str(e), retry_in=delay)
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, 60)
+
+
+async def maintain_connection(app):
+    """Keep WebOS connection alive. Implements full health lifecycle."""
+    global _healthy, _tv_mode, _tv_input, _pending, _reconnect_total, _last_error
+
+    while True:
+        try:
+            # Connect (exponential backoff)
+            client = await connect_tv()
+            _healthy = True
+            _pending = None  # C2: clear pending on reconnect
+            _reconnect_total = 0
+            app["client"] = client
+            log_event("connected", ip=TV_IP)
+
+            # Subscribe to multiViewStatus (TvRemoteOverride source)
+            await client.subscribe(
+                on_multiview_change,
+                ep.GET_SYSTEM_SETTINGS,
+                payload={"category": "option", "keys": ["multiViewStatus"]},
+            )
+            log_event("subscribed", topic="multiViewStatus")
+
+            # Heartbeat loop: detect silent disconnects
+            while True:
+                await asyncio.sleep(30)
+                try:
+                    await asyncio.wait_for(
+                        client.get_current_sw_info(), timeout=10
+                    )
+                except Exception:
+                    log_event("heartbeat_failed")
+                    break
+
+        except Exception as e:
+            log_event("disconnect", reason=str(e))
+            _last_error = str(e)
+
+        # DaemonDies: clear state
+        _healthy = False
+        _pending = None
+        _tv_mode = "unknown"
+        _tv_input = "unknown"
+        app["client"] = None
+        _reconnect_total += 1
+        log_event("disconnected", reconnect_total=_reconnect_total)
+
+        # ReconnectFails loop with 5s delay
+        await asyncio.sleep(5)
+
+
+# ---- Signal handling ----
+def setup_signal_handlers():
+    """SIGTERM → graceful shutdown. SIGUSR1 → dump state to stderr."""
+    loop = asyncio.get_event_loop()
+
+    def handle_sigterm():
+        log_event("shutdown", reason="SIGTERM")
+        loop.stop()
+
+    def handle_sigusr1():
+        import pprint
+        state = {
+            "tv_mode": _tv_mode, "tv_input": _tv_input,
+            "healthy": _healthy, "pending_switch": _pending,
+            "reconnect_total": _reconnect_total,
+            "switch_count": _switch_count, "last_error": _last_error,
+        }
+        pprint.pprint(state, stream=sys.stderr)
+
+    loop.add_signal_handler(signal.SIGTERM, handle_sigterm)
+    try:
+        loop.add_signal_handler(signal.SIGUSR1, handle_sigusr1)
+    except (NotImplementedError, AttributeError):
+        pass  # SIGUSR1 not available on all platforms
+
+
+# ---- Main ----
 async def main():
-    client = await WebOsClient.create(TV_IP, ping_interval=None, states=[])
-    await client.connect()
-    await client.subscribe(
-        on_multiview_change,
-        ep.GET_SYSTEM_SETTINGS,
-        payload={"category": "option", "keys": ["multiViewStatus"]},
-    )
+    setup_signal_handlers()
 
     app = web.Application()
-    app["client"] = client
+    app["client"] = None
     app.router.add_get("/enter/{target}", enter)
+    app.router.add_get("/multiview/on", multiview_on)
+    app.router.add_get("/multiview/off", multiview_off)
+    app.router.add_get("/status", status)
+    app.router.add_get("/health", health)
+
+    # Start connection maintainer as background task
+    asyncio.create_task(maintain_connection(app))
 
     runner = web.AppRunner(app)
     await runner.setup()
-    await web.TCPSite(runner, "0.0.0.0", {{ daemon_port }}).start()
-    print(f"tv-multiview daemon listening on :{{ daemon_port }}", flush=True)
+    await web.TCPSite(runner, "0.0.0.0", DAEMON_PORT).start()
+    log_event("startup", port=DAEMON_PORT, ip=TV_IP)
+
+    # Run until SIGTERM
     await asyncio.Event().wait()
 
 
