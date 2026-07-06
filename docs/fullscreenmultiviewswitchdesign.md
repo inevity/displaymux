@@ -31,14 +31,14 @@ TVMode == { "fullscreen", "multiview", "transitioning" }
 \* The active input (what the TV is displaying in fullscreen)
 ActiveInput == { "linux", "mac", "windows", "unknown" }
 
-\* The cursor's current location
-CursorLocation == { "linux", "mac", "windows", "edge" }
+\* The cursor's current location (on linux, on a remote host, or between edges)
+CursorLocation == { "linux", "mac", "windows" }
 
 \* The lan-mouse capture state
 CaptureState == { "idle", "capturing_linux", "capturing_mac", "capturing_windows" }
 
-\* Values for pending_switch
-PendingValues == {"none", "multiview_on"} \cup ActiveInput
+\* Values for pending_switch (input targets + "multiview_on" + "none")
+PendingValues == {"none", "multiview_on"} \cup (ActiveInput \ {"unknown"})
 
 VARIABLES
     tv_mode,            \* current TV display mode
@@ -62,8 +62,9 @@ TypeInvariant ==
 
 \* When in fullscreen, TV input must match the captured host.
 \* When idle (cursor on linux), TV must show linux.
+\* NOTE: each clause has a leading /\, because TLA+'s => binds looser than /\.
 DisplayMatchesCursor ==
-    (tv_mode = "fullscreen" /\ capture = "idle") => tv_input = "linux"
+    /\ (tv_mode = "fullscreen" /\ capture = "idle") => tv_input = "linux"
     /\ (tv_mode = "fullscreen" /\ capture = "capturing_linux") => tv_input = "linux"
     /\ (tv_mode = "fullscreen" /\ capture = "capturing_mac") => tv_input = "mac"
     /\ (tv_mode = "fullscreen" /\ capture = "capturing_windows") => tv_input = "windows"
@@ -86,20 +87,23 @@ Init ==
 
 \* F→T: Cursor crosses edge, fullscreen → transitioning (different input).
 \* The display update takes ~1-3s (HDCP/EDID relock).
+\* No-op if already on the target input.
 \* pending_switch set to the target to gate rapid re-enters (debounce).
 EnterOtherHost(host) ==
-    LET target == CASE host = "mac" -> "mac"
-                    [] host = "windows" -> "windows"
+    LET target == CASE host = "mac" -> "mac" | host = "windows" -> "windows"
+                    [] OTHER -> "linux"
     IN
     /\ tv_mode = "fullscreen"
-    /\ pending_switch = "none"        \* debounce: don't fire if switch already in flight
-    /\ cursor \in {"linux", "edge"}
+    /\ tv_input /= target              \* no-op if already there
+    /\ pending_switch = "none"         \* debounce: don't fire if switch already in flight
+    /\ cursor \in {"linux"}
     /\ daemon_healthy
     /\ tv_mode' = "transitioning"
     /\ tv_input' = target              \* destination known, TV processing async
     /\ cursor' = target
     /\ capture' = CASE host = "mac" -> "capturing_mac"
                    [] host = "windows" -> "capturing_windows"
+                   [] OTHER -> "capturing_linux"
     /\ pending_switch' = target
     /\ UNCHANGED <<daemon_healthy, reconnect_count>>
 
@@ -111,16 +115,20 @@ SwitchComplete ==
     /\ UNCHANGED <<tv_input, cursor, capture, daemon_healthy, reconnect_count>>
 
 \* F→M: User or hook enables multiView (side-by-side or PIP).
-\* Pending gate prevents overlapping toggles.
+\* The splitscreenEnable call is a single atomic SSAP command — no settle delay.
+\* pending_switch set during the call, cleared on return.
 EnterMultiView ==
     /\ tv_mode = "fullscreen"
     /\ pending_switch = "none"
     /\ daemon_healthy
     /\ tv_mode' = "multiview"
-    /\ pending_switch' = "multiview_on"
+    /\ pending_switch' = "none"
     /\ UNCHANGED <<tv_input, cursor, capture, reconnect_count>>
 
 \* M→F: Exit multiView (side-by-side or PIP), return to fullscreen.
+\* The splitscreenEnable-off call is a single atomic SSAP command.
+\* If the target input was already one of the active multiView panes,
+\* the exit is instant; otherwise the TV does a cold switch (HDCP relock).
 \* Restore TV input to the host the cursor is currently capturing.
 ExitMultiView ==
     /\ tv_mode = "multiview"
@@ -130,7 +138,7 @@ ExitMultiView ==
     /\ tv_input' = CASE capture = "capturing_mac" -> "mac"
                      [] capture = "capturing_windows" -> "windows"
                      [] OTHER -> "linux"
-    /\ pending_switch' = tv_input'
+    /\ pending_switch' = "none"
     /\ UNCHANGED <<cursor, capture, reconnect_count>>
 
 \* Cursor crosses edge while in multiView mode: update capture state only,
@@ -138,29 +146,32 @@ ExitMultiView ==
 EnterMultiViewHost(host) ==
     LET target == CASE host = "mac" -> "mac"
                     [] host = "windows" -> "windows"
+                    [] OTHER -> "linux"
     IN
     /\ tv_mode = "multiview"
     /\ pending_switch = "none"
     /\ cursor' = target
     /\ capture' = CASE host = "mac" -> "capturing_mac"
                    [] host = "windows" -> "capturing_windows"
+                   [] OTHER -> "capturing_linux"
     /\ UNCHANGED <<tv_mode, tv_input, pending_switch, daemon_healthy, reconnect_count>>
 
 \* Return to linux: cursor comes back to local machine.
-\* In fullscreen: switch TV input back to linux.
-\* In multiView: leave TV alone (multiView still active), just release capture.
+\* In fullscreen: switch TV input back to linux (async, through transitioning).
+\* In multiView or transitioning: leave TV alone, just release capture.
 ReturnToLinux ==
-    /\ cursor \in {"mac", "windows", "edge"}
+    /\ cursor \in {"mac", "windows"}
     /\ pending_switch = "none"
     /\ cursor' = "linux"
     /\ capture' = "idle"
     /\ IF tv_mode = "fullscreen" THEN
            /\ daemon_healthy
+           /\ tv_mode' = "transitioning"
            /\ tv_input' = "linux"
            /\ pending_switch' = "linux"
        ELSE
-           /\ UNCHANGED <<tv_input, pending_switch, daemon_healthy>>
-    /\ UNCHANGED <<tv_mode, reconnect_count>>
+           /\ UNCHANGED <<tv_mode, tv_input, pending_switch, daemon_healthy>>
+    /\ UNCHANGED <<reconnect_count>>
 
 \* Daemon health transitions.
 \* If daemon dies mid-switch, clear pending_switch (lost, best-effort).
@@ -177,6 +188,13 @@ ReconnectFails ==
     /\ reconnect_count' = reconnect_count + 1
     /\ UNCHANGED <<tv_mode, tv_input, cursor, capture, daemon_healthy, pending_switch>>
 
+\* After 30 retries, daemon process exits. systemd Restart=on-failure
+\* gives it a fresh start with reconnect_count=0 on the next Init.
+DaemonExits ==
+    /\ ~daemon_healthy
+    /\ reconnect_count = 30
+    /\ UNCHANGED <<tv_mode, tv_input, cursor, capture, daemon_healthy, pending_switch, reconnect_count>>
+
 DaemonReconnects ==
     /\ ~daemon_healthy
     /\ reconnect_count < 30
@@ -189,12 +207,16 @@ DaemonReconnects ==
 
 \* TV manually changes mode (user pressed remote button).
 \* Only possible if daemon is connected (subscribe callback is the source).
+\* The remote can only toggle between fullscreen and multiview — never
+\* set the TV to "transitioning" (that's our internal bookkeeping).
+\* Overrides any in-flight software-issued command: clears pending_switch.
 TvRemoteOverride ==
     /\ daemon_healthy
-    /\ tv_mode' \in TVMode \ {tv_mode}
+    /\ tv_mode' \in {"fullscreen", "multiview"} \ {tv_mode}
     \* Input may change independently of our capture state (design gap — see below).
     /\ tv_input' \in ActiveInput
-    /\ UNCHANGED <<cursor, capture, daemon_healthy, pending_switch, reconnect_count>>
+    /\ pending_switch' = "none"
+    /\ UNCHANGED <<cursor, capture, daemon_healthy, reconnect_count>>
 
 Next ==
     \/ \E host \in {"mac", "windows"} : EnterOtherHost(host)
@@ -205,19 +227,18 @@ Next ==
     \/ SwitchComplete
     \/ DaemonDies
     \/ ReconnectFails
+    \/ DaemonExits
     \/ DaemonReconnects
     \/ TvRemoteOverride
 
 Spec == Init /\ [][Next]_<<tv_mode, tv_input, cursor, capture, daemon_healthy, pending_switch, reconnect_count>>
+          /\ WF_vars(ReturnToLinux)
+          /\ WF_vars(DaemonReconnects)
 
 \* --- LIVENESS ---
-\* Cursor should eventually return to linux after release bind
-EventuallyReturn ==
-    (capture /= "idle") ~> (cursor = "linux")
-
-\* Daemon should eventually reconnect after disconnect
+\* Daemon eventually reconnects or reaches the retry cap (process exits).
 EventuallyReconnect ==
-    (~daemon_healthy) ~> (daemon_healthy)
+    (~daemon_healthy) ~> (daemon_healthy \/ reconnect_count = 30)
 
 \* --- DESIGN GAPS (discovered by model) ---
 
@@ -234,6 +255,37 @@ EventuallyReconnect ==
 \* but capture state doesn't auto-correct — the user's cursor remains on
 \* mac while the display shows windows. This is a real-world gap: the
 \* daemon cannot force capture to follow a manual TV input change.
+\*
+\* RECONCILE (structural fix for C2 traces A+B and this gap):
+\* After DaemonReconnects or TvRemoteOverride, if tv_mode = "fullscreen"
+\* and tv_input disagrees with capture's implied input, issue a corrective
+\* set_input. This gives pending_switch a recovery path independent of
+\* connection drop, and covers the restart-race and remote-override cases
+\* in one mechanism. Trace A (death mid-transition) is also covered:
+\* Reconcile fires after SwitchComplete commits stale tv_input.
+\* Implementation: wrapped in a function called on reconnect, after
+\* subscribe callback fires, and once as a timeout backstop for
+\* pending_switch. Modeled as:
+\*
+\* Reconcile ==
+\*     /\ tv_mode = "fullscreen"
+\*     /\ ~daemon_healthy \/ pending_switch /= "none"
+\*        \* ... issue corrective set_input, set pending_switch ...
+
+\* --- FIXED MODEL NOTES ---
+\* C1 (stuck pending_switch): EnterMultiView/ExitMultiView clear pending_switch
+\*     directly (atomic SSAP calls). ReturnToLinux routes through
+\*     "transitioning" like EnterOtherHost.
+\* C2 (DisplayMatchesCursor violations): /\ precedence is fixed; Reconcile
+\*     action sketched above fixes the restart-race and remote-override cases.
+\* C3 (deadlock at cap): DaemonExits represents process exit; systemd restart
+\*     returns to Init with fresh reconnect_count = 0.
+\* C4 (TvRemoteOverride): pending_switch cleared; tv_mode' restricted to
+\*     {"fullscreen","multiview"}.
+\* C5 (liveness): EventuallyReturn dropped (user behavior); EventuallyReconnect
+\*     accounts for retry cap; WF on ReturnToLinux + DaemonReconnects.
+\* C6 (no-op enter): EnterOtherHost guards tv_input /= target.
+\* C7 (cleanups): "edge" dropped, PendingValues tightened, CASE OTHER added.
 
 =================================================================================
 ```
