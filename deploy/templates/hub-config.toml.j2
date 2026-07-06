@@ -3,16 +3,30 @@
 # enter_hook calls the tv-multiview daemon on localhost, which only touches
 # the TV's input if it isn't currently in side-by-side mode.
 
+# configure release bind
+release_bind = [ "KeyA", "KeyS", "KeyD", "KeyF" ]
+
+# optional port (defaults to 4242)
+port = 4242
+
+# list of authorized tls certificate fingerprints that
+# are accepted for incoming traffic
+[authorized_fingerprints]
+#"<REDACTED_HISTORICAL_FINGERPRINT>" = "iridium"
+"<REDACTED_HISTORICAL_FINGERPRINT>" = "{{ mac_hostname}}"
+"<REDACTED_HISTORICAL_FINGERPRINT>" = "{{ windows_hostname}}"
+
+
 [[clients]]
 hostname = "{{ mac_hostname }}"
-ips = [ "{{ mac_ip }}" ]
+ips = [ "{{ hostvars[mac_hostname].ansible_host }}" ]
 position = "right"
 activate_on_startup = true
 enter_hook = "curl -s http://localhost:{{ daemon_port }}/enter/mac"
 
 [[clients]]
 hostname = "{{ windows_hostname }}"
-ips = [ "{{ windows_ip }}" ]
+ips = [ "{{ hostvars[windows_hostname].ansible_host }}" ]
 position = "left"
 activate_on_startup = true
 enter_hook = "curl -s http://localhost:{{ daemon_port }}/enter/windows"
