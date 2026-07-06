@@ -8,8 +8,6 @@
 #
 # Control-node prerequisites (not handled by this playbook):
 #   ansible-galaxy collection install ansible.windows community.general
-#   pip install pywinrm --break-system-packages
-#   WinRM already enabled on the Windows host (see README.md)
 #
 # Manual steps after the first run (also not automatable):
 #   - Accept the TV's pairing prompt once, on the TV itself, when the
