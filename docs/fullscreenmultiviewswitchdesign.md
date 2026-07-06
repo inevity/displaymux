@@ -6,11 +6,10 @@
 ---- MODULE TvDisplaySwitch ----
 EXTENDS Naturals
 
-\* The TV display can be in one of three modes
-\* plus a disconnected/error state.
-TVMode == { "fullscreen", "side_by_side", "transitioning", "dead" }
+\* The TV display mode (what the panel is actually showing)
+TVMode == { "fullscreen", "side_by_side", "transitioning" }
 
-\* The active input (what the TV is showing in fullscreen)
+\* The active input (what the TV is displaying in fullscreen)
 ActiveInput == { "linux", "mac", "windows", "unknown" }
 
 \* The cursor's current location
@@ -19,24 +18,27 @@ CursorLocation == { "linux", "mac", "windows", "edge" }
 \* The lan-mouse capture state
 CaptureState == { "idle", "capturing_linux", "capturing_mac", "capturing_windows" }
 
+\* Values for pending_switch
+PendingValues == {"none", "sxs_on"} \cup ActiveInput
+
 VARIABLES
     tv_mode,            \* current TV display mode
     tv_input,           \* what the TV is currently displaying
     cursor,             \* where the cursor physically is
     capture,            \* lan-mouse capture state
     daemon_healthy,     \* is the daemon connection alive
-    pending_switch,     \* an input switch in flight
-    reconnect_count     \* count of reconnect attempts
+    pending_switch,     \* an input switch or SXS toggle in flight
+    reconnect_count     \* count of failed reconnect attempts
 
 \* --- INVARIANTS ---
 
-\* The TV must never be in an inconsistent state
 TypeInvariant ==
     /\ tv_mode \in TVMode
     /\ tv_input \in ActiveInput
     /\ cursor \in CursorLocation
     /\ capture \in CaptureState
     /\ daemon_healthy \in BOOLEAN
+    /\ pending_switch \in PendingValues
     /\ reconnect_count \in 0..30
 
 \* When in fullscreen, TV input must match the captured host
@@ -61,36 +63,49 @@ Init ==
 
 \* --- TRANSITIONS ---
 
-\* F1 → F2: Cursor crosses edge, fullscreen → fullscreen (different input)
+\* F→T: Cursor crosses edge, fullscreen → transitioning (different input).
+\* The display update takes ~1-3s (HDCP/EDID relock).
+\* pending_switch set to the target to gate rapid re-enters (debounce).
 EnterOtherHost(host) ==
     LET target == CASE host = "mac" -> "mac"
                     [] host = "windows" -> "windows"
     IN
     /\ tv_mode = "fullscreen"
+    /\ pending_switch = "none"        \* debounce: don't fire if switch already in flight
     /\ cursor \in {"linux", "edge"}
+    /\ daemon_healthy
+    /\ tv_mode' = "transitioning"
+    /\ tv_input' = target              \* destination known, TV processing async
     /\ cursor' = target
-    /\ tv_mode' = "fullscreen"
-    /\ tv_input' = target
     /\ capture' = CASE host = "mac" -> "capturing_mac"
                    [] host = "windows" -> "capturing_windows"
     /\ pending_switch' = target
-    /\ daemon_healthy' = daemon_healthy
-    /\ UNCHANGED reconnect_count
+    /\ UNCHANGED <<daemon_healthy, reconnect_count>>
 
-\* F → S: User or hook requests side-by-side mode
+\* T→F: Switch completes (TV displays the new input, HDCP settled).
+SwitchComplete ==
+    /\ tv_mode = "transitioning"
+    /\ tv_mode' = "fullscreen"
+    /\ pending_switch' = "none"
+    /\ UNCHANGED <<tv_input, cursor, capture, daemon_healthy, reconnect_count>>
+
+\* F→S: User or hook requests side-by-side mode.
+\* Pending gate prevents overlapping toggles.
 EnterSideBySide ==
     /\ tv_mode = "fullscreen"
+    /\ pending_switch = "none"
     /\ daemon_healthy
     /\ tv_mode' = "side_by_side"
     /\ pending_switch' = "sxs_on"
     /\ UNCHANGED <<tv_input, cursor, capture, reconnect_count>>
 
-\* S → F: Exit side-by-side, return to fullscreen (the host being captured)
+\* S→F: Exit side-by-side, return to fullscreen.
+\* Restore TV input to the host the cursor is currently capturing.
 ExitSideBySide ==
     /\ tv_mode = "side_by_side"
+    /\ pending_switch = "none"
     /\ daemon_healthy
     /\ tv_mode' = "fullscreen"
-    \* Restore TV input to the host the cursor is capturing
     /\ tv_input' = CASE capture = "capturing_mac" -> "mac"
                      [] capture = "capturing_windows" -> "windows"
                      [] OTHER -> "linux"
@@ -98,56 +113,65 @@ ExitSideBySide ==
     /\ UNCHANGED <<cursor, capture, reconnect_count>>
 
 \* Cursor crosses edge while in SXS mode: update capture state only,
-\* do NOT switch TV input (it's showing multiple sources)
+\* do NOT switch TV input (it's showing multiple sources).
 EnterSxsHost(host) ==
     LET target == CASE host = "mac" -> "mac"
                     [] host = "windows" -> "windows"
     IN
     /\ tv_mode = "side_by_side"
+    /\ pending_switch = "none"
     /\ cursor' = target
     /\ capture' = CASE host = "mac" -> "capturing_mac"
                    [] host = "windows" -> "capturing_windows"
     /\ UNCHANGED <<tv_mode, tv_input, pending_switch, daemon_healthy, reconnect_count>>
 
-\* Return to linux: cursor comes back to local machine
+\* Return to linux: cursor comes back to local machine.
+\* In fullscreen: switch TV input back to linux.
+\* In SXS: leave TV alone (SXS still active), just release capture.
 ReturnToLinux ==
     /\ cursor \in {"mac", "windows", "edge"}
+    /\ pending_switch = "none"
     /\ cursor' = "linux"
     /\ capture' = "idle"
     /\ IF tv_mode = "fullscreen" THEN
+           /\ daemon_healthy
            /\ tv_input' = "linux"
            /\ pending_switch' = "linux"
        ELSE
-           /\ UNCHANGED <<tv_input, pending_switch>>
-    /\ UNCHANGED <<tv_mode, daemon_healthy, reconnect_count>>
+           /\ UNCHANGED <<tv_input, pending_switch, daemon_healthy>>
+    /\ UNCHANGED <<tv_mode, reconnect_count>>
 
-\* Daemon health transitions
+\* Daemon health transitions.
+\* If daemon dies mid-switch, clear pending_switch (lost, best-effort).
 DaemonDies ==
     /\ daemon_healthy
     /\ daemon_healthy' = FALSE
+    /\ pending_switch' = "none"      \* invariant: NoPendingWhenDead
     /\ reconnect_count' = 0
-    /\ tv_mode' = tv_mode  \* stale state, but preserved
-    /\ UNCHANGED <<tv_input, cursor, capture, pending_switch>>
+    /\ UNCHANGED <<tv_mode, tv_input, cursor, capture>>
+
+ReconnectFails ==
+    /\ ~daemon_healthy
+    /\ reconnect_count < 30
+    /\ reconnect_count' = reconnect_count + 1
+    /\ UNCHANGED <<tv_mode, tv_input, cursor, capture, daemon_healthy, pending_switch>>
 
 DaemonReconnects ==
     /\ ~daemon_healthy
     /\ reconnect_count < 30
     /\ daemon_healthy' = TRUE
     /\ reconnect_count' = 0
-    \* Resync tv_mode from TV after reconnect
-    /\ UNCHANGED <<tv_input, cursor, capture, pending_switch>>
+    \* Can't know TV state during disconnect; resync from subscribe callback.
+    /\ tv_mode' \in {"fullscreen", "side_by_side"}
+    /\ tv_input' \in ActiveInput
+    /\ UNCHANGED <<cursor, capture, pending_switch>>
 
-\* Switch command completes
-SwitchComplete ==
-    /\ pending_switch /= "none"
-    /\ daemon_healthy
-    /\ pending_switch' = "none"
-    /\ UNCHANGED <<tv_mode, tv_input, cursor, capture, daemon_healthy, reconnect_count>>
-
-\* TV manually changes mode (user pressed remote button)
+\* TV manually changes mode (user pressed remote button).
+\* Only possible if daemon is connected (subscribe callback is the source).
 TvRemoteOverride ==
+    /\ daemon_healthy
     /\ tv_mode' \in TVMode \ {tv_mode}
-    \* Resync input from TV subscription
+    \* Input may change independently of our capture state (design gap — see below).
     /\ tv_input' \in ActiveInput
     /\ UNCHANGED <<cursor, capture, daemon_healthy, pending_switch, reconnect_count>>
 
@@ -157,25 +181,38 @@ Next ==
     \/ EnterSideBySide
     \/ ExitSideBySide
     \/ ReturnToLinux
-    \/ DaemonDies
-    \/ DaemonReconnects
     \/ SwitchComplete
+    \/ DaemonDies
+    \/ ReconnectFails
+    \/ DaemonReconnects
     \/ TvRemoteOverride
+
+Spec == Init /\ [][Next]_<<tv_mode, tv_input, cursor, capture, daemon_healthy, pending_switch, reconnect_count>>
 
 \* --- LIVENESS ---
 \* Cursor should eventually return to linux after release bind
 EventuallyReturn ==
     (capture /= "idle") ~> (cursor = "linux")
 
-\* Daemon should eventually reconnect
+\* Daemon should eventually reconnect after disconnect
 EventuallyReconnect ==
     (~daemon_healthy) ~> (daemon_healthy)
 
-\* --- DEADLOCK CHECK ---
-\* Is there a state where no transition is possible?
-\* Deadlock = ~ENABLED Next
-\* Running model checker would find: daemon dead + cursor on remote host = stuck
-\* Resolution: release bind always returns to linux, regardless of daemon state
+\* --- DESIGN GAPS (discovered by model) ---
+
+\* GAP 1 (SXS → return to linux): If SXS was entered manually via remote,
+\* returning to linux leaves TV in SXS mode. The user sees a split with
+\* linux present, which may be fine. If they want fullscreen, they must
+\* manually exit SXS or call /sxs/off.
+
+\* GAP 2 (remote input override): TvRemoteOverride allows tv_input' to
+\* be anything, even if it contradicts capture state (e.g., cursor on mac
+\* but remote switches TV to windows). DisplayMatchesCursor breaks.
+\* Resolution: the subscribe callback fires, daemon learns the new input,
+\* but capture state doesn't auto-correct — the user's cursor remains on
+\* mac while the display shows windows. This is a real-world gap: the
+\* daemon cannot force capture to follow a manual TV input change.
+
 =================================================================================
 ```
 
@@ -184,58 +221,63 @@ EventuallyReconnect ==
 ### Actors
 
 ```
-┌─────────────┐     enter_hook      ┌──────────────┐     set_system_settings    ┌──────┐
-│  lan-mouse  │ ──── curl ────────→ │ tv-multiview  │ ─── bscpylgtv/SSAP ────→ │  TV  │
-│   (hub)     │                     │   daemon      │                           │      │
+┌─────────────┐     enter_hook      ┌──────────────┐    bscpylgtv library     ┌──────┐
+│  lan-mouse  │ ──── curl ────────→ │ tv-multiview  │ ──── WebOS SSAP ──────→ │  TV  │
+│   (hub)     │                     │   daemon      │                          │      │
 └─────────────┘                     │  (Python)     │ ←── subscribe callback ── │      │
-                                    └──────────────┘                           └──────┘
+                                    └──────────────┘                          └──────┘
                                            │
-                                           │ HTTP API
+                                           │ HTTP API (aiohttp)
                                            ▼
                                     ┌──────────────┐
                                     │  External     │
                                     │  triggers     │
-                                    │ (sxs on/off)  │
+                                    │ (sxs toggle)  │
                                     └──────────────┘
+
+Note: LG_Buddy (Rust) also talks to the TV via the same bscpylgtv Python
+library — it spawns /usr/bin/LG_Buddy_PIP/bin/bscpylgtvcommand as a
+subprocess per command. Our daemon imports bscpylgtv as a library and
+maintains a persistent WebSocket. Both share the same .aiopylgtv.sqlite
+key file at ~/.config/lg-buddy/ (set via WorkingDirectory).
 ```
 
 ### API Endpoints
 
 | Method | Path | Purpose | Returns |
 |---|---|---|---|
-| GET | `/enter/{target}` | lan-mouse enter_hook. Switch to `target` input if fullscreen | TV mode string |
-| GET | `/sxs/on` | Force side-by-side mode on | TV mode string |
-| GET | `/sxs/off` | Force side-by-side mode off (fullscreen) | TV mode string |
-| GET | `/status` | Health + current state | JSON with mode, input, healthy, uptime |
+| GET | `/enter/{target}` | lan-mouse enter_hook. Switch to `target` if fullscreen and no pending switch | TV mode string |
+| GET | `/sxs/on` | Enable side-by-side (toggle on) | TV mode string |
+| GET | `/sxs/off` | Disable side-by-side (return to fullscreen) | TV mode string |
+| GET | `/status` | Health + current state | JSON |
 | GET | `/health` | Liveness probe (always 200 if process alive) | `"ok"` |
 
 ### State Machine (Daemon Internal)
 
 ```
                     ┌──────────────────────────────────┐
-                    │            DEAD                   │
+                    │            DISCONNECTED           │
                     │  daemon_healthy = false           │
-                    │  HTTP responds with 503           │
+                    │  HTTP: 503                        │
                     └──────┬──────────────┬────────────┘
                            │ reconnect    │ disconnect
                            ▼              ▼
               ┌─────────────────────────────────────────┐
-              │              ALIVE                       │
+              │              CONNECTED                   │
               │  ┌──────────┐   sxs/on    ┌───────────┐ │
               │  │FULLSCREEN│ ──────────→ │ SIDE_BY   │ │
               │  │          │ ←────────── │  _SIDE     │ │
-              │  │ switch   │  sxs/off    │  skip      │ │
-              │  │ on enter │             │  switch    │ │
+              │  │ enter→   │  sxs/off    │  enter→    │ │
+              │  │ TRANS.   │             │  capture   │ │
+              │  │  (async) │             │  only      │ │
               │  └──────────┘             └───────────┘ │
-              │       │  ▲                      │  ▲    │
-              │       ▼  │                      ▼  │    │
-              │  ┌──────────────┐    ┌────────────────┐ │
-              │  │TRANSITIONING │    │ SXS_TRANSITION │ │
-              │  │ set_input    │    │ splitscreenEn. │ │
-              │  │ pending      │    │ pending        │ │
-              │  └──────────────┘    └────────────────┘ │
               └─────────────────────────────────────────┘
 ```
+
+**Pending switch gating:** `pending_switch != "none"` blocks all new transitions
+that would produce a TV command. This provides natural debounce: a second
+rapid enter while a switch is in flight returns the current mode string
+without issuing a new command.
 
 ### Reliability Design
 
@@ -243,59 +285,60 @@ EventuallyReconnect ==
 
 ```python
 class TvDaemonState:
-    healthy: bool                    # daemon connected to TV
-    tv_mode: str                     # "fullscreen" | "sxs" | "unknown"
-    last_mode_change: float          # epoch timestamp
-    reconnect_count: int             # exponential backoff counter
-    pending_switch: Optional[str]    # in-flight input switch target
-    uptime: float                    # daemon process uptime
+    healthy: bool
+    tv_mode: str              # "fullscreen" | "sxs" | "unknown"
+    last_mode_change: float   # epoch
+    reconnect_count: int      # exponential backoff: 1,2,4,8,16,30,60s cap
+    pending_switch: Optional[str]  # in-flight command; blocks new commands
+    uptime: float
 ```
 
 **Connect flow:**
-1. Exponential backoff: 1s → 2s → 4s → 8s → 16s → 30s → 60s (cap)
-2. After 5 consecutive failures: log warning
-3. After 30 consecutive failures: log error, emit metric
-4. On reconnect: resubscribe to `multiViewStatus`, reconcile state
+1. Load existing key from `~/.config/lg-buddy/.aiopylgtv.sqlite`
+2. Exponential backoff: 1s → 2s → 4s → 8s → 16s → 30s → 60s (cap)
+3. On connect: resubscribe to `multiViewStatus`
+4. Max 30 retries (StartLimitBurst=10 per 60s in systemd)
 
 **Disconnect detection:**
 - `ping_interval=5` (WebSocket keepalive, 3 missed pings = disconnect)
-- 30s heartbeat: `get_current_sw_info()` as fallback liveness check
-- On disconnect detected: set `healthy=False`, all commands return 503
+- 30s heartbeat: `get_current_sw_info()` as fallback
+- On disconnect: `healthy=False`, `pending_switch="none"`, all commands return 503
 
-#### 2. Enter Hook Idempotency
+#### 2. Enter Hook Logic
 
 ```
-curl → /enter/mac:
-  1. If healthy=false → 503 "tv disconnected"
-  2. If mode=sxs → 200 "sxs" (skip switch, don't change TV)
-  3. If mode=fullscreen AND input already mac → 200 "fullscreen" (no-op)
-  4. If mode=fullscreen AND input != mac → set_input(HDMI_3) → 200 "fullscreen"
+curl → /enter/{target}:
+  1. If healthy=false → 503
+  2. If pending_switch != none → 200 current_mode  (debounce)
+  3. If mode=sxs → 200 "sxs"                       (skip, don't disturb SXS)
+  4. If mode=fullscreen AND input == target → 200 "fullscreen"  (no-op)
+  5. If mode=fullscreen AND input != target → set_input → 200 "fullscreen"
 ```
 
 #### 3. Observability
 
-**Structured logging (JSON lines to stdout):**
+**Structured JSON logging (stdout, one object per line):**
 ```json
-{"ts":"2026-07-07T12:00:00Z","event":"connect","tv_ip":"192.0.2.20","retry":0}
-{"ts":"2026-07-07T12:00:01Z","event":"connected","tv_ip":"192.0.2.20"}
-{"ts":"2026-07-07T12:00:05Z","event":"mode_change","from":"fullscreen","to":"sxs","source":"subscribe"}
-{"ts":"2026-07-07T12:00:10Z","event":"enter","target":"mac","mode":"sxs","action":"skip"}
-{"ts":"2026-07-07T12:00:15Z","event":"enter","target":"linux","mode":"fullscreen","action":"switch","input":"HDMI_4"}
-{"ts":"2026-07-07T12:01:00Z","event":"disconnect","reason":"ping_timeout","uptime":3600}
-{"ts":"2026-07-07T12:01:01Z","event":"reconnect","retry":1}
+{"ts":"...","event":"connect","ip":"192.0.2.20","retry":0}
+{"ts":"...","event":"connected"}
+{"ts":"...","event":"mode_change","from":"fullscreen","to":"sxs","source":"subscribe"}
+{"ts":"...","event":"enter","target":"mac","mode":"sxs","action":"skip"}
+{"ts":"...","event":"enter","target":"linux","mode":"fullscreen","action":"switch","input":"HDMI_4"}
+{"ts":"...","event":"disconnect","reason":"ping_timeout"}
+{"ts":"...","event":"reconnect_fail","retry":3}
 ```
 
-**Metrics (exposed via /status):**
+**`/status` response:**
 ```json
 {
   "mode": "fullscreen",
   "input": "linux",
   "healthy": true,
+  "pending_switch": null,
   "uptime_seconds": 3600,
-  "reconnect_count_total": 3,
+  "reconnect_total": 0,
   "switch_count": {"linux": 12, "mac": 8, "windows": 5},
-  "last_error": null,
-  "subscription_active": true
+  "last_error": null
 }
 ```
 
@@ -304,72 +347,41 @@ curl → /enter/mac:
 ```
 [Service]
 ExecStart=/usr/bin/LG_Buddy_PIP/bin/python3 .../tv_multiview_daemon.py
-WorkingDirectory=/usr/bin/LG_Buddy_PIP
+WorkingDirectory=$HOME/.config/lg-buddy
 Restart=on-failure
 RestartSec=5
-
-# Reliability tuning:
-StartLimitIntervalSec=60     # don't restart forever in 60s
-StartLimitBurst=10           # max 10 restarts in interval
+StartLimitIntervalSec=60
+StartLimitBurst=10
 ```
 
-**Signal handling:**
-- SIGTERM: call `client.disconnect()`, close HTTP server, exit 0
-- SIGUSR1: dump current state to stderr (debug trigger)
+Signal handling: SIGTERM → `client.disconnect()` → graceful shutdown. SIGUSR1 → dump state to stderr.
 
 #### 5. Edge Cases
 
 | Scenario | Behavior |
 |---|---|
-| TV off when daemon starts | Exponential backoff connect, HTTP returns 503 |
-| TV reboot during capture | Daemon detects disconnect, reconnects, resubscribes |
-| WiFi blip (silent disconnect) | 30s heartbeat detects, triggers reconnect |
-| User presses remote (sxs on) | `subscribe` callback fires, state updates, future enters skip |
-| User presses remote (sxs off → fullscreen) | Callback fires, state updates, next enter triggers input switch |
-| Two rapid enters (debounce) | Second enter sees `pending_switch != None`, skips (200 + mode) |
-| bscpylgtv library crash | Exception caught, daemon logs, systemd restarts |
-| TV IP changes | Daemon crashes, systemd restarts, fails to connect, admin intervention needed |
-| `splitscreenEnable` fails (unsupported firmware) | Log warning, return 500, degrade gracefully (only read `multiViewStatus`) |
+| TV off when daemon starts | Exponential backoff, HTTP returns 503 |
+| TV reboot during capture | Detect disconnect, reconnect, resubscribe |
+| WiFi blip (silent) | 30s heartbeat detects, triggers reconnect |
+| Remote: enter SXS | subscribe callback → `mode=sxs` → future enters skip |
+| Remote: exit SXS → fullscreen | Callback → `mode=fullscreen` → next enter switches |
+| Remote: switch to different input | subscribe callback learns new input; capture state unchanged → `DisplayMatchesCursor` gap |
+| Two rapid enters | Second sees `pending_switch != none` → debounce, returns current mode |
+| Return to linux while in SXS | TV stays in SXS (linux already shown); capture released |
+| `splitscreenEnable` fails | Log warning, return 500; read-only `multiViewStatus` still works |
+| bscpylgtv library crash | Exception caught, log, systemd restarts |
+| TV IP changes | Daemon crashes → systemd restarts → fails to connect → admin must update config |
 
-### Transition Completeness Verification
-
-```
-States: fullscreen(F), side_by_side(S), transitioning(T), dead(D)
-Valid transitions:
-  F→F: enter other host (same mode, different input)
-  F→T→F: enter other host, switch completes
-  F→S: sxs/on request or remote
-  F→D: daemon disconnect
-  S→F: sxs/off request or remote
-  S→S: enter other host (capture updates, no TV change)
-  S→D: daemon disconnect
-  D→F: daemon reconnect, resync from TV
-  D→S: daemon reconnect while TV is in SXS mode
-  T→F: switch completes
-  T→D: daemon dies mid-switch (pending_switch lost, best-effort)
-
-UNREACHABLE (by design):
-  S→T→S: no input switch path from SXS mode
-  D→T: daemon reconnects directly to stable state (F or S), never to transitioning
-
-MISSING (design gap):
-  No automatic SXS→F on return-to-linux when SXS was entered manually:
-    - User manually enters SXS via remote while cursor is on mac
-    - Cursor returns to linux
-    - TV stays in SXS mode (showing linux + mac)
-    - daemon's state says "sxs" but input should be linux fullscreen
-    - Resolution: return-to-linux always calls sxs/off to restore fullscreen
-```
-
-## Implementation Plan
+## Implementation Phases
 
 ### Phase 0: Fix Critical Defects (current daemon)
 
-| Task | Fix |
+| Task | Description |
 |---|---|
 | P0 | Add `ping_interval=5` to `WebOsClient.create()` |
 | P0 | Add 30s heartbeat + reconnect loop |
-| P0 | Add structured JSON logging |
+| P0 | Implement `pending_switch` gate (debounce rapid enters) |
+| P1 | Structured JSON logging |
 | P1 | Handle SIGTERM with `client.disconnect()` |
 | P1 | Return 503 when `healthy=false` |
 | P1 | Return 400 for invalid target |
@@ -378,65 +390,67 @@ MISSING (design gap):
 
 | Task | Description |
 |---|---|
-| S1 | Define `TvDaemonState` dataclass with all fields |
-| S2 | Implement `DaemonDies` / `DaemonReconnects` transitions |
-| S3 | Implement `EnterOtherHost` / `EnterSxsHost` transitions |
-| S4 | Implement debounce (skip if `pending_switch is not None`) |
+| S1 | `TvDaemonState` dataclass with all fields |
+| S2 | `DaemonDies` / `ReconnectFails` / `DaemonReconnects` transitions |
+| S3 | `EnterOtherHost` sets `transitioning` → `SwitchComplete` resolves to `fullscreen` |
+| S4 | `EnterSxsHost` (capture-only, no TV change) |
 
 ### Phase 2: SXS Control
 
 | Task | Description |
 |---|---|
-| X1 | Add `/sxs/on` endpoint → `set_system_settings("commercial", {"splitscreenEnable": "on"})` |
-| X2 | Add `/sxs/off` endpoint → `set_system_settings("commercial", {"splitscreenEnable": "off"})` |
-| X3 | Handle `splitscreenEnable` failure (unsupported firmware, log + degrade) |
+| X1 | `/sxs/on` endpoint → `set_system_settings("commercial", {"splitscreenEnable": "on"})` |
+| X2 | `/sxs/off` endpoint → `set_system_settings("commercial", {"splitscreenEnable": "off"})` |
+| X3 | **Verify** SXS toggle on live TV before committing to this category/method |
 
 ### Phase 3: Observability
 
 | Task | Description |
 |---|---|
-| O1 | Add `/status` endpoint (JSON metrics) |
-| O2 | Add `/health` endpoint (liveness probe) |
-| O3 | Structured JSON logging for all events |
+| O1 | `/status` endpoint (JSON metrics) |
+| O2 | `/health` endpoint (liveness probe) |
+| O3 | JSON-line structured logging |
 | O4 | systemd `StartLimitIntervalSec` + `StartLimitBurst` |
 
 ### Phase 4: Integration
 
 | Task | Description |
 |---|---|
-| I1 | Update ansible `tv-multiview.service.j2` with `StartLimitIntervalSec` |
-| I2 | Update ansible `tv_multiview_daemon.py.j2` with full implementation |
-| I3 | Update `enter_hook` in lan-mouse configs to use new endpoints |
-| I4 | Add optional sxs trigger to `enter_hook` (e.g., `/enter/mac?sxs=1`) |
+| I1 | Update `tv-multiview.service.j2` with `WorkingDirectory=~/.config/lg-buddy` + `StartLimit*` |
+| I2 | Update `tv_multiview_daemon.py.j2` with full implementation |
+| I3 | `/sxs/on` and `/sxs/off` are standalone endpoints — NOT embedded in `enter_hook` |
 
 ## Architecture Decision Records
 
-### ADR-001: Separate daemon, not embedded in lan-mouse
+### ADR-001: Separate daemon
 
-**Decision:** Run tv-multiview as a standalone HTTP daemon, independent of lan-mouse.
-
-**Rationale:**
-- lan-mouse `enter_hook` is synchronous (`sh -c "curl ..."`), no async integration point
-- TV state subscription needs a persistent WebSocket — lan-mouse is event-driven, not a daemon
-- HTTP API is the simplest integration surface: any `enter_hook` on any OS can `curl` it
-- Separate crash domain: daemon crash doesn't take down lan-mouse, systemd restarts the daemon
-
-### ADR-002: LG_Buddy's venv, not our own
-
-**Decision:** Use `/usr/bin/LG_Buddy_PIP` venv (shared with LG_Buddy), add only `aiohttp`.
+**Decision:** Run tv-multiview as a standalone HTTP daemon alongside lan-mouse.
 
 **Rationale:**
-- LG_Buddy already pairs with the TV — one pairing, one key file location
-- `bscpylgtv` already installed; only `aiohttp` is missing
-- Single update surface: upgrade LG_Buddy, run ansible to re-add `aiohttp`
-- `WorkingDirectory` ensures `.aiopylgtv.sqlite` lands next to LG_Buddy's key
+- lan-mouse `enter_hook` is synchronous (`sh -c "curl ..."`) — no async integration
+- TV subscription needs persistent WebSocket — lan-mouse is event-driven
+- HTTP API is universal: any OS, any enter_hook
+- Separate crash domain: daemon death doesn't crash lan-mouse
 
-### ADR-003: SXS is opt-in, not automatic
+### ADR-002: Shared LG_Buddy key file
 
-**Decision:** Side-by-side mode is NOT auto-triggered by cursor crossing. It's a separate API call.
+**Decision:** `WorkingDirectory={{ ansible_env.HOME }}/.config/lg-buddy` so bscpylgtv
+finds the existing `.aiopylgtv.sqlite` key file (same one LG_Buddy uses).
 
 **Rationale:**
-- `splitscreenEnable` toggles mode but can't select inputs — the input pair is manual
-- Auto-triggering SXS on enter would disrupt the user's manual SXS configuration
-- SXS mode is a user choice (remote), not a cursor-tracking side effect
-- If the user wants auto-SXS, they configure it once via remote, then use `/sxs/on` to toggle
+- LG_Buddy shells out to `/usr/bin/LG_Buddy_PIP/bin/bscpylgtvcommand` — same
+  bscpylgtv library, same key file format
+- Our daemon imports bscpylgtv as a library — same key file, same pairing
+- One TV pairing, one key file, shared between both processes
+- Python venv at `/usr/bin/LG_Buddy_PIP/` provides the interpreter + library
+
+### ADR-003: SXS toggle is standalone, not cursor-driven
+
+**Decision:** `/sxs/on` and `/sxs/off` are independent HTTP endpoints — NOT
+embedded in `enter_hook` parameters. SXS is toggled by explicit call, not
+by cursor crossing.
+
+**Rationale:**
+- `splitscreenEnable` only toggles mode on/off — cannot select which inputs
+- Users configure the input pair once via remote; toggle via API
+- Cursor movement should switch inputs in fullscreen, not trigger SXS

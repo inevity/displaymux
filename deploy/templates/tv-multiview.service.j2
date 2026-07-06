@@ -5,9 +5,11 @@ Wants=network-online.target
 
 [Service]
 ExecStart=/usr/bin/LG_Buddy_PIP/bin/python3 {{ ansible_env.HOME }}/.local/share/tv-multiview/tv_multiview_daemon.py
-WorkingDirectory=/usr/bin/LG_Buddy_PIP
+WorkingDirectory={{ ansible_env.HOME }}/.config/lg-buddy
 Restart=on-failure
 RestartSec=5
+StartLimitIntervalSec=60
+StartLimitBurst=10
 
 [Install]
 WantedBy=default.target
