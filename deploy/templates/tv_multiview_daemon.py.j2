@@ -21,40 +21,102 @@ INPUTS = {
 {%- endfor %}
 }
 
-state = {"mode": "fullscreen"}  # "fullscreen" | "sxs"
+_state = "fullscreen"  # "fullscreen" | "sxs"
+_lock = asyncio.Lock()
 
 
 async def on_multiview_change(payload):
+    global _state
     status = payload.get("settings", {}).get("multiViewStatus")
     if status is not None:
-        state["mode"] = "sxs" if status == "on" else "fullscreen"
-        print(f"TV mode -> {state['mode']}", flush=True)
+        _state = "sxs" if status == "on" else "fullscreen"
+        print(f"TV mode -> {_state}", flush=True)
 
 
 async def enter(request):
     target = request.match_info["target"]
-    if target in INPUTS and state["mode"] == "fullscreen":
-        await request.app["client"].set_input(INPUTS[target])
-    return web.Response(text=state["mode"])
+    if target not in INPUTS:
+        return web.Response(text="unknown target", status=400)
+
+    client = request.app.get("client")
+    if client is None:
+        return web.Response(text="tv disconnected", status=503)
+
+    async with _lock:
+        if _state == "fullscreen":
+            try:
+                await asyncio.wait_for(
+                    client.set_input(INPUTS[target]), timeout=10
+                )
+            except Exception as e:
+                print(f"set_input({target}) failed: {e}", flush=True)
+                return web.Response(text=f"error: {e}", status=502)
+    return web.Response(text=_state)
+
+
+async def connect_tv():
+    """Connect to TV with exponential backoff on startup."""
+    delay = 1
+    while True:
+        try:
+            client = await WebOsClient.create(
+                TV_IP, ping_interval=5, states=[]
+            )
+            await client.connect()
+            return client
+        except Exception as e:
+            print(f"TV connect failed ({e}), retrying in {delay}s...",
+                  flush=True)
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, 60)
+
+
+async def maintain_connection(app):
+    """Keep WebOS connection alive; reconnect on any failure."""
+    while True:
+        try:
+            client = await connect_tv()
+            app["client"] = client
+            print("TV connected", flush=True)
+
+            await client.subscribe(
+                on_multiview_change,
+                ep.GET_SYSTEM_SETTINGS,
+                payload={"category": "option", "keys": ["multiViewStatus"]},
+            )
+
+            # Heartbeat: call a cheap endpoint every 30s to detect
+            # silent disconnects that pings miss. If it fails, we
+            # break out and reconnect.
+            while True:
+                await asyncio.sleep(30)
+                try:
+                    await asyncio.wait_for(
+                        client.get_current_sw_info(), timeout=10
+                    )
+                except Exception:
+                    break
+
+        except Exception as e:
+            print(f"TV connection lost: {e}", flush=True)
+
+        app["client"] = None
+        print("TV disconnected, reconnecting in 5s...", flush=True)
+        await asyncio.sleep(5)
 
 
 async def main():
-    client = await WebOsClient.create(TV_IP, ping_interval=None, states=[])
-    await client.connect()
-    await client.subscribe(
-        on_multiview_change,
-        ep.GET_SYSTEM_SETTINGS,
-        payload={"category": "option", "keys": ["multiViewStatus"]},
-    )
-
     app = web.Application()
-    app["client"] = client
+    app["client"] = None
     app.router.add_get("/enter/{target}", enter)
+
+    asyncio.create_task(maintain_connection(app))
 
     runner = web.AppRunner(app)
     await runner.setup()
     await web.TCPSite(runner, "0.0.0.0", {{ daemon_port }}).start()
     print(f"tv-multiview daemon listening on :{{ daemon_port }}", flush=True)
+
     await asyncio.Event().wait()
 
 
