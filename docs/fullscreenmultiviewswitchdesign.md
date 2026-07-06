@@ -1,13 +1,32 @@
 # Fullscreen / MultiView Switch Design for lan-mouse
 
+## Scope and Terminology
+
+**multiView** is the umbrella term used throughout this document. It covers
+all WebOS split-layout modes: side-by-side (two panes, left/right),
+picture-in-picture (PIP, small overlay), and any future multiView layout the
+TV firmware supports.
+
+The LG WebOS API exposes a single boolean:
+`multiViewStatus: "on" | "off"`. There is no API distinction between
+side-by-side and PIP — they are the same state as far as programmatic
+control is concerned. The TV remembers which layout the user last selected
+via the remote and uses it whenever `splitscreenEnable` is toggled on.
+
+Implication: the daemon's behavior is identical whether the user chose
+side-by-side or PIP. When `multiViewStatus == "on"`, input switching is
+suppressed regardless of layout geometry.
+
 ## TLA+ State Model
 
 ```
 ---- MODULE TvDisplaySwitch ----
 EXTENDS Naturals
 
-\* The TV display mode (what the panel is actually showing)
-TVMode == { "fullscreen", "side_by_side", "transitioning" }
+\* The TV display mode (what the panel is actually showing).
+\* "multiview" covers both side-by-side and picture-in-picture —
+\* the TV API reports multiViewStatus: "on" for both.
+TVMode == { "fullscreen", "multiview", "transitioning" }
 
 \* The active input (what the TV is displaying in fullscreen)
 ActiveInput == { "linux", "mac", "windows", "unknown" }
@@ -19,7 +38,7 @@ CursorLocation == { "linux", "mac", "windows", "edge" }
 CaptureState == { "idle", "capturing_linux", "capturing_mac", "capturing_windows" }
 
 \* Values for pending_switch
-PendingValues == {"none", "sxs_on"} \cup ActiveInput
+PendingValues == {"none", "multiview_on"} \cup ActiveInput
 
 VARIABLES
     tv_mode,            \* current TV display mode
@@ -27,7 +46,7 @@ VARIABLES
     cursor,             \* where the cursor physically is
     capture,            \* lan-mouse capture state
     daemon_healthy,     \* is the daemon connection alive
-    pending_switch,     \* an input switch or SXS toggle in flight
+    pending_switch,     \* an input switch or multiView toggle in flight
     reconnect_count     \* count of failed reconnect attempts
 
 \* --- INVARIANTS ---
@@ -41,9 +60,11 @@ TypeInvariant ==
     /\ pending_switch \in PendingValues
     /\ reconnect_count \in 0..30
 
-\* When in fullscreen, TV input must match the captured host
+\* When in fullscreen, TV input must match the captured host.
+\* When idle (cursor on linux), TV must show linux.
 DisplayMatchesCursor ==
-    (tv_mode = "fullscreen" /\ capture = "capturing_linux") => tv_input = "linux"
+    (tv_mode = "fullscreen" /\ capture = "idle") => tv_input = "linux"
+    /\ (tv_mode = "fullscreen" /\ capture = "capturing_linux") => tv_input = "linux"
     /\ (tv_mode = "fullscreen" /\ capture = "capturing_mac") => tv_input = "mac"
     /\ (tv_mode = "fullscreen" /\ capture = "capturing_windows") => tv_input = "windows"
 
@@ -89,20 +110,20 @@ SwitchComplete ==
     /\ pending_switch' = "none"
     /\ UNCHANGED <<tv_input, cursor, capture, daemon_healthy, reconnect_count>>
 
-\* F→S: User or hook requests side-by-side mode.
+\* F→M: User or hook enables multiView (side-by-side or PIP).
 \* Pending gate prevents overlapping toggles.
-EnterSideBySide ==
+EnterMultiView ==
     /\ tv_mode = "fullscreen"
     /\ pending_switch = "none"
     /\ daemon_healthy
-    /\ tv_mode' = "side_by_side"
-    /\ pending_switch' = "sxs_on"
+    /\ tv_mode' = "multiview"
+    /\ pending_switch' = "multiview_on"
     /\ UNCHANGED <<tv_input, cursor, capture, reconnect_count>>
 
-\* S→F: Exit side-by-side, return to fullscreen.
+\* M→F: Exit multiView (side-by-side or PIP), return to fullscreen.
 \* Restore TV input to the host the cursor is currently capturing.
-ExitSideBySide ==
-    /\ tv_mode = "side_by_side"
+ExitMultiView ==
+    /\ tv_mode = "multiview"
     /\ pending_switch = "none"
     /\ daemon_healthy
     /\ tv_mode' = "fullscreen"
@@ -112,13 +133,13 @@ ExitSideBySide ==
     /\ pending_switch' = tv_input'
     /\ UNCHANGED <<cursor, capture, reconnect_count>>
 
-\* Cursor crosses edge while in SXS mode: update capture state only,
-\* do NOT switch TV input (it's showing multiple sources).
-EnterSxsHost(host) ==
+\* Cursor crosses edge while in multiView mode: update capture state only,
+\* do NOT switch TV input (it's showing multiple sources already).
+EnterMultiViewHost(host) ==
     LET target == CASE host = "mac" -> "mac"
                     [] host = "windows" -> "windows"
     IN
-    /\ tv_mode = "side_by_side"
+    /\ tv_mode = "multiview"
     /\ pending_switch = "none"
     /\ cursor' = target
     /\ capture' = CASE host = "mac" -> "capturing_mac"
@@ -127,7 +148,7 @@ EnterSxsHost(host) ==
 
 \* Return to linux: cursor comes back to local machine.
 \* In fullscreen: switch TV input back to linux.
-\* In SXS: leave TV alone (SXS still active), just release capture.
+\* In multiView: leave TV alone (multiView still active), just release capture.
 ReturnToLinux ==
     /\ cursor \in {"mac", "windows", "edge"}
     /\ pending_switch = "none"
@@ -162,7 +183,7 @@ DaemonReconnects ==
     /\ daemon_healthy' = TRUE
     /\ reconnect_count' = 0
     \* Can't know TV state during disconnect; resync from subscribe callback.
-    /\ tv_mode' \in {"fullscreen", "side_by_side"}
+    /\ tv_mode' \in {"fullscreen", "multiview"}
     /\ tv_input' \in ActiveInput
     /\ UNCHANGED <<cursor, capture, pending_switch>>
 
@@ -177,9 +198,9 @@ TvRemoteOverride ==
 
 Next ==
     \/ \E host \in {"mac", "windows"} : EnterOtherHost(host)
-    \/ \E host \in {"mac", "windows"} : EnterSxsHost(host)
-    \/ EnterSideBySide
-    \/ ExitSideBySide
+    \/ \E host \in {"mac", "windows"} : EnterMultiViewHost(host)
+    \/ EnterMultiView
+    \/ ExitMultiView
     \/ ReturnToLinux
     \/ SwitchComplete
     \/ DaemonDies
@@ -200,10 +221,11 @@ EventuallyReconnect ==
 
 \* --- DESIGN GAPS (discovered by model) ---
 
-\* GAP 1 (SXS → return to linux): If SXS was entered manually via remote,
-\* returning to linux leaves TV in SXS mode. The user sees a split with
-\* linux present, which may be fine. If they want fullscreen, they must
-\* manually exit SXS or call /sxs/off.
+\* GAP 1 (multiView → return to linux): If multiView (SXS or PIP) was
+\* entered manually via remote, returning to linux leaves TV in multiView
+\* mode. The user sees the multiView layout with linux already present,
+\* which may be acceptable. To return to fullscreen, the user must
+\* manually exit multiView via remote or call /multiview/off.
 
 \* GAP 2 (remote input override): TvRemoteOverride allows tv_input' to
 \* be anything, even if it contradicts capture state (e.g., cursor on mac
@@ -232,7 +254,8 @@ EventuallyReconnect ==
                                     ┌──────────────┐
                                     │  External     │
                                     │  triggers     │
-                                    │ (sxs toggle)  │
+                                    │ (multiView   │
+                                    │  toggle)     │
                                     └──────────────┘
 
 Note: LG_Buddy (Rust) also talks to the TV via the same bscpylgtv Python
@@ -247,8 +270,8 @@ key file at ~/.config/lg-buddy/ (set via WorkingDirectory).
 | Method | Path | Purpose | Returns |
 |---|---|---|---|
 | GET | `/enter/{target}` | lan-mouse enter_hook. Switch to `target` if fullscreen and no pending switch | TV mode string |
-| GET | `/sxs/on` | Enable side-by-side (toggle on) | TV mode string |
-| GET | `/sxs/off` | Disable side-by-side (return to fullscreen) | TV mode string |
+| GET | `/multiview/on` | Enable multiView via `splitscreenEnable` toggle (commercial category, pending live-TV verification — see Phase 2/X3) | TV mode string |
+| GET | `/multiview/off` | Disable multiView | TV mode string |
 | GET | `/status` | Health + current state | JSON |
 | GET | `/health` | Liveness probe (always 200 if process alive) | `"ok"` |
 
@@ -264,13 +287,13 @@ key file at ~/.config/lg-buddy/ (set via WorkingDirectory).
                            ▼              ▼
               ┌─────────────────────────────────────────┐
               │              CONNECTED                   │
-              │  ┌──────────┐   sxs/on    ┌───────────┐ │
-              │  │FULLSCREEN│ ──────────→ │ SIDE_BY   │ │
-              │  │          │ ←────────── │  _SIDE     │ │
-              │  │ enter→   │  sxs/off    │  enter→    │ │
-              │  │ TRANS.   │             │  capture   │ │
-              │  │  (async) │             │  only      │ │
-              │  └──────────┘             └───────────┘ │
+              │  ┌──────────┐   multiview   ┌──────────┐ │
+              │  │FULLSCREEN│ ── on ──────→ │MULTIVIEW │ │
+              │  │          │ ←── off ───── │(SXS/PIP) │ │
+              │  │ enter→   │              │ enter→    │ │
+              │  │ TRANS.   │              │ capture   │ │
+              │  │  (async) │              │ only      │ │
+              │  └──────────┘              └──────────┘ │
               └─────────────────────────────────────────┘
 ```
 
@@ -286,7 +309,7 @@ without issuing a new command.
 ```python
 class TvDaemonState:
     healthy: bool
-    tv_mode: str              # "fullscreen" | "sxs" | "unknown"
+    tv_mode: str              # "fullscreen" | "multiview" | "unknown"
     last_mode_change: float   # epoch
     reconnect_count: int      # exponential backoff: 1,2,4,8,16,30,60s cap
     pending_switch: Optional[str]  # in-flight command; blocks new commands
@@ -310,7 +333,7 @@ class TvDaemonState:
 curl → /enter/{target}:
   1. If healthy=false → 503
   2. If pending_switch != none → 200 current_mode  (debounce)
-  3. If mode=sxs → 200 "sxs"                       (skip, don't disturb SXS)
+  3. If mode=multiview → 200 "multiview"           (skip, don't disturb multiView)
   4. If mode=fullscreen AND input == target → 200 "fullscreen"  (no-op)
   5. If mode=fullscreen AND input != target → set_input → 200 "fullscreen"
 ```
@@ -321,8 +344,8 @@ curl → /enter/{target}:
 ```json
 {"ts":"...","event":"connect","ip":"192.0.2.20","retry":0}
 {"ts":"...","event":"connected"}
-{"ts":"...","event":"mode_change","from":"fullscreen","to":"sxs","source":"subscribe"}
-{"ts":"...","event":"enter","target":"mac","mode":"sxs","action":"skip"}
+{"ts":"...","event":"mode_change","from":"fullscreen","to":"multiview","source":"subscribe"}
+{"ts":"...","event":"enter","target":"mac","mode":"multiview","action":"skip"}
 {"ts":"...","event":"enter","target":"linux","mode":"fullscreen","action":"switch","input":"HDMI_4"}
 {"ts":"...","event":"disconnect","reason":"ping_timeout"}
 {"ts":"...","event":"reconnect_fail","retry":3}
@@ -363,11 +386,11 @@ Signal handling: SIGTERM → `client.disconnect()` → graceful shutdown. SIGUSR
 | TV off when daemon starts | Exponential backoff, HTTP returns 503 |
 | TV reboot during capture | Detect disconnect, reconnect, resubscribe |
 | WiFi blip (silent) | 30s heartbeat detects, triggers reconnect |
-| Remote: enter SXS | subscribe callback → `mode=sxs` → future enters skip |
-| Remote: exit SXS → fullscreen | Callback → `mode=fullscreen` → next enter switches |
+| Remote: enter multiView (SXS or PIP) | subscribe callback → `mode=multiview` → future enters skip |
+| Remote: exit multiView → fullscreen | Callback → `mode=fullscreen` → next enter switches |
 | Remote: switch to different input | subscribe callback learns new input; capture state unchanged → `DisplayMatchesCursor` gap |
 | Two rapid enters | Second sees `pending_switch != none` → debounce, returns current mode |
-| Return to linux while in SXS | TV stays in SXS (linux already shown); capture released |
+| Return to linux while multiView active | TV stays in multiView (linux already present); capture released |
 | `splitscreenEnable` fails | Log warning, return 500; read-only `multiViewStatus` still works |
 | bscpylgtv library crash | Exception caught, log, systemd restarts |
 | TV IP changes | Daemon crashes → systemd restarts → fails to connect → admin must update config |
@@ -393,15 +416,15 @@ Signal handling: SIGTERM → `client.disconnect()` → graceful shutdown. SIGUSR
 | S1 | `TvDaemonState` dataclass with all fields |
 | S2 | `DaemonDies` / `ReconnectFails` / `DaemonReconnects` transitions |
 | S3 | `EnterOtherHost` sets `transitioning` → `SwitchComplete` resolves to `fullscreen` |
-| S4 | `EnterSxsHost` (capture-only, no TV change) |
+| S4 | `EnterMultiViewHost` (capture-only, no TV change) |
 
-### Phase 2: SXS Control
+### Phase 2: MultiView Control (SXS and PIP)
 
 | Task | Description |
 |---|---|
-| X1 | `/sxs/on` endpoint → `set_system_settings("commercial", {"splitscreenEnable": "on"})` |
-| X2 | `/sxs/off` endpoint → `set_system_settings("commercial", {"splitscreenEnable": "off"})` |
-| X3 | **Verify** SXS toggle on live TV before committing to this category/method |
+| X1 | `/multiview/on` → `set_system_settings("commercial", {"splitscreenEnable": "on"})` (expected API, verify on live TV) |
+| X2 | `/multiview/off` → same toggle off |
+| X3 | **Verify** on live TV: confirm category, method, and that toggling works before committing |
 
 ### Phase 3: Observability
 
@@ -418,7 +441,7 @@ Signal handling: SIGTERM → `client.disconnect()` → graceful shutdown. SIGUSR
 |---|---|
 | I1 | Update `tv-multiview.service.j2` with `WorkingDirectory=~/.config/lg-buddy` + `StartLimit*` |
 | I2 | Update `tv_multiview_daemon.py.j2` with full implementation |
-| I3 | `/sxs/on` and `/sxs/off` are standalone endpoints — NOT embedded in `enter_hook` |
+| I3 | `/multiview/on` and `/multiview/off` are standalone — NOT embedded in `enter_hook` |
 
 ## Architecture Decision Records
 
@@ -444,13 +467,17 @@ finds the existing `.aiopylgtv.sqlite` key file (same one LG_Buddy uses).
 - One TV pairing, one key file, shared between both processes
 - Python venv at `/usr/bin/LG_Buddy_PIP/` provides the interpreter + library
 
-### ADR-003: SXS toggle is standalone, not cursor-driven
+### ADR-003: MultiView toggle is standalone, not cursor-driven
 
-**Decision:** `/sxs/on` and `/sxs/off` are independent HTTP endpoints — NOT
-embedded in `enter_hook` parameters. SXS is toggled by explicit call, not
-by cursor crossing.
+**Decision:** `/multiview/on` and `/multiview/off` are independent HTTP endpoints —
+NOT embedded in `enter_hook` parameters. MultiView mode is toggled by explicit
+call, not by cursor crossing.
 
 **Rationale:**
-- `splitscreenEnable` only toggles mode on/off — cannot select which inputs
-- Users configure the input pair once via remote; toggle via API
-- Cursor movement should switch inputs in fullscreen, not trigger SXS
+- `splitscreenEnable` (category `"commercial"`, per G4 firmware settings catalog snapshot —
+  pending live-TV verification) only toggles mode on/off — cannot select which inputs go
+  into multiView (side-by-side or PIP)
+- The user pre-configures the desired layout and input pair once via remote
+- Cursor movement should switch inputs in fullscreen, not trigger multiView
+- The API endpoint works identically regardless of whether the user chose
+  side-by-side or PIP — it's a single `multiViewStatus` toggle
