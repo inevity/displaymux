@@ -103,13 +103,12 @@
         state: directory
         mode: "0755"
 
-    - name: Create venv and install bscpylgtv + aiohttp into it
+    - name: Install aiohttp into LG_Buddy's venv (bscpylgtv already there)
+      become: true
       ansible.builtin.pip:
-        name:
-          - bscpylgtv
-          - aiohttp
-        virtualenv: "{{ ansible_env.HOME }}/.local/share/tv-multiview/venv"
-        virtualenv_command: python3 -m venv
+        name: aiohttp
+        virtualenv: /usr/bin/LG_Buddy_PIP
+        state: present
 
     - name: Deploy tv-multiview daemon script
       ansible.builtin.template:

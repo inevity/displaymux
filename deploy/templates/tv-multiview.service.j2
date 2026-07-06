@@ -4,7 +4,8 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
-ExecStart={{ ansible_env.HOME }}/.local/share/tv-multiview/venv/bin/python3 {{ ansible_env.HOME }}/.local/share/tv-multiview/tv_multiview_daemon.py
+ExecStart=/usr/bin/LG_Buddy_PIP/bin/python3 {{ ansible_env.HOME }}/.local/share/tv-multiview/tv_multiview_daemon.py
+WorkingDirectory=/usr/bin/LG_Buddy_PIP
 Restart=on-failure
 RestartSec=5
 
