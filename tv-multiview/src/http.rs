@@ -1,5 +1,4 @@
 // HTTP API: axum routes implementing the TLA+ state machine.
-use std::net::Ipv4Addr;
 use std::sync::Arc;
 
 use axum::{
@@ -15,15 +14,19 @@ use crate::state::{Input, TvDaemonState, TvMode};
 use crate::tv::TvClient;
 
 pub struct AppState {
-    pub daemon: TvDaemonState,
+    pub daemon: Arc<TvDaemonState>,
     pub tv_client: TvClient,
     pub hdmi_map: std::collections::HashMap<String, String>,
 }
 
-pub fn router(tv_ip: Ipv4Addr, hdmi_map: std::collections::HashMap<String, String>) -> Router {
+pub fn router(
+    daemon: Arc<TvDaemonState>,
+    tv_client: TvClient,
+    hdmi_map: std::collections::HashMap<String, String>,
+) -> Router {
     let state = Arc::new(AppState {
-        daemon: TvDaemonState::default(),
-        tv_client: TvClient::new(tv_ip),
+        daemon,
+        tv_client,
         hdmi_map,
     });
 

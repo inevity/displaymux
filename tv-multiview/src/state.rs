@@ -199,8 +199,8 @@ impl TvDaemonState {
     // --- DaemonReconnects ---
     pub fn mark_healthy(&self) {
         *self.healthy.lock().unwrap() = true;
-        *self.pending.lock().unwrap() = None; // C2: clear on reconnect
-        *self.tv_mode.lock().unwrap() = TvMode::Unknown; // will resync
+        *self.pending.lock().unwrap() = None;
+        *self.tv_mode.lock().unwrap() = TvMode::Fullscreen;
         *self.tv_input.lock().unwrap() = Input::Unknown;
         self.reconnect_count.store(0, Ordering::SeqCst);
     }

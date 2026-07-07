@@ -2,14 +2,19 @@
 # This machine never owns input, only receives it. enter_hook fires when
 # the cursor returns to Linux, and has to reach the daemon over the same
 # network lan-mouse uses for peer-to-peer communication. The TV connection
-# lives on {{ linux_hostname }}, not here.
+# lives on {{ groups['linux_desktop'][0] }}, not here.
 
 # optional port (defaults to 4242, explicit here for clarity)
 port = {{ lan_mouse_port }}
 
+# authorize the hub's certificate for incoming connections
+[authorized_fingerprints]
+"{{ hub_fingerprint }}" = "{{ groups['linux_desktop'][0] }}"
+
 [[clients]]
-hostname = "{{ linux_hostname }}"
-ips = [ "{{ hostvars[linux_hostname].ansible_host }}" ]
+hostname = "{{ groups['linux_desktop'][0] }}"
+ips = [ "{{ hostvars[groups['linux_desktop'][0]].ansible_host }}" ]
+port = {{ lan_mouse_port }}
 position = "{{ spoke_position }}"
 activate_on_startup = true
-enter_hook = "curl -s http://{{ hostvars[linux_hostname].ansible_host }}:{{ daemon_port }}/enter/linux"
+enter_hook = "curl -s http://{{ hostvars[groups['linux_desktop'][0]].ansible_host }}:{{ daemon_port }}/enter/linux"

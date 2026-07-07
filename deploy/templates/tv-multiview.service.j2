@@ -4,6 +4,7 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
+Environment=RUST_LOG=tv_multiview={{ tv_multiview_log_level }}
 ExecStart={{ tv_multiview_binary }}
 Restart=on-failure
 RestartSec=5

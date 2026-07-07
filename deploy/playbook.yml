@@ -23,17 +23,12 @@
       become: true
       community.general.pacman:
         name:
-          - rustup
           - cmake
           - pkgconf
           - git
           - libx11
           - libxtst
         state: present
-
-    - name: Ensure stable toolchain is installed
-      ansible.builtin.command: "rustup default stable"
-      changed_when: false
 
     - name: Ensure build directory exists
       ansible.builtin.file:
@@ -48,13 +43,39 @@
         mode: "0644"
       register: pkgbuild_template
 
-    - name: Build and install lan-mouse-git (only if PKGBUILD changed)
-      when: pkgbuild_template.changed
-      become: true
-      ansible.builtin.command:
-        cmd: makepkg -si --noconfirm
-        chdir: "{{ ansible_env.HOME }}/.cache/lan-mouse-pkgbuild"
-      changed_when: true
+    - name: Check installed lan-mouse tag
+      ansible.builtin.stat:
+        path: "{{ ansible_env.HOME }}/.cache/lan-mouse-tag"
+      register: linux_tag_stat
+
+    - name: Read installed tag
+      ansible.builtin.slurp:
+        path: "{{ ansible_env.HOME }}/.cache/lan-mouse-tag"
+      register: linux_tag_content
+      when: linux_tag_stat.stat.exists
+
+    - name: Build and install lan-mouse-git (if PKGBUILD changed or tag mismatch)
+      when: pkgbuild_template.changed or not linux_tag_stat.stat.exists or (linux_tag_content.content | default('') | b64decode | trim != lan_mouse_release_tag)
+      block:
+        - name: Build package (makepkg refuses root)
+          ansible.builtin.command:
+            cmd: makepkg -f --noconfirm
+            chdir: "{{ ansible_env.HOME }}/.cache/lan-mouse-pkgbuild"
+          changed_when: true
+
+        - name: Install package
+          become: true
+          ansible.builtin.shell: |
+            pacman -U --noconfirm $(ls {{ ansible_env.HOME }}/.cache/lan-mouse-pkgbuild/lan-mouse-git-*-x86_64.pkg.tar.zst 2>/dev/null || ls {{ ansible_env.HOME }}/.cache/lan-mouse-pkgbuild/*.pkg.tar.zst | grep -v debug | head -1)
+          register: pkg_install
+          failed_when: pkg_install.rc != 0 and 'up to date' not in pkg_install.stderr
+          changed_when: pkg_install.rc == 0
+
+        - name: Record installed tag
+          ansible.builtin.copy:
+            content: "{{ lan_mouse_release_tag }}"
+            dest: "{{ ansible_env.HOME }}/.cache/lan-mouse-tag"
+            mode: "0644"
 
     - name: Ensure ~/.local/bin exists
       ansible.builtin.file:
@@ -80,6 +101,16 @@
       become: true
       ansible.builtin.command: "loginctl enable-linger {{ ansible_user_id }}"
       changed_when: false
+
+    - name: Add spoke hostnames to /etc/hosts
+      become: true
+      ansible.builtin.lineinfile:
+        path: /etc/hosts
+        line: "{{ hostvars[item].ansible_host }} {{ item }}"
+        state: present
+      loop:
+        - "{{ groups['mac_desktop'][0] }}"
+        - "{{ groups['windows_desktop'][0] }}"
 
     - name: Ensure lan-mouse config dir exists
       ansible.builtin.file:
@@ -121,6 +152,8 @@
     - name: Reload systemd user daemon and restart services (only if something changed)
       when: >
         pkgbuild_template.changed
+        or not linux_tag_stat.stat.exists
+        or (linux_tag_content.content | default('') | b64decode | trim != lan_mouse_release_tag)
         or hub_config_template.changed
         or lm_service_template.changed
         or tv_multiview_build.changed
@@ -145,48 +178,111 @@
             - tv-multiview.service
             - lan-mouse.service
 
-        - name: Verify services are running
+        - name: Verify services are running (not failed/dead)
           ansible.builtin.command: systemctl --user is-active {{ item }}
           register: service_status
-          failed_when: service_status.stdout != 'active'
+          failed_when: service_status.stdout in ['failed', 'inactive', 'dead']
           loop:
             - tv-multiview.service
             - lan-mouse.service
           changed_when: false
 
     # Firewall is deliberately NOT touched here — open UDP {{ lan_mouse_port }}
-    # and TCP {{ daemon_port }} manually, however example-user's firewall is actually
+    # and TCP {{ daemon_port }} manually, however the firewall is actually
     # set up. Guessing at nftables/firewalld/ufw here risks fighting a ruleset
     # this playbook has no visibility into.
 
+    - name: Prompt user to accept TV pairing (first run only)
+      ansible.builtin.pause:
+        prompt: |
+          ══════════════════════════════════════════════════════
+          ACTION REQUIRED — on the LG TV:
+          
+          Accept the pairing prompt on the TV screen.
+          (WebOS shows a 4-digit code — accept it.)
+          
+          Press Enter once done.
+          ══════════════════════════════════════════════════════
+      when: not linux_tag_stat.stat.exists
+
 - name: Deploy lan-mouse spoke on macOS
   hosts: mac_desktop
-  gather_facts: true
+  gather_facts: false
+  pre_tasks:
+    - name: Ensure wakeonlan is installed (control node)
+      become: true
+      community.general.pacman:
+        name: wakeonlan
+        state: present
+      delegate_to: "{{ groups['linux_desktop'][0] }}"
+      run_once: true
+
+    - name: Wake macOS via WoL
+      ansible.builtin.command: wakeonlan {{ mac_mac_address }}
+      delegate_to: "{{ groups['linux_desktop'][0] }}"
+      run_once: true
+      changed_when: false
+
+    - name: Let macOS network stack initialize
+      ansible.builtin.wait_for:
+        timeout: 15
+      delegate_to: "{{ groups['linux_desktop'][0] }}"
+      run_once: true
+
+    - name: Wait for macOS SSH to be ready
+      ansible.builtin.wait_for:
+        host: "{{ hostvars[inventory_hostname].ansible_host }}"
+        port: 22
+        timeout: 120
+
+    - name: Gather facts
+      ansible.builtin.setup:
+
   tasks:
+    - name: Check installed lan-mouse tag (macOS)
+      ansible.builtin.stat:
+        path: "{{ ansible_env.HOME }}/.cache/lan-mouse-tag"
+      register: mac_tag_stat
+
+    - name: Read installed tag
+      ansible.builtin.slurp:
+        path: "{{ ansible_env.HOME }}/.cache/lan-mouse-tag"
+      register: mac_tag_content
+      when: mac_tag_stat.stat.exists
+
     - name: Download lan-mouse for macOS (Intel)
       ansible.builtin.get_url:
         url: "https://github.com/feschber/lan-mouse/releases/download/{{ lan_mouse_release_tag }}/lan-mouse-macos-intel.zip"
         dest: "/tmp/lan-mouse-macos.zip"
         mode: "0644"
-
-    - name: Ensure ~/Applications exists
-      ansible.builtin.file:
-        path: "{{ ansible_env.HOME }}/Applications"
-        state: directory
-        mode: "0755"
+      when: not mac_tag_stat.stat.exists or (mac_tag_content.content | default('') | b64decode | trim != lan_mouse_release_tag)
 
     - name: Extract lan-mouse
       ansible.builtin.unarchive:
         src: "/tmp/lan-mouse-macos.zip"
         dest: "{{ ansible_env.HOME }}/Applications/"
         remote_src: true
+      when: not mac_tag_stat.stat.exists or (mac_tag_content.content | default('') | b64decode | trim != lan_mouse_release_tag)
 
     - name: Remove quarantine attribute (macOS Gatekeeper)
       ansible.builtin.command: >
         xattr -rd com.apple.quarantine "{{ ansible_env.HOME }}/Applications/Lan Mouse.app"
       changed_when: false
 
-    - name: Ensure lan-mouse config dir exists
+    - name: Record installed tag
+      ansible.builtin.copy:
+        content: "{{ lan_mouse_release_tag }}"
+        dest: "{{ ansible_env.HOME }}/.cache/lan-mouse-tag"
+        mode: "0644"
+
+    - name: Add Linux host to /etc/hosts
+      become: true
+      ansible.builtin.lineinfile:
+        path: /etc/hosts
+        line: "{{ hostvars[groups['linux_desktop'][0]].ansible_host }} {{ groups['linux_desktop'][0] }}"
+        state: present
+
+    - name: Ensure lan-mouse config dir exists  # macOS
       ansible.builtin.file:
         path: "{{ ansible_env.HOME }}/.config/lan-mouse"
         state: directory
@@ -199,12 +295,6 @@
         mode: "0644"
       vars:
         spoke_position: "{{ mac_spoke_position }}"
-
-    - name: Ensure LaunchAgents dir exists
-      ansible.builtin.file:
-        path: "{{ ansible_env.HOME }}/Library/LaunchAgents"
-        state: directory
-        mode: "0755"
 
     - name: Deploy LaunchAgent
       ansible.builtin.template:
@@ -221,32 +311,130 @@
       failed_when: false
       changed_when: false
 
-    - name: Load LaunchAgent
+    - name: Load LaunchAgent (first time)
       ansible.builtin.command: >
         launchctl load -w {{ ansible_env.HOME }}/Library/LaunchAgents/com.feschber.lan-mouse.plist
       when: la_loaded.rc != 0
       changed_when: true
 
-    # Accessibility permission for lan-mouse cannot be granted from here —
-    # macOS requires a human click in System Settings > Privacy & Security >
-    # Accessibility the first time. Until that happens the process runs but
-    # captures/emulates nothing.
+    - name: Restart LaunchAgent (config/binary changed)
+      ansible.builtin.command: >
+        launchctl unload {{ ansible_env.HOME }}/Library/LaunchAgents/com.feschber.lan-mouse.plist 2>/dev/null;
+        launchctl load -w {{ ansible_env.HOME }}/Library/LaunchAgents/com.feschber.lan-mouse.plist
+      when: la_loaded.rc == 0
+      changed_when: true
+
+    - name: Allow lan-mouse through macOS Application Firewall
+      become: true
+      ansible.builtin.command: >
+        /usr/libexec/ApplicationFirewall/socketfilterfw
+        --add "{{ ansible_env.HOME }}/Applications/Lan Mouse.app/Contents/MacOS/lan-mouse"
+      register: fw_add
+      failed_when: fw_add.rc != 0 and 'already' not in fw_add.stderr
+      changed_when: fw_add.rc == 0
+
+    - name: Unblock lan-mouse in macOS Firewall
+      become: true
+      ansible.builtin.command: >
+        /usr/libexec/ApplicationFirewall/socketfilterfw
+        --unblockapp "{{ ansible_env.HOME }}/Applications/Lan Mouse.app/Contents/MacOS/lan-mouse"
+      changed_when: false
+
+    - name: Prompt user to enable Accessibility for lan-mouse (first deploy only)
+      ansible.builtin.pause:
+        prompt: |
+          ══════════════════════════════════════════════════════
+          ACTION REQUIRED — on the Mac:
+          
+          System Settings → Privacy & Security → Accessibility
+          → toggle Lan Mouse ON
+          
+          Press Enter once done.
+          ══════════════════════════════════════════════════════
+      when: not mac_tag_stat.stat.exists
 
 - name: Deploy lan-mouse spoke on Windows
   hosts: windows_desktop
-  gather_facts: true
+  gather_facts: false
+  pre_tasks:
+    - name: Wake Windows via WoL
+      ansible.builtin.command: wakeonlan {{ windows_mac_address }}
+      delegate_to: "{{ groups['linux_desktop'][0] }}"
+      run_once: true
+      changed_when: false
+
+    - name: Let Windows network stack initialize
+      ansible.builtin.wait_for:
+        timeout: 15
+      delegate_to: "{{ groups['linux_desktop'][0] }}"
+      run_once: true
+
+    - name: Wait for Windows SSH to be ready
+      ansible.windows.win_wait_for:
+        host: "{{ ansible_host }}"
+        port: 22
+        timeout: 120
+
+    - name: Gather facts
+      ansible.builtin.setup:
+      tags: always
+
   tasks:
-    - name: Ensure Git for Windows is present (provides sh.exe — lan-mouse spawns every enter_hook via `sh -c`, on every OS)
+    - name: Enable Wake-on-LAN on active network adapters
+      ansible.windows.win_shell: |
+        Get-NetAdapter | Where-Object {$_.Status -eq 'Up'} | ForEach-Object {
+          $adapter = $_
+          try {
+            Set-NetAdapterAdvancedProperty -Name $adapter.Name -RegistryKeyword '*WakeOnMagicPacket' -RegistryValue 1 -ErrorAction Stop
+            Write-Host "WoL enabled: $($adapter.Name)"
+          } catch { }
+        }
+      changed_when: true
+
+    - name: Check if sh.exe is available (needed for enter_hook)
+      ansible.windows.win_shell: |
+        $sh = Get-Command sh -ErrorAction SilentlyContinue
+        if ($sh) { exit 0 }
+        $paths = @(
+          "C:\Program Files\Git\bin\sh.exe",
+          "C:\Program Files (x86)\Git\bin\sh.exe",
+          "$env:LOCALAPPDATA\Programs\Git\bin\sh.exe"
+        )
+        foreach ($p in $paths) {
+          if (Test-Path $p) {
+            [Environment]::SetEnvironmentVariable("PATH", "$env:PATH;$((Split-Path $p))", [EnvironmentVariableTarget]::User)
+            exit 0
+          }
+        }
+        exit 1
+      register: sh_check
+      failed_when: false
+      changed_when: false
+
+    - name: Install Git for Windows (provides sh.exe)
       ansible.windows.win_shell: >
         winget install --id Git.Git -e --silent --accept-package-agreements --accept-source-agreements
-      register: git_install
-      failed_when: git_install.rc not in [0, -1978335189]
-      changed_when: "'Successfully installed' in git_install.stdout"
+      when: sh_check.rc != 0
+      register: winget_result
+      failed_when: winget_result.rc not in [0, -1978335189]
+      changed_when: "'Successfully installed' in winget_result.stdout"
+
+    - name: Check installed lan-mouse tag (Windows)
+      ansible.windows.win_stat:
+        path: "{{ ansible_env.LOCALAPPDATA }}\\lan-mouse-tag"
+      register: win_tag_stat
+
+    - name: Read installed Windows tag
+      ansible.windows.slurp:
+        path: "{{ ansible_env.LOCALAPPDATA }}\\lan-mouse-tag"
+      register: win_tag_slurp
+      when: win_tag_stat.stat.exists
 
     - name: Download lan-mouse for Windows
       ansible.windows.win_get_url:
         url: "https://github.com/feschber/lan-mouse/releases/download/{{ lan_mouse_release_tag }}/lan-mouse-windows-x86_64.zip"
-        dest: "C:\\Temp\\lan-mouse-windows.zip"
+        dest: "{{ ansible_env.TEMP }}\\lan-mouse-windows.zip"
+      when: not win_tag_stat.stat.exists or (win_tag_slurp.content | default('') | b64decode | trim != lan_mouse_release_tag)
 
     - name: Ensure install directory exists
       ansible.windows.win_file:
@@ -255,8 +443,15 @@
 
     - name: Extract lan-mouse
       ansible.windows.win_shell: >
-        Expand-Archive -Path 'C:\Temp\lan-mouse-windows.zip'
+        Expand-Archive -Path '{{ ansible_env.TEMP }}\lan-mouse-windows.zip'
         -DestinationPath '{{ ansible_env.LOCALAPPDATA }}\Programs\lan-mouse' -Force
+      when: not win_tag_stat.stat.exists or (win_tag_slurp.content | default('') | b64decode | trim != lan_mouse_release_tag)
+
+    - name: Record installed Windows tag
+      ansible.windows.win_copy:
+        content: "{{ lan_mouse_release_tag }}"
+        dest: "{{ ansible_env.LOCALAPPDATA }}\\lan-mouse-tag"
+      when: not win_tag_stat.stat.exists or (win_tag_slurp.content | default('') | b64decode | trim != lan_mouse_release_tag)
 
     - name: Locate lan-mouse.exe inside extracted files
       ansible.windows.win_find:
@@ -270,6 +465,13 @@
         path: "{{ ansible_env.LOCALAPPDATA }}\\lan-mouse"
         state: directory
 
+    - name: Add Linux host to Windows hosts file
+      ansible.windows.win_shell: |
+        $hosts = "C:\Windows\System32\drivers\etc\hosts"
+        $line = "{{ hostvars[groups['linux_desktop'][0]].ansible_host }} {{ groups['linux_desktop'][0] }}"
+        $content = Get-Content $hosts -ErrorAction SilentlyContinue
+        if ($content -notcontains $line) { Add-Content $hosts $line }
+
     - name: Deploy lan-mouse config (spoke — points back at linux hub)
       ansible.windows.win_template:
         src: templates/spoke-config.toml.j2
@@ -278,7 +480,7 @@
         spoke_position: "{{ win_spoke_position }}"
 
     - name: Create scheduled task to run lan-mouse daemon at logon
-      ansible.windows.win_scheduled_task:
+      community.windows.win_scheduled_task:
         name: LanMouseDaemon
         description: "Runs lan-mouse in daemon mode at user logon"
         actions:
@@ -290,5 +492,15 @@
         state: present
         enabled: true
         run_level: limited
-      # verify module option names with `ansible-doc ansible.windows.win_scheduled_task` —
-      # this is the one part of the playbook not re-checked against live source.
+
+    - name: Restart lan-mouse (to pick up new config)
+      ansible.windows.win_shell: |
+        schtasks /end /tn LanMouseDaemon 2>$null
+        Start-Sleep 2
+        schtasks /run /tn LanMouseDaemon
+      changed_when: true
+
+    - name: Open Windows Firewall for lan-mouse (UDP {{ lan_mouse_port }})
+      ansible.windows.win_shell: |
+        Remove-NetFirewallRule -Name lan-mouse -ErrorAction SilentlyContinue
+        New-NetFirewallRule -Name lan-mouse -DisplayName lan-mouse -Enabled True -Profile Any -Direction Inbound -Protocol UDP -Action Allow -LocalPort {{ lan_mouse_port }}

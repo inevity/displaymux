@@ -3,12 +3,12 @@
 // at /usr/bin/LG_Buddy_PIP/bin/bscpylgtvcommand.
 
 use std::net::Ipv4Addr;
-use std::process::Output;
 use tokio::process::Command;
+use tracing::debug;
 
 const BSCPYLGTV: &str = "/usr/bin/LG_Buddy_PIP/bin/bscpylgtvcommand";
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TvClient {
     pub ip: Ipv4Addr,
 }
@@ -18,12 +18,25 @@ impl TvClient {
         Self { ip }
     }
 
-    async fn run(&self, args: &[&str]) -> Result<Output, std::io::Error> {
+    async fn run(&self, args: &[&str]) -> Result<std::process::Output, std::io::Error> {
+        let cmd = format!("{} {} {}", BSCPYLGTV, self.ip, args.join(" "));
+        debug!(cmd = %cmd, "bscpylgtvcommand");
+
         Command::new(BSCPYLGTV)
             .arg(self.ip.to_string())
             .args(args)
             .output()
             .await
+            .inspect(|out| {
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                if !stdout.trim().is_empty() {
+                    debug!(stdout = %stdout.trim(), "bscpylgtvcommand stdout");
+                }
+                if !stderr.trim().is_empty() {
+                    debug!(stderr = %stderr.trim(), "bscpylgtvcommand stderr");
+                }
+            })
     }
 
     /// Set the TV input to the given HDMI port.
@@ -37,13 +50,13 @@ impl TvClient {
         }
     }
 
-    /// Toggle multiView (splitscreenEnable).
+    /// Toggle multiView (splitscreenEnable) via Luna API.
     pub async fn set_splitscreen(&self, enable: bool) -> Result<(), String> {
         let val = if enable { "on" } else { "off" };
-        let payload = format!(r#"{{"splitscreenEnable":"{}"}}"#, val);
+        let payload = format!("{{\"splitscreenEnable\":\"{}\"}}", val);
 
         let out = self
-            .run(&["set_system_settings", "commercial", &payload])
+            .run(&["set_settings", "commercial", &payload])
             .await
             .map_err(|e| e.to_string())?;
 
@@ -58,7 +71,7 @@ impl TvClient {
     /// Heartbeat: get current software info.
     pub async fn get_sw_info(&self) -> Result<(), String> {
         let out = self
-            .run(&["get_current_sw_info"])
+            .run(&["get_software_info"])
             .await
             .map_err(|e| e.to_string())?;
         if out.status.success() {
@@ -67,28 +80,5 @@ impl TvClient {
             let stderr = String::from_utf8_lossy(&out.stderr);
             Err(format!("get_sw_info failed: {}", stderr.trim()))
         }
-    }
-
-    /// Poll multiViewStatus. Returns Some(true) if active, Some(false) if not,
-    /// None on error.
-    pub async fn poll_multiview_status(&self) -> Option<bool> {
-        let payload = r#"{"category":"option","keys":["multiViewStatus"]}"#;
-        let out = self
-            .run(&["get_system_settings", "option", payload])
-            .await
-            .ok()?;
-
-        if !out.status.success() {
-            return None;
-        }
-
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        // Response is JSON: {"settings":{"multiViewStatus":"on"}}
-        let val: serde_json::Value = serde_json::from_str(&stdout).ok()?;
-        let status = val
-            .get("settings")?
-            .get("multiViewStatus")?
-            .as_str()?;
-        Some(status == "on")
     }
 }

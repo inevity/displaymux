@@ -7,26 +7,27 @@
 release_bind = [ "KeyA", "KeyS", "KeyD", "KeyF" ]
 
 # optional port (defaults to 4242)
-port = 4242
+port = {{ lan_mouse_port }}
 
 # list of authorized tls certificate fingerprints that
 # are accepted for incoming traffic
 [authorized_fingerprints]
-#"<REDACTED_HISTORICAL_FINGERPRINT>" = "iridium"
-"<REDACTED_HISTORICAL_FINGERPRINT>" = "{{ mac_hostname}}"
-"<REDACTED_HISTORICAL_FINGERPRINT>" = "{{ windows_hostname}}"
+"{{ mac_fingerprint }}" = "{{ groups['mac_desktop'][0] }}"
+"{{ windows_fingerprint }}" = "{{ groups['windows_desktop'][0] }}"
 
 
 [[clients]]
-hostname = "{{ mac_hostname }}"
-ips = [ "{{ hostvars[mac_hostname].ansible_host }}" ]
+hostname = "{{ groups['mac_desktop'][0] }}"
+ips = [ "{{ hostvars[groups['mac_desktop'][0]].ansible_host }}" ]
+port = {{ lan_mouse_port }}
 position = "right"
 activate_on_startup = true
 enter_hook = "curl -s http://localhost:{{ daemon_port }}/enter/mac"
 
 [[clients]]
-hostname = "{{ windows_hostname }}"
-ips = [ "{{ hostvars[windows_hostname].ansible_host }}" ]
+hostname = "{{ groups['windows_desktop'][0] }}"
+ips = [ "{{ hostvars[groups['windows_desktop'][0]].ansible_host }}" ]
+port = {{ lan_mouse_port }}
 position = "left"
 activate_on_startup = true
 enter_hook = "curl -s http://localhost:{{ daemon_port }}/enter/windows"

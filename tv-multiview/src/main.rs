@@ -52,7 +52,7 @@ async fn main() {
     });
 
     // ---- HTTP server ----
-    let app = http::router(tv_ip, hdmi_map);
+    let app = http::router(Arc::clone(&daemon), (*tv_client).clone(), hdmi_map);
     let addr = SocketAddr::from(([0, 0, 0, 0], daemon_port));
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
 
@@ -91,24 +91,13 @@ async fn maintain_connection(
         daemon.mark_healthy();
         info!(event = "connected");
 
-        // Heartbeat + multiView polling loop
+        // Heartbeat every 5s
         loop {
             tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
 
-            // Poll multiViewStatus (TvRemoteOverride source)
-            match client.poll_multiview_status().await {
-                Some(true) => daemon.remote_override(state::TvMode::Multiview),
-                Some(false) => daemon.remote_override(state::TvMode::Fullscreen),
-                None => {
-                    // Poll failed — might be disconnect
-                }
-            }
-
-            // Heartbeat every 30s (every 6th iteration)
-            // Simple approach: check every 5s via get_sw_info
             if let Err(e) = client.get_sw_info().await {
                 error!(error = %e, "heartbeat_failed");
-                break; // disconnect detected
+                break;
             }
         }
 
