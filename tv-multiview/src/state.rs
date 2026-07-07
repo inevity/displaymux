@@ -14,7 +14,6 @@ pub enum TvMode {
     Fullscreen,
     Multiview,
     Transitioning,
-    Unknown,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -207,6 +206,7 @@ impl TvDaemonState {
 
     // --- TvRemoteOverride ---
     // C4 fix: clears pending_switch, restricts to {Fullscreen, Multiview}
+    #[allow(dead_code)]
     pub fn remote_override(&self, new_mode: TvMode) {
         if new_mode != TvMode::Fullscreen && new_mode != TvMode::Multiview {
             return; // C4: remote can't set Transitioning
