@@ -14,6 +14,8 @@
 #     daemon connects for the first time.
 #   - macOS: grant lan-mouse Accessibility permission once in
 #     System Settings > Privacy & Security > Accessibility.
+#   - macOS: disable lock screen password (Lock Screen > Require
+#     password: Never). Remote input can't unlock macOS.
 
 - name: Deploy tv-multiview daemon and lan-mouse hub on Arch Linux
   hosts: linux_desktop
@@ -340,7 +342,7 @@
         --unblockapp "{{ ansible_env.HOME }}/Applications/Lan Mouse.app/Contents/MacOS/lan-mouse"
       changed_when: false
 
-    - name: Prompt user to enable Accessibility for lan-mouse (first deploy only)
+    - name: Prompt user to enable Accessibility + disable lock screen (first deploy only)
       ansible.builtin.pause:
         prompt: |
           ══════════════════════════════════════════════════════
@@ -348,6 +350,10 @@
           
           System Settings → Privacy & Security → Accessibility
           → toggle Lan Mouse ON
+          
+          System Settings → Lock Screen
+          → Require password after display off: Never
+            (remote input can't unlock macOS lock screen)
           
           Press Enter once done.
           ══════════════════════════════════════════════════════
