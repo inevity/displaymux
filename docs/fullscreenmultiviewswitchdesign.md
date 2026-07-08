@@ -195,10 +195,28 @@ SubscriptionFires ==
 \* SWITCH TRANSITIONS (EnterOtherHost → SwitchComplete | SwitchFailed | SwitchTimeout)
 \* =====================================================================
 
-\* Cursor crosses edge into remote host. TV must switch input.
+\* =====================================================================
+\* TWO-PHASE SWITCH PROTOCOL (atomicity invariant: cursor never moves to dead host)
+\*
+\* Phase 1 (EnterOtherHost): TV input switches. Cursor + capture STAY on Linux.
+\*   The daemon issues set_input(target) and awaits two confirmations:
+\*   (a) SSAP response: set_input() returned success.
+\*   (b) Signal verification: target input has HDMI signal present.
+\*   If (a) fails → SwitchFailed. If (b) fails within SWITCH_TIMEOUT → SwitchTimeout.
+\*   In both failure cases, cursor never left Linux — user is never trapped.
+\*
+\* Phase 2 (SwitchComplete): Both confirmations received. NOW move cursor + capture
+\*   to target. The HTTP response returns "fullscreen" to lan-mouse, which then
+\*   switches its own capture to the remote host. Cursor only moves AFTER the
+\*   display is verified working.
+\*
+\* This eliminates the trap scenario: switch to sleeping/shutdown Windows →
+\*   display shows nothing → keyboard/mouse captured by dead host → stuck.
+\* =====================================================================
+
+\* Phase 1: Cursor crosses edge. TV input switches. Cursor + capture STAY on Linux.
 \* APPROACH 1: ALWAYS issues set_input() — no stale-state no-op guard.
-\* tv_input is informational only; the real state is input_signal + remote_online.
-\* switch_timer starts countdown for no-signal detection.
+\* switch_timer starts countdown for signal verification.
 EnterOtherHost(host) ==
     LET target == CASE host = "mac" -> "mac"
                     [] host = "windows" -> "windows"
@@ -211,54 +229,50 @@ EnterOtherHost(host) ==
     /\ ws_state = "connected"
     /\ tv_mode' = "transitioning"
     /\ tv_input' = target
-    /\ cursor' = target
-    /\ capture' = CASE host = "mac" -> "capturing_mac"
-                   [] host = "windows" -> "capturing_windows"
-                   [] OTHER -> "capturing_linux"
+    \* CURSOR + CAPTURE STAY ON LINUX — do not move until signal verified.
     /\ pending_switch' = target
-    /\ switch_timer' = SWITCH_TIMEOUT   \* start no-signal countdown
-    /\ UNCHANGED <<ws_state, subscribe_active, daemon_healthy,
-                   reconnect_count, input_signal, remote_online>>
+    /\ switch_timer' = SWITCH_TIMEOUT   \* start signal-verification countdown
+    /\ UNCHANGED <<cursor, capture, ws_state, subscribe_active,
+                   daemon_healthy, reconnect_count, input_signal, remote_online>>
 
-\* set_input() acknowledged by TV. HDCP settled, signal present.
-\* This is the optimal path — everything worked.
+\* Phase 2a: set_input() acknowledged AND signal present on target input.
+\* NOW move cursor + capture to target. Return success to lan-mouse.
 SwitchComplete ==
     /\ tv_mode = "transitioning"
     /\ input_signal[tv_input] = TRUE    \* authoritative signal check
     /\ tv_mode' = "fullscreen"
+    /\ cursor' = tv_input               \* cursor moves NOW — after verification
+    /\ capture' = CASE tv_input = "mac" -> "capturing_mac"
+                    [] tv_input = "windows" -> "capturing_windows"
+                    [] OTHER -> "capturing_linux"
     /\ pending_switch' = "none"
     /\ switch_timer' = 0
-    /\ UNCHANGED <<tv_input, cursor, capture, ws_state, subscribe_active,
+    /\ UNCHANGED <<tv_input, ws_state, subscribe_active,
                    daemon_healthy, reconnect_count, input_signal, remote_online>>
 
-\* set_input() returned an explicit SSAP error (TV refused, timeout, malformed response).
-\* Revert to Linux to preserve always-availability.
+\* Phase 2b: set_input() returned SSAP error.
+\* Cursor never left Linux. Just clear pending, return 502 to lan-mouse.
 SwitchFailed ==
     /\ tv_mode = "transitioning"
     /\ ws_state = "connected"
     /\ tv_mode' = "fullscreen"
     /\ tv_input' = "linux"
-    /\ cursor' = "linux"
-    /\ capture' = "idle"
     /\ pending_switch' = "none"
     /\ switch_timer' = 0
-    /\ UNCHANGED <<ws_state, subscribe_active, daemon_healthy,
-                   reconnect_count, input_signal, remote_online>>
+    /\ UNCHANGED <<cursor, capture, ws_state, subscribe_active,
+                   daemon_healthy, reconnect_count, input_signal, remote_online>>
 
-\* Switch timer expired — TV accepted set_input() but source has no signal.
-\* Covers: remote host powered off, HDMI cable unplugged, GPU not initialized.
-\* Revert to Linux to preserve always-availability.
+\* Phase 2b: Timer expired — set_input() succeeded but no signal on target.
+\* Cursor never left Linux. Revert tv_input, clear pending, return failure.
 SwitchTimeout ==
     /\ tv_mode = "transitioning"
     /\ switch_timer = 1                \* last tick before expiry
     /\ switch_timer' = 0
     /\ tv_mode' = "fullscreen"
     /\ tv_input' = "linux"
-    /\ cursor' = "linux"
-    /\ capture' = "idle"
     /\ pending_switch' = "none"
-    /\ UNCHANGED <<ws_state, subscribe_active, daemon_healthy,
-                   reconnect_count, input_signal, remote_online>>
+    /\ UNCHANGED <<cursor, capture, ws_state, subscribe_active,
+                   daemon_healthy, reconnect_count, input_signal, remote_online>>
 
 \* Timer tick — models time passing during switch.
 TimerTick ==
@@ -507,6 +521,13 @@ EventuallyRevert ==
 \*     daemon state machine (tv_mode, tv_input, cursor, capture) are
 \*     modeled in one spec. The HealthDefinition invariant ties them
 \*     together: daemon_healthy iff connected AND subscribed.
+\* C10 (two-phase atomic enter): EnterOtherHost switches only the TV input.
+\*     Cursor and capture stay on Linux during Phase 1. SwitchComplete
+\*     (signal verified) moves cursor+capture to target. SwitchFailed or
+\*     SwitchTimeout leaves cursor on Linux. This prevents the trap:
+\*     switch to sleeping/shutdown host → keyboard/mouse captured by dead
+\*     host → user can't move or see anything. The invariant is: cursor
+\*     never moves to a host whose display isn't verified working.
 
 =================================================================================
 ```
@@ -626,20 +647,30 @@ systemd `Restart=on-failure` gives a fresh start.
 #### 2. Enter Hook Logic
 
 ```
-curl → /enter/{target}:
+curl → /enter/{target}:                               [cursor still on linux]
   1. If daemon_healthy=false → 503
   2. If pending_switch != none → 200 current_mode  (debounce)
   3. If mode=multiview → 200 "multiview"           (skip, don't disturb multiView)
-  4. If mode=fullscreen → set_input(target) always  (APPROACH 1: no stale-state no-op)
-     ├─ success + signal present → SwitchComplete → 200 "fullscreen"
-     ├─ success + no signal      → SwitchTimeout  → revert to linux → 200 "fullscreen"
-     └─ SSAP error               → SwitchFailed   → revert to linux → 502
+  4. If mode=fullscreen → TWO-PHASE ENTER:
+     a. set_input(target) always  (APPROACH 1: no stale-state no-op)
+     b. Await SSAP response:
+        ├─ error → SwitchFailed  → revert to linux → 502
+        └─ success → Proceed
+     c. Query signal status on target input:
+        ├─ signal present → SwitchComplete → cursor+capture move to target → 200 "fullscreen"
+        └─ no signal      → SwitchTimeout  → revert to linux            → 502
+     [CRITICAL: cursor+capture only move in step (c) AFTER signal verified.
+      If signal absent, cursor never left linux — user is never trapped.]
 ```
 
 The key change from the previous design (C6): step 4 no longer checks
 `tv_input == target`. It always issues `set_input()`. The TV's actual
 state is determined by `input_signal` (from SSAP query) and `remote_online`
 (from lan-mouse spoke), not by cached `tv_input`.
+
+The second key change (C10): cursor and capture do NOT move to the target
+until signal is verified (two-phase protocol). This prevents the trap
+scenario where the user's keyboard/mouse are captured by a dead host.
 
 #### 3. Failure Recovery Paths
 
