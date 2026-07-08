@@ -21,33 +21,37 @@ suppressed regardless of layout geometry.
 
 ```
 ---- MODULE TvDisplaySwitch ----
-EXTENDS Naturals
+EXTENDS Naturals, Sequences
 
-\* The TV display mode (what the panel is actually showing).
-\* "multiview" covers both side-by-side and picture-in-picture —
-\* the TV API reports multiViewStatus: "on" for both.
+\* --- TYPE DEFINITIONS ---
+
 TVMode == { "fullscreen", "multiview", "transitioning" }
-
-\* The active input (what the TV is displaying in fullscreen)
 ActiveInput == { "linux", "mac", "windows", "unknown" }
-
-\* The cursor's current location (on linux, on a remote host, or between edges)
 CursorLocation == { "linux", "mac", "windows" }
-
-\* The lan-mouse capture state
 CaptureState == { "idle", "capturing_linux", "capturing_mac", "capturing_windows" }
+PendingValues == {"none", "multiview_on", "multiview_off"} \cup (ActiveInput \ {"unknown"})
+SSAPState == { "disconnected", "connecting", "registering", "connected" }
 
-\* Values for pending_switch (input targets + "multiview_on" + "none")
-PendingValues == {"none", "multiview_on"} \cup (ActiveInput \ {"unknown"})
+\* --- CONSTANTS ---
+
+SWITCH_TIMEOUT == 5     \* seconds before declaring no-signal
+RECONNECT_CAP == 30     \* max reconnects before process exit
+
+\* --- VARIABLES ---
 
 VARIABLES
-    tv_mode,            \* current TV display mode
-    tv_input,           \* what the TV is currently displaying
-    cursor,             \* where the cursor physically is
+    tv_mode,            \* "fullscreen" | "multiview" | "transitioning"
+    tv_input,           \* last commanded input (informational — NOT used as gate)
+    cursor,             \* cursor location
     capture,            \* lan-mouse capture state
-    daemon_healthy,     \* is the daemon connection alive
-    pending_switch,     \* an input switch or multiView toggle in flight
-    reconnect_count     \* count of failed reconnect attempts
+    ws_state,           \* SSAP WebSocket lifecycle
+    subscribe_active,   \* is multiViewStatus subscription live
+    daemon_healthy,     \* daemon + SSAP combined health (commands accepted)
+    pending_switch,     \* in-flight command (debounce gate)
+    reconnect_count,    \* consecutive failed reconnect attempts
+    switch_timer,       \* countdown for no-signal detection after switch
+    input_signal,       \* per-input HDMI signal presence (authoritative, from TV)
+    remote_online       \* per-remote-host lan-mouse spoke connectivity
 
 \* --- INVARIANTS ---
 
@@ -56,93 +60,312 @@ TypeInvariant ==
     /\ tv_input \in ActiveInput
     /\ cursor \in CursorLocation
     /\ capture \in CaptureState
+    /\ ws_state \in SSAPState
+    /\ subscribe_active \in BOOLEAN
     /\ daemon_healthy \in BOOLEAN
     /\ pending_switch \in PendingValues
-    /\ reconnect_count \in 0..30
+    /\ reconnect_count \in 0..RECONNECT_CAP
+    /\ switch_timer \in 0..SWITCH_TIMEOUT
+    /\ input_signal \in [ActiveInput -> BOOLEAN]
+    /\ remote_online \in [{"mac","windows"} -> BOOLEAN]
 
-\* When in fullscreen, TV input must match the captured host.
-\* When idle (cursor on linux), TV must show linux.
-\* NOTE: each clause has a leading /\, because TLA+'s => binds looser than /\.
+\* Display matches cursor position.
 DisplayMatchesCursor ==
     /\ (tv_mode = "fullscreen" /\ capture = "idle") => tv_input = "linux"
     /\ (tv_mode = "fullscreen" /\ capture = "capturing_linux") => tv_input = "linux"
     /\ (tv_mode = "fullscreen" /\ capture = "capturing_mac") => tv_input = "mac"
     /\ (tv_mode = "fullscreen" /\ capture = "capturing_windows") => tv_input = "windows"
 
-\* When daemon is dead, no commands can be in flight
+\* No command in flight when daemon is dead.
 NoPendingWhenDead ==
     (~daemon_healthy) => pending_switch = "none"
 
+\* CENTRAL AVAILABILITY INVARIANT:
+\* If a remote host is selected but has no signal or is offline,
+\* the system must revert to Linux (the always-available host).
+\* switch_timer > 0 means revert is already in progress.
+LinuxAlwaysAvailable ==
+    (tv_mode = "fullscreen" /\ tv_input \in {"mac", "windows"}) =>
+        (input_signal[tv_input] = TRUE /\ remote_online[tv_input] = TRUE
+         \/ switch_timer > 0)
+
+\* Subscription only active when connected.
+SubscribeRequiresConnected ==
+    subscribe_active => ws_state = "connected"
+
+\* Combined daemon health: SSAP connected AND subscribe active.
+\* This ensures the daemon only accepts commands when the TV is fully reachable.
+HealthDefinition ==
+    daemon_healthy <=> (ws_state = "connected" /\ subscribe_active)
+
 \* --- INITIAL STATE ---
+
 Init ==
     /\ tv_mode = "fullscreen"
     /\ tv_input = "linux"
     /\ cursor = "linux"
     /\ capture = "idle"
-    /\ daemon_healthy = TRUE
+    /\ ws_state = "disconnected"
+    /\ subscribe_active = FALSE
+    /\ daemon_healthy = FALSE    \* SSAP not yet connected
     /\ pending_switch = "none"
     /\ reconnect_count = 0
+    /\ switch_timer = 0
+    /\ input_signal = [linux |-> TRUE, mac |-> FALSE, windows |-> FALSE, unknown |-> FALSE]
+    /\ remote_online = [mac |-> FALSE, windows |-> FALSE]
 
-\* --- TRANSITIONS ---
+\* =====================================================================
+\* SSAP LIFECYCLE (persistent wss:// connection, replaces subprocess-per-command)
+\* =====================================================================
 
-\* F→T: Cursor crosses edge, fullscreen → transitioning (different input).
-\* The display update takes ~1-3s (HDCP/EDID relock).
-\* No-op if already on the target input.
-\* pending_switch set to the target to gate rapid re-enters (debounce).
+\* TCP + TLS handshake to wss://TV_IP:3001/.
+SSAPConnecting ==
+    /\ ws_state = "disconnected"
+    /\ ws_state' = "connecting"
+    /\ UNCHANGED <<tv_mode, tv_input, cursor, capture, subscribe_active,
+                   daemon_healthy, pending_switch, reconnect_count,
+                   switch_timer, input_signal, remote_online>>
+
+\* SSAP register handshake: send client-key, receive registration confirmation.
+SSAPRegistering ==
+    /\ ws_state = "connecting"
+    /\ ws_state' = "registering"
+    /\ UNCHANGED <<tv_mode, tv_input, cursor, capture, subscribe_active,
+                   daemon_healthy, pending_switch, reconnect_count,
+                   switch_timer, input_signal, remote_online>>
+
+\* Registration complete. SSAP ready for commands.
+\* daemon_healthy transitions to TRUE (via HealthDefinition).
+SSAPRegistered ==
+    /\ ws_state = "registering"
+    /\ ws_state' = "connected"
+    /\ daemon_healthy' = TRUE
+    /\ reconnect_count' = 0
+    \* Can't know TV state during disconnect; resync from subscribe + signal query.
+    /\ tv_mode' \in {"fullscreen", "multiview"}
+    /\ tv_input' \in ActiveInput
+    \* Query signal status on reconnect to resolve stale state.
+    /\ input_signal' \in [ActiveInput -> BOOLEAN]
+    /\ UNCHANGED <<tv_mode, tv_input, cursor, capture,
+                   pending_switch, switch_timer, remote_online>>
+
+\* Subscribe to multiViewStatus push updates from TV.
+\* daemon_healthy only becomes TRUE after subscription is live
+\* (HealthDefinition: connected AND subscribed).
+SSAPSubscribe ==
+    /\ ws_state = "connected"
+    /\ ~subscribe_active
+    /\ subscribe_active' = TRUE
+    /\ UNCHANGED <<tv_mode, tv_input, cursor, capture, ws_state,
+                   daemon_healthy, pending_switch, reconnect_count,
+                   switch_timer, input_signal, remote_online>>
+
+\* WebSocket drops (TV reboot, WiFi blip, TV off).
+\* Everything goes dead. pending_switch cleared (invariant).
+SSAPDisconnect ==
+    /\ ws_state = "connected"
+    /\ ws_state' = "disconnected"
+    /\ subscribe_active' = FALSE
+    /\ daemon_healthy' = FALSE
+    /\ pending_switch' = "none"
+    /\ switch_timer' = 0
+    /\ UNCHANGED <<tv_mode, tv_input, cursor, capture,
+                   reconnect_count, input_signal, remote_online>>
+
+\* =====================================================================
+\* SUBSCRIPTION CALLBACK (push updates from TV)
+\* =====================================================================
+
+\* TV reports multiViewStatus change via subscribe callback.
+\* Can fire at any time while subscribed — handles race with pending_switch.
+\* C4 fix: remote can only set fullscreen or multiview, never transitioning.
+SubscriptionFires ==
+    /\ subscribe_active
+    /\ tv_mode' \in {tv_mode} \cup ({"fullscreen", "multiview"} \ {tv_mode})
+    /\ tv_input' \in ActiveInput        \* remote may change input independently
+    /\ IF pending_switch /= "none" THEN
+           /\ pending_switch' = "none"  \* C4: remote override clears pending
+       ELSE
+           /\ UNCHANGED pending_switch
+    /\ switch_timer' = 0                \* cancel any in-flight timeout
+    /\ UNCHANGED <<cursor, capture, ws_state, subscribe_active,
+                   daemon_healthy, reconnect_count, input_signal, remote_online>>
+
+\* =====================================================================
+\* SWITCH TRANSITIONS (EnterOtherHost → SwitchComplete | SwitchFailed | SwitchTimeout)
+\* =====================================================================
+
+\* Cursor crosses edge into remote host. TV must switch input.
+\* APPROACH 1: ALWAYS issues set_input() — no stale-state no-op guard.
+\* tv_input is informational only; the real state is input_signal + remote_online.
+\* switch_timer starts countdown for no-signal detection.
 EnterOtherHost(host) ==
-    LET target == CASE host = "mac" -> "mac" | host = "windows" -> "windows"
+    LET target == CASE host = "mac" -> "mac"
+                    [] host = "windows" -> "windows"
                     [] OTHER -> "linux"
     IN
     /\ tv_mode = "fullscreen"
-    /\ tv_input /= target              \* no-op if already there
-    /\ pending_switch = "none"         \* debounce: don't fire if switch already in flight
+    /\ pending_switch = "none"          \* debounce: only one switch at a time
     /\ cursor \in {"linux"}
-    /\ daemon_healthy
+    /\ daemon_healthy                   \* requires connected + subscribed
+    /\ ws_state = "connected"
     /\ tv_mode' = "transitioning"
-    /\ tv_input' = target              \* destination known, TV processing async
+    /\ tv_input' = target
     /\ cursor' = target
     /\ capture' = CASE host = "mac" -> "capturing_mac"
                    [] host = "windows" -> "capturing_windows"
                    [] OTHER -> "capturing_linux"
     /\ pending_switch' = target
-    /\ UNCHANGED <<daemon_healthy, reconnect_count>>
+    /\ switch_timer' = SWITCH_TIMEOUT   \* start no-signal countdown
+    /\ UNCHANGED <<ws_state, subscribe_active, daemon_healthy,
+                   reconnect_count, input_signal, remote_online>>
 
-\* T→F: Switch completes (TV displays the new input, HDCP settled).
+\* set_input() acknowledged by TV. HDCP settled, signal present.
+\* This is the optimal path — everything worked.
 SwitchComplete ==
     /\ tv_mode = "transitioning"
+    /\ input_signal[tv_input] = TRUE    \* authoritative signal check
     /\ tv_mode' = "fullscreen"
     /\ pending_switch' = "none"
-    /\ UNCHANGED <<tv_input, cursor, capture, daemon_healthy, reconnect_count>>
+    /\ switch_timer' = 0
+    /\ UNCHANGED <<tv_input, cursor, capture, ws_state, subscribe_active,
+                   daemon_healthy, reconnect_count, input_signal, remote_online>>
 
-\* F→M: User or hook enables multiView (side-by-side or PIP).
-\* The splitscreenEnable call is a single atomic SSAP command — no settle delay.
-\* pending_switch set during the call, cleared on return.
+\* set_input() returned an explicit SSAP error (TV refused, timeout, malformed response).
+\* Revert to Linux to preserve always-availability.
+SwitchFailed ==
+    /\ tv_mode = "transitioning"
+    /\ ws_state = "connected"
+    /\ tv_mode' = "fullscreen"
+    /\ tv_input' = "linux"
+    /\ cursor' = "linux"
+    /\ capture' = "idle"
+    /\ pending_switch' = "none"
+    /\ switch_timer' = 0
+    /\ UNCHANGED <<ws_state, subscribe_active, daemon_healthy,
+                   reconnect_count, input_signal, remote_online>>
+
+\* Switch timer expired — TV accepted set_input() but source has no signal.
+\* Covers: remote host powered off, HDMI cable unplugged, GPU not initialized.
+\* Revert to Linux to preserve always-availability.
+SwitchTimeout ==
+    /\ tv_mode = "transitioning"
+    /\ switch_timer = 1                \* last tick before expiry
+    /\ switch_timer' = 0
+    /\ tv_mode' = "fullscreen"
+    /\ tv_input' = "linux"
+    /\ cursor' = "linux"
+    /\ capture' = "idle"
+    /\ pending_switch' = "none"
+    /\ UNCHANGED <<ws_state, subscribe_active, daemon_healthy,
+                   reconnect_count, input_signal, remote_online>>
+
+\* Timer tick — models time passing during switch.
+TimerTick ==
+    /\ tv_mode = "transitioning"
+    /\ switch_timer > 1
+    /\ switch_timer' = switch_timer - 1
+    /\ UNCHANGED <<tv_mode, tv_input, cursor, capture, ws_state,
+                   subscribe_active, daemon_healthy, pending_switch,
+                   reconnect_count, input_signal, remote_online>>
+
+\* =====================================================================
+\* SIGNAL STATUS TRACKING (authoritative TV-reported signal presence)
+\* =====================================================================
+
+\* Periodic query to TV: getExternalInputList or equivalent.
+\* Returns per-port signal presence. This is the authoritative source
+\* for whether a display is actually usable — replaces stale tv_input guess.
+\* Fires non-deterministically to model arbitrary timing of periodic poll.
+SignalUpdate ==
+    /\ ws_state = "connected"
+    /\ input_signal' \in [ActiveInput -> BOOLEAN]
+    \* If currently on a remote host and signal drops, start revert timer.
+    /\ IF tv_mode = "fullscreen" /\ tv_input \in {"mac", "windows"}
+          /\ input_signal'[tv_input] = FALSE THEN
+           /\ switch_timer' = SWITCH_TIMEOUT
+       ELSE
+           /\ UNCHANGED switch_timer
+    /\ UNCHANGED <<tv_mode, tv_input, cursor, capture, ws_state,
+                   subscribe_active, daemon_healthy, pending_switch,
+                   reconnect_count, remote_online>>
+
+\* Signal-loss revert: fullscreen on remote, signal just went dead, timer expired.
+\* Revert to Linux.
+SignalLossRevert ==
+    /\ tv_mode = "fullscreen"
+    /\ tv_input \in {"mac", "windows"}
+    /\ ~input_signal[tv_input]
+    /\ switch_timer = 1
+    /\ switch_timer' = 0
+    /\ tv_mode' = "transitioning"
+    /\ tv_input' = "linux"
+    /\ pending_switch' = "linux"
+    /\ UNCHANGED <<cursor, capture, ws_state, subscribe_active,
+                   daemon_healthy, reconnect_count, input_signal, remote_online>>
+
+\* =====================================================================
+\* REMOTE HOST HEALTH (lan-mouse spoke connectivity)
+\* =====================================================================
+
+\* Remote host lan-mouse spoke disconnects (power off, crash, network loss).
+\* If currently displaying that host, initiate revert to Linux.
+RemoteHostOffline(host) ==
+    /\ host \in {"mac", "windows"}
+    /\ remote_online[host] = TRUE
+    /\ remote_online' = [remote_online EXCEPT ![host] = FALSE]
+    /\ IF tv_mode = "fullscreen" /\ tv_input = host THEN
+           /\ tv_mode' = "transitioning"
+           /\ tv_input' = "linux"
+           /\ pending_switch' = "linux"
+           /\ switch_timer' = SWITCH_TIMEOUT
+       ELSE
+           /\ UNCHANGED <<tv_mode, tv_input, pending_switch, switch_timer>>
+    /\ UNCHANGED <<cursor, capture, ws_state, subscribe_active,
+                   daemon_healthy, reconnect_count, input_signal>>
+
+\* Remote host spoke reconnects (power on, network restored).
+RemoteHostOnline(host) ==
+    /\ host \in {"mac", "windows"}
+    /\ remote_online[host] = FALSE
+    /\ remote_online' = [remote_online EXCEPT ![host] = TRUE]
+    /\ UNCHANGED <<tv_mode, tv_input, cursor, capture, ws_state,
+                   subscribe_active, daemon_healthy, pending_switch,
+                   reconnect_count, switch_timer, input_signal>>
+
+\* =====================================================================
+\* MULTIVIEW TRANSITIONS (Side-by-side / PIP)
+\* =====================================================================
+
+\* F→M: Enable multiView via splitscreenEnable SSAP command.
+\* Atomic SSAP call — no settle delay. pending_switch set during call, cleared on return.
 EnterMultiView ==
     /\ tv_mode = "fullscreen"
     /\ pending_switch = "none"
     /\ daemon_healthy
+    /\ ws_state = "connected"
     /\ tv_mode' = "multiview"
     /\ pending_switch' = "none"
-    /\ UNCHANGED <<tv_input, cursor, capture, reconnect_count>>
+    /\ UNCHANGED <<tv_input, cursor, capture, ws_state, subscribe_active,
+                   reconnect_count, switch_timer, input_signal, remote_online>>
 
-\* M→F: Exit multiView (side-by-side or PIP), return to fullscreen.
-\* The splitscreenEnable-off call is a single atomic SSAP command.
-\* If the target input was already one of the active multiView panes,
-\* the exit is instant; otherwise the TV does a cold switch (HDCP relock).
-\* Restore TV input to the host the cursor is currently capturing.
+\* M→F: Disable multiView, return to fullscreen.
+\* Atomic SSAP call. Restore TV input to the host the cursor is currently capturing.
 ExitMultiView ==
     /\ tv_mode = "multiview"
     /\ pending_switch = "none"
     /\ daemon_healthy
+    /\ ws_state = "connected"
     /\ tv_mode' = "fullscreen"
     /\ tv_input' = CASE capture = "capturing_mac" -> "mac"
                      [] capture = "capturing_windows" -> "windows"
                      [] OTHER -> "linux"
     /\ pending_switch' = "none"
-    /\ UNCHANGED <<cursor, capture, reconnect_count>>
+    /\ UNCHANGED <<cursor, capture, ws_state, subscribe_active,
+                   reconnect_count, switch_timer, input_signal, remote_online>>
 
-\* Cursor crosses edge while in multiView mode: update capture state only,
-\* do NOT switch TV input (it's showing multiple sources already).
+\* Cursor crosses edge while in multiView: update capture state only.
+\* Do NOT switch TV input — it's showing multiple sources already.
 EnterMultiViewHost(host) ==
     LET target == CASE host = "mac" -> "mac"
                     [] host = "windows" -> "windows"
@@ -154,11 +377,17 @@ EnterMultiViewHost(host) ==
     /\ capture' = CASE host = "mac" -> "capturing_mac"
                    [] host = "windows" -> "capturing_windows"
                    [] OTHER -> "capturing_linux"
-    /\ UNCHANGED <<tv_mode, tv_input, pending_switch, daemon_healthy, reconnect_count>>
+    /\ UNCHANGED <<tv_mode, tv_input, ws_state, subscribe_active,
+                   daemon_healthy, pending_switch, reconnect_count,
+                   switch_timer, input_signal, remote_online>>
 
-\* Return to linux: cursor comes back to local machine.
-\* In fullscreen: switch TV input back to linux (async, through transitioning).
-\* In multiView or transitioning: leave TV alone, just release capture.
+\* =====================================================================
+\* RETURN TO LINUX
+\* =====================================================================
+
+\* Cursor comes back to local machine.
+\* Fullscreen: switch TV input back to linux (through transitioning).
+\* MultiView or transitioning: leave TV alone, just release capture.
 ReturnToLinux ==
     /\ cursor \in {"mac", "windows"}
     /\ pending_switch = "none"
@@ -166,126 +395,118 @@ ReturnToLinux ==
     /\ capture' = "idle"
     /\ IF tv_mode = "fullscreen" THEN
            /\ daemon_healthy
+           /\ ws_state = "connected"
            /\ tv_mode' = "transitioning"
            /\ tv_input' = "linux"
            /\ pending_switch' = "linux"
+           /\ switch_timer' = SWITCH_TIMEOUT
        ELSE
-           /\ UNCHANGED <<tv_mode, tv_input, pending_switch, daemon_healthy>>
-    /\ UNCHANGED <<reconnect_count>>
+           /\ UNCHANGED <<tv_mode, tv_input, pending_switch, switch_timer,
+                          daemon_healthy, ws_state>>
+    /\ UNCHANGED <<subscribe_active, reconnect_count,
+                   input_signal, remote_online>>
 
-\* Daemon health transitions.
-\* If daemon dies mid-switch, clear pending_switch (lost, best-effort).
-DaemonDies ==
-    /\ daemon_healthy
-    /\ daemon_healthy' = FALSE
-    /\ pending_switch' = "none"      \* invariant: NoPendingWhenDead
-    /\ reconnect_count' = 0
-    /\ UNCHANGED <<tv_mode, tv_input, cursor, capture>>
+\* =====================================================================
+\* RECONNECT LIFECYCLE
+\* =====================================================================
 
+\* Reconnect attempt failed. Exponential backoff external to spec.
 ReconnectFails ==
     /\ ~daemon_healthy
-    /\ reconnect_count < 30
+    /\ reconnect_count < RECONNECT_CAP
     /\ reconnect_count' = reconnect_count + 1
-    /\ UNCHANGED <<tv_mode, tv_input, cursor, capture, daemon_healthy, pending_switch>>
+    /\ UNCHANGED <<tv_mode, tv_input, cursor, capture, ws_state,
+                   subscribe_active, daemon_healthy, pending_switch,
+                   switch_timer, input_signal, remote_online>>
 
-\* After 30 retries, daemon process exits. systemd Restart=on-failure
-\* gives it a fresh start with reconnect_count=0 on the next Init.
+\* Retry cap reached. Process exits; systemd Restart=on-failure
+\* gives a fresh start with reconnect_count=0 (Init).
 DaemonExits ==
     /\ ~daemon_healthy
-    /\ reconnect_count = 30
-    /\ UNCHANGED <<tv_mode, tv_input, cursor, capture, daemon_healthy, pending_switch, reconnect_count>>
+    /\ reconnect_count = RECONNECT_CAP
+    /\ UNCHANGED <<tv_mode, tv_input, cursor, capture, ws_state,
+                   subscribe_active, daemon_healthy, pending_switch,
+                   reconnect_count, switch_timer, input_signal, remote_online>>
 
-DaemonReconnects ==
-    /\ ~daemon_healthy
-    /\ reconnect_count < 30
-    /\ daemon_healthy' = TRUE
-    /\ reconnect_count' = 0
-    \* Can't know TV state during disconnect; resync from subscribe callback.
-    /\ tv_mode' \in {"fullscreen", "multiview"}
-    /\ tv_input' \in ActiveInput
-    /\ UNCHANGED <<cursor, capture, pending_switch>>
-
-\* TV manually changes mode (user pressed remote button).
-\* Only possible if daemon is connected (subscribe callback is the source).
-\* The remote can only toggle between fullscreen and multiview — never
-\* set the TV to "transitioning" (that's our internal bookkeeping).
-\* Overrides any in-flight software-issued command: clears pending_switch.
-TvRemoteOverride ==
-    /\ daemon_healthy
-    /\ tv_mode' \in {"fullscreen", "multiview"} \ {tv_mode}
-    \* Input may change independently of our capture state (design gap — see below).
-    /\ tv_input' \in ActiveInput
-    /\ pending_switch' = "none"
-    /\ UNCHANGED <<cursor, capture, daemon_healthy, reconnect_count>>
+\* =====================================================================
+\* COMPOSITE NEXT
+\* =====================================================================
 
 Next ==
+    \/ SSAPConnecting
+    \/ SSAPRegistering
+    \/ SSAPRegistered
+    \/ SSAPSubscribe
+    \/ SSAPDisconnect
+    \/ SubscriptionFires
     \/ \E host \in {"mac", "windows"} : EnterOtherHost(host)
-    \/ \E host \in {"mac", "windows"} : EnterMultiViewHost(host)
+    \/ SwitchComplete
+    \/ SwitchFailed
+    \/ SwitchTimeout
+    \/ TimerTick
+    \/ SignalUpdate
+    \/ SignalLossRevert
+    \/ \E host \in {"mac", "windows"} : RemoteHostOffline(host)
+    \/ \E host \in {"mac", "windows"} : RemoteHostOnline(host)
     \/ EnterMultiView
     \/ ExitMultiView
+    \/ \E host \in {"mac", "windows"} : EnterMultiViewHost(host)
     \/ ReturnToLinux
-    \/ SwitchComplete
-    \/ DaemonDies
     \/ ReconnectFails
     \/ DaemonExits
-    \/ DaemonReconnects
-    \/ TvRemoteOverride
 
-Spec == Init /\ [][Next]_<<tv_mode, tv_input, cursor, capture, daemon_healthy, pending_switch, reconnect_count>>
+Spec == Init /\ [][Next]_vars
           /\ WF_vars(ReturnToLinux)
-          /\ WF_vars(DaemonReconnects)
+          /\ WF_vars(SSAPRegistered)
 
-\* --- LIVENESS ---
-\* Daemon eventually reconnects or reaches the retry cap (process exits).
+\* =====================================================================
+\* LIVENESS
+\* =====================================================================
+
+\* Daemon eventually reconnects or reaches the retry cap.
 EventuallyReconnect ==
-    (~daemon_healthy) ~> (daemon_healthy \/ reconnect_count = 30)
+    (~daemon_healthy /\ ws_state = "disconnected")
+        ~> (daemon_healthy /\ ws_state = "connected" \/ reconnect_count = RECONNECT_CAP)
 
-\* --- DESIGN GAPS (discovered by model) ---
+\* If a remote host is selected but unusable, eventually revert to Linux.
+EventuallyRevert ==
+    (tv_mode = "fullscreen" /\ tv_input \in {"mac", "windows"}
+     /\ (~input_signal[tv_input] \/ ~remote_online[tv_input]))
+        ~> (tv_input = "linux")
 
-\* GAP 1 (multiView → return to linux): If multiView (SXS or PIP) was
-\* entered manually via remote, returning to linux leaves TV in multiView
-\* mode. The user sees the multiView layout with linux already present,
-\* which may be acceptable. To return to fullscreen, the user must
-\* manually exit multiView via remote or call /multiview/off.
+\* =====================================================================
+\* DESIGN DECISIONS
+\* =====================================================================
 
-\* GAP 2 (remote input override): TvRemoteOverride allows tv_input' to
-\* be anything, even if it contradicts capture state (e.g., cursor on mac
-\* but remote switches TV to windows). DisplayMatchesCursor breaks.
-\* Resolution: the subscribe callback fires, daemon learns the new input,
-\* but capture state doesn't auto-correct — the user's cursor remains on
-\* mac while the display shows windows. This is a real-world gap: the
-\* daemon cannot force capture to follow a manual TV input change.
-\*
-\* RECONCILE (structural fix for C2 traces A+B and this gap):
-\* After DaemonReconnects or TvRemoteOverride, if tv_mode = "fullscreen"
-\* and tv_input disagrees with capture's implied input, issue a corrective
-\* set_input. This gives pending_switch a recovery path independent of
-\* connection drop, and covers the restart-race and remote-override cases
-\* in one mechanism. Trace A (death mid-transition) is also covered:
-\* Reconcile fires after SwitchComplete commits stale tv_input.
-\* Implementation: wrapped in a function called on reconnect, after
-\* subscribe callback fires, and once as a timeout backstop for
-\* pending_switch. Modeled as:
-\*
-\* Reconcile ==
-\*     /\ tv_mode = "fullscreen"
-\*     /\ ~daemon_healthy \/ pending_switch /= "none"
-\*        \* ... issue corrective set_input, set pending_switch ...
-
-\* --- FIXED MODEL NOTES ---
-\* C1 (stuck pending_switch): EnterMultiView/ExitMultiView clear pending_switch
-\*     directly (atomic SSAP calls). ReturnToLinux routes through
-\*     "transitioning" like EnterOtherHost.
-\* C2 (DisplayMatchesCursor violations): /\ precedence is fixed; Reconcile
-\*     action sketched above fixes the restart-race and remote-override cases.
-\* C3 (deadlock at cap): DaemonExits represents process exit; systemd restart
-\*     returns to Init with fresh reconnect_count = 0.
-\* C4 (TvRemoteOverride): pending_switch cleared; tv_mode' restricted to
-\*     {"fullscreen","multiview"}.
-\* C5 (liveness): EventuallyReturn dropped (user behavior); EventuallyReconnect
-\*     accounts for retry cap; WF on ReturnToLinux + DaemonReconnects.
-\* C6 (no-op enter): EnterOtherHost guards tv_input /= target.
-\* C7 (cleanups): "edge" dropped, PendingValues tightened, CASE OTHER added.
+\* C1 (stuck pending): EnterMultiView/ExitMultiView clear pending directly
+\*     (atomic SSAP calls). ReturnToLinux routes through transitioning
+\*     like EnterOtherHost. SwitchFailed/SwitchTimeout clear pending.
+\* C2 (DisplayMatchesCursor violations): Resolved by SwitchFailed,
+\*     SwitchTimeout, SignalLossRevert, and RemoteHostOffline — all revert
+\*     to Linux when the display is unusable. SubscriptionFires handles
+\*     TvRemoteOverride races.
+\* C3 (deadlock at cap): DaemonExits → systemd restart → fresh Init with
+\*     reconnect_count = 0.
+\* C4 (TvRemoteOverride): SubscriptionFires clears pending_switch.
+\*     tv_mode' restricted to {"fullscreen","multiview"} — remote can't
+\*     set transitioning.
+\* C5 (liveness violated by user): EventuallyReturn dropped (user may
+\*     never return cursor). Instead: EventuallyRevert ensures the
+\*     system recovers from host failure. EventuallyReconnect covers the
+\*     SSAP health path.
+\* C6 (stale-state no-op): REMOVED. Approach 1: always issue set_input(),
+\*     never skip based on cached tv_input. set_input() is idempotent.
+\*     tv_input is now informational-only — not a gating condition.
+\* C7 (stale state elimination): tv_input is no longer the authority on
+\*     what the TV displays. input_signal (from TV SSAP query) and
+\*     remote_online (from lan-mouse spoke) are the authoritative sources.
+\* C8 (always-availability): LinuxAlwaysAvailable invariant enforced by
+\*     SwitchFailed, SwitchTimeout, SignalLossRevert, and
+\*     RemoteHostOffline. The system never gets stuck on a dead display.
+\* C9 (unified design): SSAP lifecycle (ws_state, subscribe_active) and
+\*     daemon state machine (tv_mode, tv_input, cursor, capture) are
+\*     modeled in one spec. The HealthDefinition invariant ties them
+\*     together: daemon_healthy iff connected AND subscribed.
 
 =================================================================================
 ```
@@ -295,13 +516,13 @@ EventuallyReconnect ==
 ### Actors
 
 ```
-┌─────────────┐     enter_hook      ┌──────────────┐    bscpylgtv library     ┌──────┐
-│  lan-mouse  │ ──── curl ────────→ │ tv-multiview  │ ──── WebOS SSAP ──────→ │  TV  │
-│   (hub)     │                     │   daemon      │                          │      │
-└─────────────┘                     │  (Python)     │ ←── subscribe callback ── │      │
+┌─────────────┐     enter_hook      ┌──────────────┐    persistent wss://      ┌──────┐
+│  lan-mouse  │ ──── curl ────────→ │ tv-multiview  │ ──── SSAP (WebSocket) ─→ │  TV  │
+│   (hub)     │                     │   daemon      │                          │ G4   │
+└─────────────┘                     │  (Rust)       │ ←── subscribe callback ── │      │
                                     └──────────────┘                          └──────┘
                                            │
-                                           │ HTTP API (aiohttp)
+                                           │ HTTP API (axum)
                                            ▼
                                     ┌──────────────┐
                                     │  External     │
@@ -310,97 +531,166 @@ EventuallyReconnect ==
                                     │  toggle)     │
                                     └──────────────┘
 
-Note: LG_Buddy (Rust) also talks to the TV via the same bscpylgtv Python
-library — it spawns /usr/bin/LG_Buddy_PIP/bin/bscpylgtvcommand as a
-subprocess per command. Our daemon imports bscpylgtv as a library and
-maintains a persistent WebSocket. Both share the same .aiopylgtv.sqlite
-key file at ~/.config/lg-buddy/ (set via WorkingDirectory).
+The Rust daemon holds one persistent wss:// connection to the TV for its
+entire lifetime. No subprocess-per-command. No repeated TLS handshakes.
+No repeated SSAP register. All SSAP operations (set_input,
+set_splitscreen, get_signal_status, subscribe) flow over the same
+long-lived WebSocket.
+
+The daemon uses the same .aiopylgtv.sqlite client-key file as LG_Buddy
+(at ~/.config/lg-buddy/), so one TV pairing works for both tools.
 ```
 
 ### API Endpoints
 
 | Method | Path | Purpose | Returns |
 |---|---|---|---|
-| GET | `/enter/{target}` | lan-mouse enter_hook. Switch to `target` if fullscreen and no pending switch | TV mode string |
-| GET | `/multiview/on` | Enable multiView via `splitscreenEnable` toggle (commercial category, pending live-TV verification — see Phase 2/X3) | TV mode string |
-| GET | `/multiview/off` | Disable multiView | TV mode string |
-| GET | `/status` | Health + current state | JSON |
-| GET | `/health` | Liveness probe (always 200 if process alive) | `"ok"` |
+| GET | `/enter/{target}` | lan-mouse enter_hook. Switch to `target`. Always issues set_input() (no stale-state no-op). | TV mode string |
+| GET | `/multiview/on` | Enable multiView via `splitscreenEnable` SSAP command. | TV mode string |
+| GET | `/multiview/off` | Disable multiView. | TV mode string |
+| GET | `/status` | Health + current state + signal status. | JSON |
+| GET | `/health` | Liveness probe (always 200 if process alive). | `"ok"` |
 
 ### State Machine (Daemon Internal)
 
 ```
-                    ┌──────────────────────────────────┐
-                    │            DISCONNECTED           │
-                    │  daemon_healthy = false           │
-                    │  HTTP: 503                        │
-                    └──────┬──────────────┬────────────┘
-                           │ reconnect    │ disconnect
-                           ▼              ▼
-              ┌─────────────────────────────────────────┐
-              │              CONNECTED                   │
-              │  ┌──────────┐   multiview   ┌──────────┐ │
-              │  │FULLSCREEN│ ── on ──────→ │MULTIVIEW │ │
-              │  │          │ ←── off ───── │(SXS/PIP) │ │
-              │  │ enter→   │              │ enter→    │ │
-              │  │ TRANS.   │              │ capture   │ │
-              │  │  (async) │              │ only      │ │
-              │  └──────────┘              └──────────┘ │
-              └─────────────────────────────────────────┘
-```
+                         ┌──────────────────────────────────┐
+                         │          DISCONNECTED             │
+                         │  ws_state = disconnected          │
+                         │  daemon_healthy = false           │
+                         │  HTTP: 503                        │
+                         └──────┬──────────────┬────────────┘
+                                │ reconnect    │ disconnect
+                                ▼              ▼
+                   ┌─────────────────────────────────────────────────────┐
+                   │                   CONNECTED                          │
+                   │  ws_state = connected, subscribe_active = true       │
+                   │                                                     │
+                   │  ┌──────────┐   multiview     ┌──────────┐          │
+                   │  │FULLSCREEN│ ── on ────────→ │MULTIVIEW │          │
+                   │  │          │ ←── off ─────── │(SXS/PIP) │          │
+                   │  │          │                 │          │          │
+                   │  │ enter→   │                 │ enter→   │          │
+                   │  │ TRANS.   │                 │ capture  │          │
+                   │  │  ┌───────┼───┐             │ only     │          │
+                   │  │  │ SwitchComplete  │       └──────────┘          │
+                   │  │  │ SwitchFailed    │                              │
+                   │  │  │ SwitchTimeout   │                              │
+                   │  │  └───────┼───┘             ┌──────────┐          │
+                   │  │          │                 │ SIGNAL   │          │
+                   │  │  SignalLossRevert ───────→ │ LOSS     │          │
+                   │  │          │                 │ REVERT   │          │
+                   │  └──────────┘                 └──────────┘          │
+                   │                                                     │
+                   │  ┌──────────┐                                       │
+                   │  │ REMOTE   │  RemoteHostOffline ──→ revert to linux│
+                   │  │ HOST     │                                       │
+                   │  │ OFFLINE  │                                       │
+                   │  └──────────┘                                       │
+                   └─────────────────────────────────────────────────────┘
 
-**Pending switch gating:** `pending_switch != "none"` blocks all new transitions
-that would produce a TV command. This provides natural debounce: a second
-rapid enter while a switch is in flight returns the current mode string
-without issuing a new command.
+Pending switch gating: pending_switch != "none" blocks all new transitions
+that produce a TV command (natural debounce).
+
+Failure is always recoverable: SwitchFailed, SwitchTimeout, SignalLossRevert,
+and RemoteHostOffline all converge to tv_input = "linux", cursor = "linux",
+capture = "idle" — the always-available baseline.
+```
 
 ### Reliability Design
 
-#### 1. Connection Lifecycle
+#### 1. SSAP Lifecycle (persistent wss://)
 
-```python
-class TvDaemonState:
-    healthy: bool
-    tv_mode: str              # "fullscreen" | "multiview" | "unknown"
-    last_mode_change: float   # epoch
-    reconnect_count: int      # exponential backoff: 1,2,4,8,16,30,60s cap
-    pending_switch: Optional[str]  # in-flight command; blocks new commands
-    uptime: float
-```
+The daemon holds one persistent WebSocket connection to the TV.
+This eliminates the ~28% CPU overhead of spawning a Python subprocess
+per command (previously `bscpylgtvcommand` every 5s).
 
 **Connect flow:**
-1. Load existing key from `~/.config/lg-buddy/.aiopylgtv.sqlite`
-2. Exponential backoff: 1s → 2s → 4s → 8s → 16s → 30s → 60s (cap)
-3. On connect: resubscribe to `multiViewStatus`
-4. Max 30 retries (StartLimitBurst=10 per 60s in systemd)
+1. TCP + TLS handshake to `wss://TV_IP:3001/` (TV self-signed cert, trusted).
+2. SSAP register: send client-key (from `~/.config/lg-buddy/.aiopylgtv.sqlite`).
+   On first ever connect, TV shows pairing prompt; subsequent connects use
+   the persisted client-key with no prompt.
+3. Subscribe to `multiViewStatus` push updates.
+4. Query signal status (`getExternalInputList` or equivalent) to resolve
+   any stale state from while disconnected.
+5. daemon_healthy = TRUE only after all of the above succeed.
 
-**Disconnect detection:**
-- `ping_interval=5` (WebSocket keepalive, 3 missed pings = disconnect)
-- 30s heartbeat: `get_current_sw_info()` as fallback
-- On disconnect: `healthy=False`, `pending_switch="none"`, all commands return 503
+**Keepalive:** WebSocket-level ping/pong (tokio-tungstenite built-in).
+No separate heartbeat command needed. If the TV misses 3 consecutive pongs,
+the WebSocket is declared dead and `SSAPDisconnect` fires.
+
+**Reconnect:** Exponential backoff (1s → 2s → 4s → ... → 60s cap).
+After RECONNECT_CAP (30) consecutive failures, the process exits.
+systemd `Restart=on-failure` gives a fresh start.
 
 #### 2. Enter Hook Logic
 
 ```
 curl → /enter/{target}:
-  1. If healthy=false → 503
+  1. If daemon_healthy=false → 503
   2. If pending_switch != none → 200 current_mode  (debounce)
   3. If mode=multiview → 200 "multiview"           (skip, don't disturb multiView)
-  4. If mode=fullscreen AND input == target → 200 "fullscreen"  (no-op)
-  5. If mode=fullscreen AND input != target → set_input → 200 "fullscreen"
+  4. If mode=fullscreen → set_input(target) always  (APPROACH 1: no stale-state no-op)
+     ├─ success + signal present → SwitchComplete → 200 "fullscreen"
+     ├─ success + no signal      → SwitchTimeout  → revert to linux → 200 "fullscreen"
+     └─ SSAP error               → SwitchFailed   → revert to linux → 502
 ```
 
-#### 3. Observability
+The key change from the previous design (C6): step 4 no longer checks
+`tv_input == target`. It always issues `set_input()`. The TV's actual
+state is determined by `input_signal` (from SSAP query) and `remote_online`
+(from lan-mouse spoke), not by cached `tv_input`.
+
+#### 3. Failure Recovery Paths
+
+All failures converge to the same recovery state:
+`tv_input = "linux"`, `cursor = "linux"`, `capture = "idle"`.
+
+| Failure | Detection | Recovery Time | Transition |
+|---|---|---|---|
+| set_input() SSAP error | Immediate (response code) | <1s | SwitchFailed |
+| Source has no HDMI signal | switch_timer expires (5s) | 5s | SwitchTimeout |
+| Signal drops after stable connection | SignalUpdate periodic poll | 5s (SWITCH_TIMEOUT) | SignalLossRevert |
+| Remote host spoke disconnects | lan-mouse hub event | <3s | RemoteHostOffline |
+| WebSocket disconnects | ping timeout (~15s) | ~15s + reconnect backoff | SSAPDisconnect → reconnect |
+| TV reboot | ping timeout → reconnect | ~20s | SSAPDisconnect → reconnect → SSAPRegistered |
+
+#### 4. Signal Status Tracking
+
+The daemon periodically queries the TV for per-input signal presence
+(via SSAP `getExternalInputList` or equivalent endpoint). This is the
+**authoritative** source for whether a display is actually usable — it
+replaces the old approach of trusting the cached `tv_input` variable.
+
+Query frequency: once after each switch (to confirm signal), then every
+10s while a remote host is selected (to detect mid-session signal loss).
+No query while on Linux (zero overhead for the always-available baseline).
+
+#### 5. Remote Host Health Tracking
+
+The daemon monitors lan-mouse spoke connectivity to determine whether
+remote hosts are online. If a spoke disconnects while that host's input
+is selected, the daemon reverts to Linux.
+
+This covers:
+- macOS powered off after being selected.
+- Windows crash/reboot while selected.
+- Network loss to the remote host.
+
+#### 6. Observability
 
 **Structured JSON logging (stdout, one object per line):**
 ```json
-{"ts":"...","event":"connect","ip":"192.0.2.20","retry":0}
-{"ts":"...","event":"connected"}
-{"ts":"...","event":"mode_change","from":"fullscreen","to":"multiview","source":"subscribe"}
-{"ts":"...","event":"enter","target":"mac","mode":"multiview","action":"skip"}
-{"ts":"...","event":"enter","target":"linux","mode":"fullscreen","action":"switch","input":"HDMI_4"}
-{"ts":"...","event":"disconnect","reason":"ping_timeout"}
-{"ts":"...","event":"reconnect_fail","retry":3}
+{"ts":"...","event":"ssap_connecting","tv_ip":"192.0.2.20"}
+{"ts":"...","event":"ssap_registered","client_key_present":true}
+{"ts":"...","event":"subscribed","topic":"multiViewStatus"}
+{"ts":"...","event":"enter","target":"mac","action":"switch","input":"HDMI_3"}
+{"ts":"...","event":"switch_complete","input":"mac","signal":true}
+{"ts":"...","event":"switch_timeout","target":"mac","action":"revert_to_linux"}
+{"ts":"...","event":"switch_failed","target":"windows","error":"timeout","action":"revert_to_linux"}
+{"ts":"...","event":"signal_loss","input":"mac","action":"revert_to_linux"}
+{"ts":"...","event":"remote_offline","host":"mac","action":"revert_to_linux"}
+{"ts":"...","event":"ssap_disconnect","reason":"ping_timeout"}
 ```
 
 **`/status` response:**
@@ -409,7 +699,12 @@ curl → /enter/{target}:
   "mode": "fullscreen",
   "input": "linux",
   "healthy": true,
+  "ws_state": "connected",
+  "subscribe_active": true,
   "pending_switch": null,
+  "switch_timer": 0,
+  "input_signal": {"linux": true, "mac": false, "windows": true},
+  "remote_online": {"mac": false, "windows": true},
   "uptime_seconds": 3600,
   "reconnect_total": 0,
   "switch_count": {"linux": 12, "mac": 8, "windows": 5},
@@ -417,83 +712,19 @@ curl → /enter/{target}:
 }
 ```
 
-#### 4. systemd Integration
+#### 7. systemd Integration
 
 ```
 [Service]
-ExecStart=/usr/bin/LG_Buddy_PIP/bin/python3 .../tv_multiview_daemon.py
-WorkingDirectory=$HOME/.config/lg-buddy
+ExecStart=/home/example/.local/bin/tv-multiview
 Restart=on-failure
 RestartSec=5
 StartLimitIntervalSec=60
 StartLimitBurst=10
 ```
 
-Signal handling: SIGTERM → `client.disconnect()` → graceful shutdown. SIGUSR1 → dump state to stderr.
-
-#### 5. Edge Cases
-
-| Scenario | Behavior |
-|---|---|
-| TV off when daemon starts | Exponential backoff, HTTP returns 503 |
-| TV reboot during capture | Detect disconnect, reconnect, resubscribe |
-| WiFi blip (silent) | 30s heartbeat detects, triggers reconnect |
-| Remote: enter multiView (SXS or PIP) | subscribe callback → `mode=multiview` → future enters skip |
-| Remote: exit multiView → fullscreen | Callback → `mode=fullscreen` → next enter switches |
-| Remote: switch to different input | subscribe callback learns new input; capture state unchanged → `DisplayMatchesCursor` gap |
-| Two rapid enters | Second sees `pending_switch != none` → debounce, returns current mode |
-| Return to linux while multiView active | TV stays in multiView (linux already present); capture released |
-| `splitscreenEnable` fails | Log warning, return 500; read-only `multiViewStatus` still works |
-| bscpylgtv library crash | Exception caught, log, systemd restarts |
-| TV IP changes | Daemon crashes → systemd restarts → fails to connect → admin must update config |
-
-## Implementation Phases
-
-### Phase 0: Fix Critical Defects (current daemon)
-
-| Task | Description |
-|---|---|
-| P0 | Add `ping_interval=5` to `WebOsClient.create()` |
-| P0 | Add 30s heartbeat + reconnect loop |
-| P0 | Implement `pending_switch` gate (debounce rapid enters) |
-| P1 | Structured JSON logging |
-| P1 | Handle SIGTERM with `client.disconnect()` |
-| P1 | Return 503 when `healthy=false` |
-| P1 | Return 400 for invalid target |
-
-### Phase 1: State Machine
-
-| Task | Description |
-|---|---|
-| S1 | `TvDaemonState` dataclass with all fields |
-| S2 | `DaemonDies` / `ReconnectFails` / `DaemonReconnects` transitions |
-| S3 | `EnterOtherHost` sets `transitioning` → `SwitchComplete` resolves to `fullscreen` |
-| S4 | `EnterMultiViewHost` (capture-only, no TV change) |
-
-### Phase 2: MultiView Control (SXS and PIP)
-
-| Task | Description |
-|---|---|
-| X1 | `/multiview/on` → `set_system_settings("commercial", {"splitscreenEnable": "on"})` (expected API, verify on live TV) |
-| X2 | `/multiview/off` → same toggle off |
-| X3 | **Verify** on live TV: confirm category, method, and that toggling works before committing |
-
-### Phase 3: Observability
-
-| Task | Description |
-|---|---|
-| O1 | `/status` endpoint (JSON metrics) |
-| O2 | `/health` endpoint (liveness probe) |
-| O3 | JSON-line structured logging |
-| O4 | systemd `StartLimitIntervalSec` + `StartLimitBurst` |
-
-### Phase 4: Integration
-
-| Task | Description |
-|---|---|
-| I1 | Update `tv-multiview.service.j2` with `WorkingDirectory=~/.config/lg-buddy` + `StartLimit*` |
-| I2 | Update `tv_multiview_daemon.py.j2` with full implementation |
-| I3 | `/multiview/on` and `/multiview/off` are standalone — NOT embedded in `enter_hook` |
+Signal handling: SIGTERM → graceful WebSocket close → shutdown.
+SIGUSR1 → dump full state to stderr (debugging).
 
 ## Architecture Decision Records
 
@@ -509,27 +740,84 @@ Signal handling: SIGTERM → `client.disconnect()` → graceful shutdown. SIGUSR
 
 ### ADR-002: Shared LG_Buddy key file
 
-**Decision:** `WorkingDirectory={{ ansible_env.HOME }}/.config/lg-buddy` so bscpylgtv
-finds the existing `.aiopylgtv.sqlite` key file (same one LG_Buddy uses).
+**Decision:** Read client-key from `~/.config/lg-buddy/.aiopylgtv.sqlite`
+(same file LG_Buddy uses). One TV pairing, one key file.
 
 **Rationale:**
-- LG_Buddy shells out to `/usr/bin/LG_Buddy_PIP/bin/bscpylgtvcommand` — same
-  bscpylgtv library, same key file format
-- Our daemon imports bscpylgtv as a library — same key file, same pairing
-- One TV pairing, one key file, shared between both processes
-- Python venv at `/usr/bin/LG_Buddy_PIP/` provides the interpreter + library
+- LG_Buddy and our daemon speak the same SSAP protocol to the same TV
+- The client-key from the initial pairing prompt is stored in sqlite
+- Sharing the key file means the user pairs once, both tools work
 
 ### ADR-003: MultiView toggle is standalone, not cursor-driven
 
 **Decision:** `/multiview/on` and `/multiview/off` are independent HTTP endpoints —
-NOT embedded in `enter_hook` parameters. MultiView mode is toggled by explicit
-call, not by cursor crossing.
+NOT embedded in `enter_hook` parameters.
 
 **Rationale:**
-- `splitscreenEnable` (category `"commercial"`, per G4 firmware settings catalog snapshot —
-  pending live-TV verification) only toggles mode on/off — cannot select which inputs go
-  into multiView (side-by-side or PIP)
+- `splitscreenEnable` only toggles mode on/off — cannot select which inputs
+  go into multiView
 - The user pre-configures the desired layout and input pair once via remote
 - Cursor movement should switch inputs in fullscreen, not trigger multiView
-- The API endpoint works identically regardless of whether the user chose
-  side-by-side or PIP — it's a single `multiViewStatus` toggle
+
+### ADR-004: Persistent wss:// (no subprocess-per-command)
+
+**Decision:** The daemon holds one long-lived WebSocket connection to the TV.
+All SSAP commands flow over this connection. No Python subprocess, no
+per-command TLS handshake.
+
+**Rationale:**
+- Eliminates ~28% CPU from Python subprocess startup (previously
+  `bscpylgtvcommand` every 5s for heartbeat)
+- Reduces per-command latency from 300-500ms to <5ms
+- Connection health is immediate (socket error on next write) vs.
+  discovered via 5s heartbeat
+- Subscriptions (push updates from TV) require a persistent connection
+  anyway — can't subscribe over a one-shot subprocess
+
+### ADR-005: Approach 1 — always switch, never skip on stale state
+
+**Decision:** `/enter/{target}` always issues `set_input(target)`.
+There is no "already on target" no-op guard. `tv_input` is
+informational-only (for `/status`), not a gating condition.
+
+**Rationale:**
+- `tv_input` can become stale (user pressed remote, TV rebooted,
+  previous switch silently failed)
+- `set_input()` is idempotent — sending the same HDMI port when already
+  on it is harmless
+- Simpler state machine: one less invariant to maintain
+- Eliminates the bug where the daemon thinks it's on macOS but the display
+  shows something else
+
+### ADR-006: Always-availability — revert to Linux on any failure
+
+**Decision:** If a remote host (mac/windows) is selected but becomes
+unusable, the daemon automatically reverts to Linux. This is the
+`LinuxAlwaysAvailable` invariant in the TLA+ spec.
+
+**Rationale:**
+- The user's desktop must always have a usable display
+- If macOS shows "No Signal" or is powered off, the user is stuck
+  (can't move cursor back because screen edge is unreachable)
+- Detect via: SSAP signal query (no HDMI signal), lan-mouse spoke
+  disconnect (host offline), SSAP command failure (set_input error)
+- All failure paths converge to the same recovery: linux input,
+  linux cursor, idle capture
+
+### ADR-007: SSAP + daemon unified in one TLA+ spec
+
+**Decision:** The TLA+ spec models both the SSAP client lifecycle
+(`ws_state`, `subscribe_active`) and the daemon state machine
+(`tv_mode`, `tv_input`, `cursor`, `capture`) in one module.
+
+**Rationale:**
+- The daemon's state machine depends on SSAP events (disconnect →
+  DaemonDies, register → DaemonReconnects, subscribe fires →
+  SubscriptionFires)
+- The `HealthDefinition` invariant ties them together: daemon_healthy
+  iff connected AND subscribed
+- Modeling them separately would miss race conditions between SSAP
+  events and daemon state transitions
+- In code, they are separated by a module boundary (`src/ssap/`) within
+  a single Rust crate, not a crate boundary — so the unified spec
+  matches the implementation structure
