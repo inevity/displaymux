@@ -51,7 +51,8 @@ VARIABLES
     reconnect_count,    \* consecutive failed reconnect attempts
     switch_timer,       \* countdown for no-signal detection after switch
     input_signal,       \* per-input HDMI signal presence (authoritative, from TV)
-    remote_online       \* per-remote-host lan-mouse spoke connectivity
+    remote_online,      \* per-remote-host lan-mouse spoke connectivity
+    wake_pending        \* host being woken via WoL before retry (None|"mac"|"windows")
 
 \* --- INVARIANTS ---
 
@@ -68,6 +69,7 @@ TypeInvariant ==
     /\ switch_timer \in 0..SWITCH_TIMEOUT
     /\ input_signal \in [ActiveInput -> BOOLEAN]
     /\ remote_online \in [{"mac","windows"} -> BOOLEAN]
+    /\ wake_pending \in ({"none"} \cup (ActiveInput \ {"linux","unknown"}))
 
 \* Display matches cursor position.
 DisplayMatchesCursor ==
@@ -113,6 +115,12 @@ Init ==
     /\ switch_timer = 0
     /\ input_signal = [linux |-> TRUE, mac |-> FALSE, windows |-> FALSE, unknown |-> FALSE]
     /\ remote_online = [mac |-> FALSE, windows |-> FALSE]
+    /\ wake_pending = "none"
+
+\* All variables tuple (used by Spec for stuttering).
+vars == <<tv_mode, tv_input, cursor, capture, ws_state, subscribe_active,
+          daemon_healthy, pending_switch, reconnect_count, switch_timer,
+          input_signal, remote_online, wake_pending>>
 
 \* =====================================================================
 \* SSAP LIFECYCLE (persistent wss:// connection, replaces subprocess-per-command)
@@ -124,7 +132,7 @@ SSAPConnecting ==
     /\ ws_state' = "connecting"
     /\ UNCHANGED <<tv_mode, tv_input, cursor, capture, subscribe_active,
                    daemon_healthy, pending_switch, reconnect_count,
-                   switch_timer, input_signal, remote_online>>
+                   switch_timer, input_signal, remote_online, wake_pending>>
 
 \* SSAP register handshake: send client-key, receive registration confirmation.
 SSAPRegistering ==
@@ -132,7 +140,7 @@ SSAPRegistering ==
     /\ ws_state' = "registering"
     /\ UNCHANGED <<tv_mode, tv_input, cursor, capture, subscribe_active,
                    daemon_healthy, pending_switch, reconnect_count,
-                   switch_timer, input_signal, remote_online>>
+                   switch_timer, input_signal, remote_online, wake_pending>>
 
 \* Registration complete. SSAP ready for commands.
 \* daemon_healthy transitions to TRUE (via HealthDefinition).
@@ -147,7 +155,7 @@ SSAPRegistered ==
     \* Query signal status on reconnect to resolve stale state.
     /\ input_signal' \in [ActiveInput -> BOOLEAN]
     /\ UNCHANGED <<tv_mode, tv_input, cursor, capture,
-                   pending_switch, switch_timer, remote_online>>
+                   pending_switch, switch_timer, remote_online, wake_pending>>
 
 \* Subscribe to multiViewStatus push updates from TV.
 \* daemon_healthy only becomes TRUE after subscription is live
@@ -158,7 +166,7 @@ SSAPSubscribe ==
     /\ subscribe_active' = TRUE
     /\ UNCHANGED <<tv_mode, tv_input, cursor, capture, ws_state,
                    daemon_healthy, pending_switch, reconnect_count,
-                   switch_timer, input_signal, remote_online>>
+                   switch_timer, input_signal, remote_online, wake_pending>>
 
 \* WebSocket drops (TV reboot, WiFi blip, TV off).
 \* Everything goes dead. pending_switch cleared (invariant).
@@ -170,7 +178,7 @@ SSAPDisconnect ==
     /\ pending_switch' = "none"
     /\ switch_timer' = 0
     /\ UNCHANGED <<tv_mode, tv_input, cursor, capture,
-                   reconnect_count, input_signal, remote_online>>
+                   reconnect_count, input_signal, remote_online, wake_pending>>
 
 \* =====================================================================
 \* SUBSCRIPTION CALLBACK (push updates from TV)
@@ -186,10 +194,10 @@ SubscriptionFires ==
     /\ IF pending_switch /= "none" THEN
            /\ pending_switch' = "none"  \* C4: remote override clears pending
        ELSE
-           /\ UNCHANGED pending_switch
+           /\ UNCHANGED <<pending_switch, wake_pending>>
     /\ switch_timer' = 0                \* cancel any in-flight timeout
     /\ UNCHANGED <<cursor, capture, ws_state, subscribe_active,
-                   daemon_healthy, reconnect_count, input_signal, remote_online>>
+                   daemon_healthy, reconnect_count, input_signal, remote_online, wake_pending>>
 
 \* =====================================================================
 \* SWITCH TRANSITIONS (EnterOtherHost → SwitchComplete | SwitchFailed | SwitchTimeout)
@@ -217,6 +225,8 @@ SubscriptionFires ==
 \* Phase 1: Cursor crosses edge. TV input switches. Cursor + capture STAY on Linux.
 \* APPROACH 1: ALWAYS issues set_input() — no stale-state no-op guard.
 \* switch_timer starts countdown for signal verification.
+\* GUARD: target host must be online (remote_online[target] = TRUE).
+\*   If offline, SendWoL fires instead — wake the host, then auto-retry.
 EnterOtherHost(host) ==
     LET target == CASE host = "mac" -> "mac"
                     [] host = "windows" -> "windows"
@@ -227,13 +237,15 @@ EnterOtherHost(host) ==
     /\ cursor \in {"linux"}
     /\ daemon_healthy                   \* requires connected + subscribed
     /\ ws_state = "connected"
+    /\ remote_online[target] = TRUE     \* C11: target must be online (WoL otherwise)
     /\ tv_mode' = "transitioning"
     /\ tv_input' = target
     \* CURSOR + CAPTURE STAY ON LINUX — do not move until signal verified.
     /\ pending_switch' = target
     /\ switch_timer' = SWITCH_TIMEOUT   \* start signal-verification countdown
     /\ UNCHANGED <<cursor, capture, ws_state, subscribe_active,
-                   daemon_healthy, reconnect_count, input_signal, remote_online>>
+                   daemon_healthy, reconnect_count, input_signal, remote_online,
+                   wake_pending>>
 
 \* Phase 2a: set_input() acknowledged AND signal present on target input.
 \* NOW move cursor + capture to target. Return success to lan-mouse.
@@ -248,7 +260,7 @@ SwitchComplete ==
     /\ pending_switch' = "none"
     /\ switch_timer' = 0
     /\ UNCHANGED <<tv_input, ws_state, subscribe_active,
-                   daemon_healthy, reconnect_count, input_signal, remote_online>>
+                   daemon_healthy, reconnect_count, input_signal, remote_online, wake_pending>>
 
 \* Phase 2b: set_input() returned SSAP error.
 \* Cursor never left Linux. Just clear pending, return 502 to lan-mouse.
@@ -260,7 +272,7 @@ SwitchFailed ==
     /\ pending_switch' = "none"
     /\ switch_timer' = 0
     /\ UNCHANGED <<cursor, capture, ws_state, subscribe_active,
-                   daemon_healthy, reconnect_count, input_signal, remote_online>>
+                   daemon_healthy, reconnect_count, input_signal, remote_online, wake_pending>>
 
 \* Phase 2b: Timer expired — set_input() succeeded but no signal on target.
 \* Cursor never left Linux. Revert tv_input, clear pending, return failure.
@@ -272,7 +284,7 @@ SwitchTimeout ==
     /\ tv_input' = "linux"
     /\ pending_switch' = "none"
     /\ UNCHANGED <<cursor, capture, ws_state, subscribe_active,
-                   daemon_healthy, reconnect_count, input_signal, remote_online>>
+                   daemon_healthy, reconnect_count, input_signal, remote_online, wake_pending>>
 
 \* Timer tick — models time passing during switch.
 TimerTick ==
@@ -281,7 +293,7 @@ TimerTick ==
     /\ switch_timer' = switch_timer - 1
     /\ UNCHANGED <<tv_mode, tv_input, cursor, capture, ws_state,
                    subscribe_active, daemon_healthy, pending_switch,
-                   reconnect_count, input_signal, remote_online>>
+                   reconnect_count, input_signal, remote_online, wake_pending>>
 
 \* =====================================================================
 \* SIGNAL STATUS TRACKING (authoritative TV-reported signal presence)
@@ -299,10 +311,10 @@ SignalUpdate ==
           /\ input_signal'[tv_input] = FALSE THEN
            /\ switch_timer' = SWITCH_TIMEOUT
        ELSE
-           /\ UNCHANGED switch_timer
+           /\ UNCHANGED <<switch_timer, wake_pending>>
     /\ UNCHANGED <<tv_mode, tv_input, cursor, capture, ws_state,
                    subscribe_active, daemon_healthy, pending_switch,
-                   reconnect_count, remote_online>>
+                   reconnect_count, remote_online, wake_pending>>
 
 \* Signal-loss revert: fullscreen on remote, signal just went dead, timer expired.
 \* Revert to Linux.
@@ -316,13 +328,40 @@ SignalLossRevert ==
     /\ tv_input' = "linux"
     /\ pending_switch' = "linux"
     /\ UNCHANGED <<cursor, capture, ws_state, subscribe_active,
-                   daemon_healthy, reconnect_count, input_signal, remote_online>>
+                   daemon_healthy, reconnect_count, input_signal, remote_online, wake_pending>>
 
 \* =====================================================================
 \* REMOTE HOST HEALTH (lan-mouse spoke connectivity)
 \* =====================================================================
 
-\* Remote host lan-mouse spoke disconnects (power off, crash, network loss).
+\* Remote host is offline — instead of failing the switch, wake it first.
+\* C11: Send WoL, set wake_pending, and return "waking" to lan-mouse.
+\* The user's cursor stays on Linux; no capture switch happens.
+\* When RemoteHostOnline fires → WakeAndRetry automatically re-enters.
+SendWoL(host) ==
+    /\ host \in {"mac", "windows"}
+    /\ tv_mode = "fullscreen"
+    /\ pending_switch = "none"
+    /\ cursor \in {"linux"}
+    /\ daemon_healthy
+    /\ ws_state = "connected"
+    /\ ~remote_online[host]            \* host is asleep/offline
+    /\ wake_pending = "none"
+    /\ wake_pending' = host
+    /\ UNCHANGED <<tv_mode, tv_input, cursor, capture, ws_state,
+                   subscribe_active, daemon_healthy, pending_switch,
+                    reconnect_count, switch_timer, input_signal, remote_online>>
+                                                                       \* wake_pending set explicitly above
+\* Now that remote_online[host] = TRUE, EnterOtherHost(host) becomes enabled.
+WakeAndRetry(host) ==
+    /\ host \in {"mac", "windows"}
+    /\ wake_pending = host
+    /\ remote_online[host] = TRUE      \* host woke up
+    /\ wake_pending' = "none"
+    /\ UNCHANGED <<tv_mode, tv_input, cursor, capture, ws_state,
+                   subscribe_active, daemon_healthy, pending_switch,
+                                       reconnect_count, switch_timer, input_signal, remote_online>>
+                                                              \* wake_pending set explicitly above (power off, crash, network loss).
 \* If currently displaying that host, initiate revert to Linux.
 RemoteHostOffline(host) ==
     /\ host \in {"mac", "windows"}
@@ -334,18 +373,19 @@ RemoteHostOffline(host) ==
            /\ pending_switch' = "linux"
            /\ switch_timer' = SWITCH_TIMEOUT
        ELSE
-           /\ UNCHANGED <<tv_mode, tv_input, pending_switch, switch_timer>>
+           /\ UNCHANGED <<tv_mode, tv_input, pending_switch, switch_timer, wake_pending>>
     /\ UNCHANGED <<cursor, capture, ws_state, subscribe_active,
-                   daemon_healthy, reconnect_count, input_signal>>
+                   daemon_healthy, reconnect_count, input_signal,
+                   wake_pending>>
 
-\* Remote host spoke reconnects (power on, network restored).
 RemoteHostOnline(host) ==
     /\ host \in {"mac", "windows"}
     /\ remote_online[host] = FALSE
     /\ remote_online' = [remote_online EXCEPT ![host] = TRUE]
     /\ UNCHANGED <<tv_mode, tv_input, cursor, capture, ws_state,
                    subscribe_active, daemon_healthy, pending_switch,
-                   reconnect_count, switch_timer, input_signal>>
+                   reconnect_count, switch_timer, input_signal,
+                   wake_pending>>
 
 \* =====================================================================
 \* MULTIVIEW TRANSITIONS (Side-by-side / PIP)
@@ -361,7 +401,7 @@ EnterMultiView ==
     /\ tv_mode' = "multiview"
     /\ pending_switch' = "none"
     /\ UNCHANGED <<tv_input, cursor, capture, ws_state, subscribe_active,
-                   reconnect_count, switch_timer, input_signal, remote_online>>
+                   reconnect_count, switch_timer, input_signal, remote_online, wake_pending>>
 
 \* M→F: Disable multiView, return to fullscreen.
 \* Atomic SSAP call. Restore TV input to the host the cursor is currently capturing.
@@ -376,7 +416,7 @@ ExitMultiView ==
                      [] OTHER -> "linux"
     /\ pending_switch' = "none"
     /\ UNCHANGED <<cursor, capture, ws_state, subscribe_active,
-                   reconnect_count, switch_timer, input_signal, remote_online>>
+                   reconnect_count, switch_timer, input_signal, remote_online, wake_pending>>
 
 \* Cursor crosses edge while in multiView: update capture state only.
 \* Do NOT switch TV input — it's showing multiple sources already.
@@ -393,7 +433,7 @@ EnterMultiViewHost(host) ==
                    [] OTHER -> "capturing_linux"
     /\ UNCHANGED <<tv_mode, tv_input, ws_state, subscribe_active,
                    daemon_healthy, pending_switch, reconnect_count,
-                   switch_timer, input_signal, remote_online>>
+                   switch_timer, input_signal, remote_online, wake_pending>>
 
 \* =====================================================================
 \* RETURN TO LINUX
@@ -416,9 +456,9 @@ ReturnToLinux ==
            /\ switch_timer' = SWITCH_TIMEOUT
        ELSE
            /\ UNCHANGED <<tv_mode, tv_input, pending_switch, switch_timer,
-                          daemon_healthy, ws_state>>
+                          daemon_healthy, ws_state, wake_pending>>
     /\ UNCHANGED <<subscribe_active, reconnect_count,
-                   input_signal, remote_online>>
+                   input_signal, remote_online, wake_pending>>
 
 \* =====================================================================
 \* RECONNECT LIFECYCLE
@@ -431,7 +471,7 @@ ReconnectFails ==
     /\ reconnect_count' = reconnect_count + 1
     /\ UNCHANGED <<tv_mode, tv_input, cursor, capture, ws_state,
                    subscribe_active, daemon_healthy, pending_switch,
-                   switch_timer, input_signal, remote_online>>
+                   switch_timer, input_signal, remote_online, wake_pending>>
 
 \* Retry cap reached. Process exits; systemd Restart=on-failure
 \* gives a fresh start with reconnect_count=0 (Init).
@@ -440,7 +480,7 @@ DaemonExits ==
     /\ reconnect_count = RECONNECT_CAP
     /\ UNCHANGED <<tv_mode, tv_input, cursor, capture, ws_state,
                    subscribe_active, daemon_healthy, pending_switch,
-                   reconnect_count, switch_timer, input_signal, remote_online>>
+                   reconnect_count, switch_timer, input_signal, remote_online, wake_pending>>
 
 \* =====================================================================
 \* COMPOSITE NEXT
@@ -454,6 +494,8 @@ Next ==
     \/ SSAPDisconnect
     \/ SubscriptionFires
     \/ \E host \in {"mac", "windows"} : EnterOtherHost(host)
+    \/ \E host \in {"mac", "windows"} : SendWoL(host)
+    \/ \E host \in {"mac", "windows"} : WakeAndRetry(host)
     \/ SwitchComplete
     \/ SwitchFailed
     \/ SwitchTimeout
@@ -528,6 +570,15 @@ EventuallyRevert ==
 \*     switch to sleeping/shutdown host → keyboard/mouse captured by dead
 \*     host → user can't move or see anything. The invariant is: cursor
 \*     never moves to a host whose display isn't verified working.
+\* C11 (pre-switch wake): EnterOtherHost requires remote_online[target] = TRUE
+\*     for remote hosts. If the host is asleep/offline, SendWoL fires
+\*     instead — sends Wake-on-LAN, sets wake_pending, returns "waking"
+\*     to lan-mouse. When the host comes online (RemoteHostOnline),
+\*     WakeAndRetry clears wake_pending, and EnterOtherHost becomes
+\*     enabled again (auto-retry). The user never needs to re-trigger
+\*     the edge crossing. If the host never wakes, the user can use the
+\*     TV remote to switch back manually (TvRemoteOverride via
+\*     SubscriptionFires).
 
 =================================================================================
 ```
@@ -651,16 +702,21 @@ curl → /enter/{target}:                               [cursor still on linux]
   1. If daemon_healthy=false → 503
   2. If pending_switch != none → 200 current_mode  (debounce)
   3. If mode=multiview → 200 "multiview"           (skip, don't disturb multiView)
-  4. If mode=fullscreen → TWO-PHASE ENTER:
-     a. set_input(target) always  (APPROACH 1: no stale-state no-op)
-     b. Await SSAP response:
-        ├─ error → SwitchFailed  → revert to linux → 502
-        └─ success → Proceed
-     c. Query signal status on target input:
-        ├─ signal present → SwitchComplete → cursor+capture move to target → 200 "fullscreen"
-        └─ no signal      → SwitchTimeout  → revert to linux            → 502
-     [CRITICAL: cursor+capture only move in step (c) AFTER signal verified.
-      If signal absent, cursor never left linux — user is never trapped.]
+  4. If mode=fullscreen → CHECK TARGET ONLINE:
+     a. If remote_online[target] = FALSE:
+        → send WoL, set wake_pending=target         [C11: pre-switch wake]
+        → return 202 "waking" to lan-mouse
+        → when host comes online → auto-retry step 4
+     b. If remote_online[target] = TRUE → TWO-PHASE ENTER:
+        i.   set_input(target) always  (APPROACH 1: no stale-state no-op)
+        ii.  Await SSAP response:
+             ├─ error → SwitchFailed  → revert to linux → 502
+             └─ success → Proceed
+        iii. Query signal status on target input:
+             ├─ signal present → SwitchComplete → cursor+capture move → 200 "fullscreen"
+             └─ no signal      → SwitchTimeout  → revert to linux   → 502
+        [CRITICAL: cursor+capture only move in step (iii) AFTER signal verified.
+         If signal absent, cursor never left linux — user is never trapped.]
 ```
 
 The key change from the previous design (C6): step 4 no longer checks
@@ -671,6 +727,11 @@ state is determined by `input_signal` (from SSAP query) and `remote_online`
 The second key change (C10): cursor and capture do NOT move to the target
 until signal is verified (two-phase protocol). This prevents the trap
 scenario where the user's keyboard/mouse are captured by a dead host.
+
+The third key change (C11): if the target host is offline, the daemon
+sends Wake-on-LAN and defers the switch. When the host wakes up and its
+lan-mouse spoke connects, the daemon auto-retries the enter. The user
+never needs to manually re-cross the screen edge.
 
 #### 3. Failure Recovery Paths
 
