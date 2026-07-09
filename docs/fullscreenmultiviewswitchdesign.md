@@ -39,12 +39,41 @@ PendingValues == {"none", "multiview_on", "multiview_off"} \cup (ActiveInput \ {
 SSAPState == { "disconnected", "connecting", "registering", "connected" }
 InputOwner == Host  \* keyboard + mouse as one atomic unit
 InputCapabilities == { "keyboard", "pointer" }
+RequestTarget == {"none"} \cup RemoteHosts
+ProtocolPhase == {
+    "idle",
+    "waking",
+    "command_pending",
+    "verification_pending",
+    "grant_pending",
+    "remote_owned",
+    "multiview_owned",
+    "fallback_deferred",
+    "fallback_command_pending",
+    "fallback_verification_pending"
+}
+
+ProtocolType == [
+    commanded_input    : ActiveInput,
+    phase              : ProtocolPhase,
+    switch_epoch       : Nat,
+    verified_epoch     : Nat,
+    request_target     : RequestTarget,
+    request_epoch      : Nat,
+    grant_epoch        : Nat,
+    reservation_target : RequestTarget,
+    reservation_epoch  : Nat,
+    keyboard_owner     : Host,
+    pointer_owner      : Host,
+    fallback_required  : BOOLEAN,
+    tv_control_available : BOOLEAN
+]
 
 \* --- CONSTANTS ---
 
-SWITCH_TIMEOUT == 5     \* seconds before declaring no-signal
-WAKE_TIMEOUT == 60      \* seconds before cancelling a wake attempt
-RECONNECT_CAP == 30     \* max reconnects before process exit
+SWITCH_TIMEOUT == 5     \* candidate deadline; production value uses measured p99
+WAKE_TIMEOUT == 60      \* candidate wake deadline; configurable per host
+RECONNECT_CAP == 30     \* alert threshold only; transient failures keep retrying
 
 HostCapture == [
     linux |-> "capturing_linux",
@@ -59,7 +88,7 @@ CaptureFor(host) ==
 
 VARIABLES
     tv_mode,            \* "fullscreen" | "multiview" | "transitioning"
-    tv_input,           \* last commanded input (informational — NOT used as gate)
+    tv_input,           \* last TV-observed active input; never set by command intent
     cursor,             \* cursor location
     capture,            \* lan-mouse capture state
     input_owner,         \* atomic keyboard+mouse owner; never split
@@ -70,10 +99,11 @@ VARIABLES
     reconnect_count,    \* consecutive failed reconnect attempts
     switch_timer,       \* countdown for no-signal detection after switch
     wake_timer,         \* countdown for host wake attempt
-    input_signal,       \* per-input HDMI signal presence (authoritative, from TV)
+    input_signal,       \* cached TV observation; epoch proves transaction freshness
     remote_online,      \* per-remote-host lan-mouse spoke connectivity
     remote_input_ready, \* per-host keyboard+pointer injection readiness
-    wake_pending        \* host being woken via WoL before retry ("none" or RemoteHosts)
+    wake_pending,       \* host being woken via WoL before retry ("none" or RemoteHosts)
+    protocol            \* command, observation, reservation, grant, and owner state
 
 \* --- INVARIANTS ---
 
@@ -87,7 +117,7 @@ TypeInvariant ==
     /\ subscribe_active \in BOOLEAN
     /\ daemon_healthy \in BOOLEAN
     /\ pending_switch \in PendingValues
-    /\ reconnect_count \in 0..RECONNECT_CAP
+    /\ reconnect_count \in Nat
     /\ switch_timer \in 0..SWITCH_TIMEOUT
     /\ wake_timer \in 0..WAKE_TIMEOUT
     /\ input_signal \in [ActiveInput -> BOOLEAN]
@@ -96,11 +126,14 @@ TypeInvariant ==
     \* values, so each per-host readiness map is a total function over them.
     /\ remote_input_ready \in [RemoteHosts -> [InputCapabilities -> BOOLEAN]]
     /\ wake_pending \in ({"none"} \cup RemoteHosts)
+    /\ protocol \in ProtocolType
 
 \* Keyboard and mouse are never independently switched. The local user's
 \* physical input is one unit: pointer motion, pointer buttons, scroll, and
 \* keyboard events must be owned by the same host at every visible state.
 InputOwnershipAtomic ==
+    /\ protocol.keyboard_owner = protocol.pointer_owner
+    /\ protocol.keyboard_owner = input_owner
     /\ (input_owner = SERVER_HOST) =>
          (cursor = SERVER_HOST /\ capture = "idle")
     /\ \A host \in RemoteHosts :
@@ -111,6 +144,26 @@ RemoteReadyForControl(host) ==
     /\ remote_online[host] = TRUE
     /\ remote_input_ready[host]["keyboard"] = TRUE
     /\ remote_input_ready[host]["pointer"] = TRUE
+
+ReservationValid(host) ==
+    /\ host \in RemoteHosts
+    /\ protocol.reservation_target = host
+    /\ protocol.reservation_epoch = protocol.request_epoch
+    /\ RemoteReadyForControl(host)
+
+FreshRemoteVerification(host) ==
+    /\ protocol.phase = "verification_pending"
+    /\ protocol.commanded_input = host
+    /\ protocol.verified_epoch = protocol.switch_epoch
+    /\ tv_input = host
+    /\ input_signal[host]
+
+FreshServerVerification ==
+    /\ protocol.phase = "fallback_verification_pending"
+    /\ protocol.commanded_input = SERVER_HOST
+    /\ protocol.verified_epoch = protocol.switch_epoch
+    /\ tv_input = SERVER_HOST
+    /\ input_signal[SERVER_HOST]
 
 \* If input is owned by a remote host in fullscreen, the visible input must
 \* be that same host. Server-host ownership can temporarily coexist with a
@@ -126,8 +179,10 @@ DisplayMatchesInputOwner ==
 \* about the machine that runs the lan-mouse hub/server.
 ServerHostNormalFallback ==
     (daemon_healthy /\ tv_mode = "fullscreen" /\ input_owner = SERVER_HOST
-     /\ pending_switch = "none" /\ switch_timer = 0) =>
+     /\ pending_switch = "none" /\ switch_timer = 0
+     /\ protocol.phase = "idle" /\ ~protocol.fallback_required) =>
         /\ tv_input = SERVER_HOST
+        /\ input_signal[SERVER_HOST]
         /\ cursor = SERVER_HOST
         /\ capture = "idle"
 
@@ -142,7 +197,34 @@ NoPendingWhenDead ==
 ServerHostAlwaysAvailable ==
     (daemon_healthy /\ tv_mode = "fullscreen" /\ tv_input \in RemoteHosts) =>
         (input_signal[tv_input] = TRUE /\ RemoteReadyForControl(tv_input)
-         \/ switch_timer > 0)
+         \/ protocol.fallback_required \/ switch_timer > 0)
+
+FallbackReleasesInputImmediately ==
+    protocol.fallback_required =>
+      /\ input_owner = SERVER_HOST
+      /\ protocol.keyboard_owner = SERVER_HOST
+      /\ protocol.pointer_owner = SERVER_HOST
+
+GrantIsFresh ==
+    (protocol.phase = "grant_pending") =>
+      /\ protocol.request_target \in RemoteHosts
+      /\ protocol.grant_epoch = protocol.request_epoch
+      /\ ReservationValid(protocol.request_target)
+      /\ protocol.verified_epoch = protocol.switch_epoch
+      /\ tv_input = protocol.request_target
+      /\ input_signal[protocol.request_target]
+
+RemoteOwnershipHasLease ==
+    \A host \in RemoteHosts :
+      (input_owner = host) =>
+        /\ ReservationValid(host)
+        /\ protocol.phase \in {"remote_owned", "multiview_owned"}
+
+RemoteFullscreenKnownSafe ==
+    (tv_mode = "fullscreen" /\ input_owner \in RemoteHosts) =>
+      /\ tv_input = input_owner
+      /\ (input_signal[input_owner] /\ ReservationValid(input_owner)
+          \/ switch_timer > 0)
 
 \* Subscription only active when connected.
 SubscribeRequiresConnected ==
@@ -174,16 +256,41 @@ Init ==
          h \in RemoteHosts |-> ["keyboard" |-> FALSE, "pointer" |-> FALSE]
        ]
     /\ wake_pending = "none"
+    /\ protocol = [
+         commanded_input |-> SERVER_HOST,
+         phase |-> "idle",
+         switch_epoch |-> 0,
+         verified_epoch |-> 0,
+         request_target |-> "none",
+         request_epoch |-> 0,
+         grant_epoch |-> 0,
+         reservation_target |-> "none",
+         reservation_epoch |-> 0,
+         keyboard_owner |-> SERVER_HOST,
+         pointer_owner |-> SERVER_HOST,
+         fallback_required |-> FALSE,
+         tv_control_available |-> FALSE
+       ]
 
 \* All variables tuple (used by Spec for stuttering).
 vars == <<tv_mode, tv_input, cursor, capture, input_owner, ws_state,
           subscribe_active, daemon_healthy, pending_switch, reconnect_count,
           switch_timer, wake_timer, input_signal, remote_online,
-          remote_input_ready, wake_pending>>
+          remote_input_ready, wake_pending, protocol>>
 
 \* =====================================================================
 \* SSAP LIFECYCLE (persistent wss:// connection, replaces subprocess-per-command)
 \* =====================================================================
+
+\* Environment assumption boundary: this says the TV control path is
+\* reachable again; it does not itself complete any lifecycle phase.
+TVControlAvailable ==
+    /\ ~protocol.tv_control_available
+    /\ protocol' = [protocol EXCEPT !.tv_control_available = TRUE]
+    /\ UNCHANGED <<tv_mode, tv_input, cursor, capture, input_owner, ws_state,
+                   subscribe_active, daemon_healthy, pending_switch,
+                   reconnect_count, switch_timer, wake_timer, input_signal,
+                   remote_online, remote_input_ready, wake_pending>>
 
 \* TCP + TLS handshake to wss://TV_IP:3001/.
 SSAPConnecting ==
@@ -192,32 +299,53 @@ SSAPConnecting ==
     /\ UNCHANGED <<tv_mode, tv_input, cursor, capture, input_owner,
                    subscribe_active, daemon_healthy, pending_switch,
                    reconnect_count, switch_timer, wake_timer, input_signal,
-                   remote_online, remote_input_ready, wake_pending>>
+                   remote_online, remote_input_ready, wake_pending, protocol>>
 
 \* SSAP register handshake: send client-key, receive registration confirmation.
 SSAPRegistering ==
     /\ ws_state = "connecting"
+    /\ protocol.tv_control_available
     /\ ws_state' = "registering"
     /\ UNCHANGED <<tv_mode, tv_input, cursor, capture, input_owner,
                    subscribe_active, daemon_healthy, pending_switch,
                    reconnect_count, switch_timer, wake_timer, input_signal,
-                   remote_online, remote_input_ready, wake_pending>>
+                   remote_online, remote_input_ready, wake_pending, protocol>>
+
+SSAPConnectFailed ==
+    /\ ws_state = "connecting"
+    /\ ~protocol.tv_control_available
+    /\ ws_state' = "disconnected"
+    /\ reconnect_count' = reconnect_count + 1
+    /\ UNCHANGED <<tv_mode, tv_input, cursor, capture, input_owner,
+                   subscribe_active, daemon_healthy, pending_switch,
+                   switch_timer, wake_timer, input_signal, remote_online,
+                   remote_input_ready, wake_pending, protocol>>
 
 \* Registration complete. SSAP socket is connected, but commands are not
 \* accepted until subscription is live.
 SSAPRegistered ==
     /\ ws_state = "registering"
+    /\ protocol.tv_control_available
     /\ ws_state' = "connected"
     /\ daemon_healthy' = FALSE
-    /\ reconnect_count' = 0
     \* Can't know TV state during disconnect; resync from subscribe + signal query.
     /\ tv_mode' \in {"fullscreen", "multiview"}
     /\ tv_input' \in ActiveInput
     \* Query signal status on reconnect to resolve stale state.
     /\ input_signal' \in [ActiveInput -> BOOLEAN]
     /\ UNCHANGED <<cursor, capture, input_owner, subscribe_active,
-                   pending_switch, switch_timer, wake_timer, remote_online,
-                   remote_input_ready, wake_pending>>
+                   pending_switch, reconnect_count, switch_timer, wake_timer,
+                   remote_online, remote_input_ready, wake_pending, protocol>>
+
+SSAPRegisterFailed ==
+    /\ ws_state = "registering"
+    /\ ~protocol.tv_control_available
+    /\ ws_state' = "disconnected"
+    /\ reconnect_count' = reconnect_count + 1
+    /\ UNCHANGED <<tv_mode, tv_input, cursor, capture, input_owner,
+                   subscribe_active, daemon_healthy, pending_switch,
+                   switch_timer, wake_timer, input_signal, remote_online,
+                   remote_input_ready, wake_pending, protocol>>
 
 \* Subscribe to multiViewStatus push updates from TV.
 \* daemon_healthy only becomes TRUE after subscription is live
@@ -225,18 +353,32 @@ SSAPRegistered ==
 SSAPSubscribe ==
     /\ ws_state = "connected"
     /\ ~subscribe_active
+    /\ protocol.tv_control_available
     /\ subscribe_active' = TRUE
     /\ daemon_healthy' = TRUE
-    /\ IF tv_mode = "fullscreen" /\ input_owner = SERVER_HOST /\ tv_input # SERVER_HOST THEN
+    /\ reconnect_count' = 0
+    /\ IF protocol.fallback_required
+          \/ (tv_mode = "fullscreen" /\ input_owner = SERVER_HOST
+              /\ (tv_input # SERVER_HOST
+                  \/ ~input_signal[SERVER_HOST])) THEN
            /\ tv_mode' = "transitioning"
-           /\ tv_input' = SERVER_HOST
            /\ pending_switch' = SERVER_HOST
            /\ switch_timer' = SWITCH_TIMEOUT
+           /\ protocol' = [protocol EXCEPT
+                              !.commanded_input = SERVER_HOST,
+                              !.phase = "fallback_command_pending",
+                              !.switch_epoch = protocol.switch_epoch + 1,
+                              !.reservation_target = "none",
+                              !.reservation_epoch = 0,
+                              !.grant_epoch = 0,
+                              !.keyboard_owner = SERVER_HOST,
+                              !.pointer_owner = SERVER_HOST,
+                              !.fallback_required = TRUE]
        ELSE
-           /\ UNCHANGED <<tv_mode, tv_input, pending_switch, switch_timer>>
+           /\ UNCHANGED <<tv_mode, pending_switch, switch_timer, protocol>>
     /\ UNCHANGED <<cursor, capture, input_owner, ws_state,
-                   reconnect_count, wake_timer,
-                   input_signal, remote_online, remote_input_ready, wake_pending>>
+                   wake_timer, tv_input, input_signal, remote_online, remote_input_ready,
+                   wake_pending>>
 
 \* WebSocket drops (TV reboot, WiFi blip, TV off). TV commands are unavailable
 \* until reconnect, so display may remain stale. lan-mouse input still falls
@@ -252,6 +394,15 @@ SSAPDisconnect ==
     /\ input_owner' = SERVER_HOST
     /\ cursor' = SERVER_HOST
     /\ capture' = "idle"
+    /\ protocol' = [protocol EXCEPT
+                       !.phase = "fallback_deferred",
+                       !.reservation_target = "none",
+                       !.reservation_epoch = 0,
+                       !.grant_epoch = 0,
+                       !.keyboard_owner = SERVER_HOST,
+                       !.pointer_owner = SERVER_HOST,
+                       !.fallback_required = TRUE,
+                       !.tv_control_available = FALSE]
     /\ UNCHANGED <<tv_mode, tv_input,
                    reconnect_count, wake_timer, input_signal, remote_online,
                    remote_input_ready, wake_pending>>
@@ -262,30 +413,90 @@ SSAPDisconnect ==
 
 \* TV reports multiViewStatus change via subscribe callback.
 \* Can fire at any time while subscribed — handles race with pending_switch.
-\* C4 fix: remote can only set fullscreen or multiview, never transitioning.
+\* A callback matching the active transaction is an expected observation and
+\* must not cancel that transaction. Only an unexpected callback is a manual
+\* override. TV reports only fullscreen or multiview, never transitioning.
 SubscriptionFires ==
     /\ subscribe_active
-    /\ \E reported_mode \in {tv_mode} \cup ({"fullscreen", "multiview"} \ {tv_mode}) :
+    /\ \E reported_mode \in {"fullscreen", "multiview"} :
        \E reported_input \in ActiveInput :
-       IF (reported_mode = "fullscreen"
-           /\ input_owner = SERVER_HOST
-           /\ reported_input \in RemoteHosts) THEN
-           \* TV remote/manual override moved display away while lan-mouse input
-           \* is on the server host. Treat it as a resync event and return the
-           \* display to SERVER_HOST.
+       LET expected_remote ==
+             protocol.phase \in {
+               "command_pending", "verification_pending", "grant_pending",
+               "remote_owned"
+             }
+             /\ reported_mode = "fullscreen"
+             /\ reported_input = protocol.request_target
+           expected_fallback ==
+             protocol.phase \in {
+               "fallback_command_pending", "fallback_verification_pending"
+             }
+             /\ reported_mode = "fullscreen"
+             /\ reported_input = SERVER_HOST
+           stable_server ==
+             protocol.phase = "idle"
+             /\ input_owner = SERVER_HOST
+             /\ reported_mode = "fullscreen"
+             /\ reported_input = SERVER_HOST
+             /\ input_signal[SERVER_HOST]
+           stable_multiview ==
+             tv_mode = "multiview"
+             /\ pending_switch = "none"
+             /\ reported_mode = "multiview"
+       IN
+       IF expected_remote \/ expected_fallback
+          \/ stable_server \/ stable_multiview THEN
+           /\ tv_mode' =
+                IF protocol.phase \in {
+                     "command_pending", "verification_pending", "grant_pending",
+                     "fallback_command_pending", "fallback_verification_pending"
+                   }
+                   THEN tv_mode
+                   ELSE reported_mode
+           /\ tv_input' = reported_input
+           /\ UNCHANGED <<cursor, capture, input_owner, pending_switch,
+                          switch_timer, protocol>>
+       ELSE IF reported_mode = "multiview"
+               /\ ~protocol.fallback_required THEN
+           \* Manual multiView is allowed, but any stale fullscreen grant and
+           \* reservation are revoked before exposing the new mode.
+           /\ tv_mode' = "multiview"
+           /\ tv_input' = reported_input
+           /\ input_owner' = SERVER_HOST
+           /\ cursor' = SERVER_HOST
+           /\ capture' = "idle"
+           /\ pending_switch' = "none"
+           /\ switch_timer' = 0
+           /\ protocol' = [protocol EXCEPT
+                              !.phase = "idle",
+                              !.request_target = "none",
+                              !.grant_epoch = 0,
+                              !.reservation_target = "none",
+                              !.reservation_epoch = 0,
+                              !.keyboard_owner = SERVER_HOST,
+                              !.pointer_owner = SERVER_HOST,
+                              !.fallback_required = FALSE]
+       ELSE
+           \* Any unexpected safety-relevant callback revokes remote ownership
+           \* and starts or continues verified SERVER_HOST fallback.
            /\ tv_mode' = "transitioning"
-           /\ tv_input' = SERVER_HOST
+           /\ tv_input' = reported_input
+           /\ input_owner' = SERVER_HOST
+           /\ cursor' = SERVER_HOST
+           /\ capture' = "idle"
            /\ pending_switch' = SERVER_HOST
            /\ switch_timer' = SWITCH_TIMEOUT
-       ELSE
-           /\ tv_mode' = reported_mode
-           /\ tv_input' = reported_input
-           /\ IF pending_switch /= "none" THEN
-                  /\ pending_switch' = "none"  \* C4: remote override clears pending
-              ELSE
-                  /\ UNCHANGED pending_switch
-           /\ switch_timer' = 0                \* cancel any in-flight timeout
-    /\ UNCHANGED <<cursor, capture, input_owner, ws_state, subscribe_active,
+           /\ protocol' = [protocol EXCEPT
+                              !.commanded_input = SERVER_HOST,
+                              !.phase = "fallback_command_pending",
+                              !.switch_epoch = protocol.switch_epoch + 1,
+                              !.grant_epoch = 0,
+                              !.reservation_target = "none",
+                              !.reservation_epoch = 0,
+                              !.keyboard_owner = SERVER_HOST,
+                              !.pointer_owner = SERVER_HOST,
+                              !.fallback_required = TRUE]
+    /\ UNCHANGED <<ws_state, subscribe_active,
                    daemon_healthy, reconnect_count, wake_timer, input_signal,
                    remote_online, remote_input_ready, wake_pending>>
 
@@ -296,67 +507,160 @@ SubscriptionFires ==
 \* =====================================================================
 \* TWO-PHASE SWITCH PROTOCOL (atomicity invariant: cursor never moves to dead host)
 \*
-\* Phase 1 (EnterOtherHost): TV input switches. Cursor + capture STAY on
-\*   SERVER_HOST.
-\*   The daemon issues set_input(target) and awaits two confirmations:
+\* Phase 1 (EnterOtherHost): reserve keyboard+pointer and issue the TV command.
+\*   Observed tv_input is unchanged; cursor + capture STAY on SERVER_HOST.
+\*   The daemon awaits two separate confirmations:
 \*   (a) SSAP response: set_input() returned success.
 \*   (b) Signal verification: target input has HDMI signal present.
 \*   If (a) fails → SwitchFailed. If (b) fails within SWITCH_TIMEOUT → SwitchTimeout.
 \*   In both failure cases, cursor never left SERVER_HOST — user is never trapped.
 \*
-\* Phase 2 (SwitchComplete): Both confirmations received. NOW move cursor + capture
-\*   to target. The HTTP response returns "fullscreen" to lan-mouse, which then
-\*   switches its own capture to the remote host. Cursor only moves AFTER the
-\*   display is verified working.
+\* Phase 2 (SwitchComplete): Both confirmations received. Issue an epoch-fenced,
+\*   expiring grant to lan-mouse. LanMouseCommitGrant is a separate transition;
+\*   only it moves keyboard and pointer ownership together. A delayed response
+\*   cannot commit after timeout, cancellation, lease loss, or a newer request.
 \*
 \* This eliminates the trap scenario: switch to sleeping/shutdown Windows →
 \*   display shows nothing → keyboard/mouse captured by dead host → stuck.
 \* =====================================================================
 
-\* Phase 1: Cursor crosses edge. TV input switches. Cursor + capture STAY on
-\* SERVER_HOST.
+\* Phase 1: Cursor crosses edge. Reserve the input bundle and issue the TV
+\* command. Observed TV state and input ownership remain unchanged.
 \* APPROACH 1: ALWAYS issues set_input() — no stale-state no-op guard.
 \* switch_timer starts countdown for signal verification.
 \* GUARD: target host must be online and ready for BOTH keyboard and pointer.
-\*   If offline, SendWoL fires instead — wake the host, then auto-retry.
+\*   If offline, SendWoL preserves one request epoch while lan-mouse polls it.
 \*   If online but missing keyboard/pointer capability, reject the enter and
 \*   keep input_owner=SERVER_HOST; do not split keyboard from mouse.
 EnterOtherHost(host) ==
     /\ host \in RemoteHosts
     /\ tv_mode = "fullscreen"
     /\ pending_switch = "none"          \* debounce: only one switch at a time
+    /\ protocol.phase = "idle"
+    /\ ~protocol.fallback_required
     /\ cursor = SERVER_HOST
     /\ input_owner = SERVER_HOST        \* keyboard+mouse still local
     /\ daemon_healthy                   \* requires connected + subscribed
     /\ ws_state = "connected"
     /\ RemoteReadyForControl(host)      \* online + keyboard + pointer ready
-    /\ tv_mode' = "transitioning"
-    /\ tv_input' = host
-\* INPUT STAYS ON SERVER_HOST — keyboard and mouse move only after verification.
-    /\ pending_switch' = host
-    /\ switch_timer' = SWITCH_TIMEOUT   \* start signal-verification countdown
-    /\ UNCHANGED <<cursor, capture, input_owner, ws_state, subscribe_active,
-                   daemon_healthy, reconnect_count, wake_timer, input_signal,
+    /\ LET request == protocol.request_epoch + 1
+           switch == protocol.switch_epoch + 1
+       IN
+       /\ tv_mode' = "transitioning"
+       /\ pending_switch' = host
+       /\ switch_timer' = SWITCH_TIMEOUT
+       /\ protocol' = [protocol EXCEPT
+                          !.commanded_input = host,
+                          !.phase = "command_pending",
+                          !.switch_epoch = switch,
+                          !.request_target = host,
+                          !.request_epoch = request,
+                          !.grant_epoch = 0,
+                          !.reservation_target = host,
+                          !.reservation_epoch = request,
+                          !.keyboard_owner = SERVER_HOST,
+                          !.pointer_owner = SERVER_HOST,
+                          !.fallback_required = FALSE]
+    \* tv_input and input_signal remain observations; command intent cannot
+    \* update them. Input remains on SERVER_HOST until client commit.
+    /\ UNCHANGED <<tv_input, cursor, capture, input_owner, ws_state,
+                   subscribe_active, daemon_healthy, reconnect_count,
+                   wake_timer, input_signal, remote_online,
+                   remote_input_ready, wake_pending>>
+
+\* SSAP acknowledged the command. This does not prove what the TV displays.
+SwitchCommandAck ==
+    /\ protocol.phase = "command_pending"
+    /\ pending_switch \in RemoteHosts
+    /\ protocol.commanded_input = pending_switch
+    /\ ReservationValid(pending_switch)
+    /\ daemon_healthy
+    /\ protocol' = [protocol EXCEPT !.phase = "verification_pending"]
+    /\ UNCHANGED <<tv_mode, tv_input, cursor, capture, input_owner, ws_state,
+                   subscribe_active, daemon_healthy, pending_switch,
+                   reconnect_count, switch_timer, wake_timer, input_signal,
                    remote_online, remote_input_ready, wake_pending>>
 
-\* Phase 2a: set_input() acknowledged, target signal is present, and the
-\* pending remote target is still online and ready for both keyboard+pointer.
-\* NOW move keyboard+mouse ownership to target. Return success to lan-mouse.
+\* Fresh active-input and signal observations are tagged with the current
+\* switch epoch. Cached signal state from an earlier switch cannot satisfy it.
+SwitchVerificationObserved ==
+    /\ protocol.phase = "verification_pending"
+    /\ pending_switch \in RemoteHosts
+    /\ protocol.commanded_input = pending_switch
+    /\ ReservationValid(pending_switch)
+    /\ daemon_healthy
+    /\ tv_input' = pending_switch
+    /\ input_signal' = [input_signal EXCEPT ![pending_switch] = TRUE]
+    /\ protocol' = [protocol EXCEPT
+                       !.verified_epoch = protocol.switch_epoch]
+    /\ UNCHANGED <<tv_mode, cursor, capture, input_owner, ws_state,
+                   subscribe_active, daemon_healthy, pending_switch,
+                   reconnect_count, switch_timer, wake_timer, remote_online,
+                   remote_input_ready, wake_pending>>
+
+\* Phase 2a: issue an expiring grant after command acknowledgement and a fresh
+\* matching observation. Ownership remains local until LanMouseCommitGrant.
 SwitchComplete ==
     /\ tv_mode = "transitioning"
     /\ pending_switch \in RemoteHosts
-    /\ tv_input = pending_switch
-    /\ input_signal[tv_input] = TRUE    \* authoritative signal check
-    /\ RemoteReadyForControl(tv_input)  \* re-check spoke readiness at commit
+    /\ FreshRemoteVerification(pending_switch)
+    /\ ReservationValid(pending_switch)
     /\ tv_mode' = "fullscreen"
-    /\ input_owner' = tv_input
-    /\ cursor' = input_owner'           \* mouse follows keyboard atomically
-    /\ capture' = CaptureFor(input_owner')
+    /\ switch_timer' = SWITCH_TIMEOUT
+    /\ protocol' = [protocol EXCEPT
+                       !.phase = "grant_pending",
+                       !.grant_epoch = protocol.request_epoch]
+    /\ UNCHANGED <<tv_input, cursor, capture, input_owner, ws_state,
+                   subscribe_active, daemon_healthy, pending_switch,
+                   reconnect_count, wake_timer, input_signal, remote_online,
+                   remote_input_ready, wake_pending>>
+
+LanMouseCommitGrant ==
+    /\ protocol.phase = "grant_pending"
+    /\ pending_switch \in RemoteHosts
+    /\ protocol.grant_epoch = protocol.request_epoch
+    /\ ReservationValid(pending_switch)
+    /\ protocol.verified_epoch = protocol.switch_epoch
+    /\ tv_input = pending_switch
+    /\ input_signal[pending_switch]
+    /\ switch_timer > 1
+    /\ input_owner' = pending_switch
+    /\ cursor' = pending_switch
+    /\ capture' = CaptureFor(pending_switch)
     /\ pending_switch' = "none"
     /\ switch_timer' = 0
-    /\ UNCHANGED <<tv_input, ws_state, subscribe_active,
+    /\ protocol' = [protocol EXCEPT
+                       !.phase = "remote_owned",
+                       !.keyboard_owner = pending_switch,
+                       !.pointer_owner = pending_switch]
+    /\ UNCHANGED <<tv_mode, tv_input, ws_state, subscribe_active,
                    daemon_healthy, reconnect_count, wake_timer, input_signal,
                    remote_online, remote_input_ready, wake_pending>>
+
+GrantTimeout ==
+    /\ protocol.phase = "grant_pending"
+    /\ (switch_timer = 1
+        \/ protocol.grant_epoch # protocol.request_epoch
+        \/ ~ReservationValid(protocol.request_target))
+    /\ tv_mode' = "transitioning"
+    /\ input_owner' = SERVER_HOST
+    /\ cursor' = SERVER_HOST
+    /\ capture' = "idle"
+    /\ pending_switch' = SERVER_HOST
+    /\ switch_timer' = SWITCH_TIMEOUT
+    /\ protocol' = [protocol EXCEPT
+                       !.commanded_input = SERVER_HOST,
+                       !.phase = "fallback_command_pending",
+                       !.switch_epoch = protocol.switch_epoch + 1,
+                       !.grant_epoch = 0,
+                       !.reservation_target = "none",
+                       !.reservation_epoch = 0,
+                       !.keyboard_owner = SERVER_HOST,
+                       !.pointer_owner = SERVER_HOST,
+                       !.fallback_required = TRUE]
+    /\ UNCHANGED <<tv_input, ws_state, subscribe_active, daemon_healthy,
+                   reconnect_count, wake_timer, input_signal, remote_online,
+                   remote_input_ready, wake_pending>>
 
 \* Server-host fallback/return completion. This is intentionally separate from
 \* remote SwitchComplete so the remote completion path cannot accidentally fire
@@ -364,55 +668,125 @@ SwitchComplete ==
 ServerHostSwitchComplete ==
     /\ tv_mode = "transitioning"
     /\ pending_switch = SERVER_HOST
-    /\ tv_input = SERVER_HOST
-    /\ input_signal[SERVER_HOST] = TRUE
+    /\ FreshServerVerification
     /\ tv_mode' = "fullscreen"
     /\ input_owner' = SERVER_HOST
     /\ cursor' = SERVER_HOST
     /\ capture' = "idle"
     /\ pending_switch' = "none"
     /\ switch_timer' = 0
+    /\ protocol' = [protocol EXCEPT
+                       !.phase = "idle",
+                       !.request_target = "none",
+                       !.grant_epoch = 0,
+                       !.reservation_target = "none",
+                       !.reservation_epoch = 0,
+                       !.keyboard_owner = SERVER_HOST,
+                       !.pointer_owner = SERVER_HOST,
+                       !.fallback_required = FALSE]
     /\ UNCHANGED <<tv_input, ws_state, subscribe_active,
                    daemon_healthy, reconnect_count, wake_timer, input_signal,
                    remote_online, remote_input_ready, wake_pending>>
+
+FallbackCommandAck ==
+    /\ protocol.phase = "fallback_command_pending"
+    /\ pending_switch = SERVER_HOST
+    /\ daemon_healthy
+    /\ protocol' = [protocol EXCEPT
+                       !.phase = "fallback_verification_pending"]
+    /\ UNCHANGED <<tv_mode, tv_input, cursor, capture, input_owner, ws_state,
+                   subscribe_active, daemon_healthy, pending_switch,
+                   reconnect_count, switch_timer, wake_timer, input_signal,
+                   remote_online, remote_input_ready, wake_pending>>
+
+FallbackVerificationObserved ==
+    /\ protocol.phase = "fallback_verification_pending"
+    /\ pending_switch = SERVER_HOST
+    /\ daemon_healthy
+    /\ tv_input' = SERVER_HOST
+    /\ input_signal' = [input_signal EXCEPT ![SERVER_HOST] = TRUE]
+    /\ protocol' = [protocol EXCEPT
+                       !.verified_epoch = protocol.switch_epoch]
+    /\ UNCHANGED <<tv_mode, cursor, capture, input_owner, ws_state,
+                   subscribe_active, daemon_healthy, pending_switch,
+                   reconnect_count, switch_timer, wake_timer, remote_online,
+                   remote_input_ready, wake_pending>>
 
 \* Phase 2b: set_input() returned SSAP error.
 \* Cursor never left SERVER_HOST. Revert/confirm server-host display and keep
 \* keyboard+mouse local.
 SwitchFailed ==
     /\ tv_mode = "transitioning"
+    /\ protocol.phase = "command_pending"
+    /\ pending_switch \in RemoteHosts
     /\ ws_state = "connected"
-    /\ tv_mode' = "fullscreen"
-    /\ tv_input' = SERVER_HOST
+    /\ tv_mode' = "transitioning"
     /\ input_owner' = SERVER_HOST
     /\ cursor' = SERVER_HOST
     /\ capture' = "idle"
-    /\ pending_switch' = "none"
-    /\ switch_timer' = 0
+    /\ pending_switch' = SERVER_HOST
+    /\ switch_timer' = SWITCH_TIMEOUT
+    /\ protocol' = [protocol EXCEPT
+                       !.commanded_input = SERVER_HOST,
+                       !.phase = "fallback_command_pending",
+                       !.switch_epoch = protocol.switch_epoch + 1,
+                       !.grant_epoch = 0,
+                       !.reservation_target = "none",
+                       !.reservation_epoch = 0,
+                       !.keyboard_owner = SERVER_HOST,
+                       !.pointer_owner = SERVER_HOST,
+                       !.fallback_required = TRUE]
     /\ UNCHANGED <<ws_state, subscribe_active, daemon_healthy, reconnect_count,
-                   wake_timer, input_signal, remote_online, remote_input_ready,
-                   wake_pending>>
+                   tv_input, wake_timer, input_signal, remote_online,
+                   remote_input_ready, wake_pending>>
 
 \* Phase 2b: Timer expired — set_input() succeeded but no signal on target.
 \* Cursor never left SERVER_HOST. Revert/confirm server-host display and keep
 \* keyboard+mouse local.
 SwitchTimeout ==
     /\ tv_mode = "transitioning"
+    /\ protocol.phase \in {"command_pending", "verification_pending"}
+    /\ pending_switch \in RemoteHosts
     /\ switch_timer = 1                \* last tick before expiry
-    /\ ~(pending_switch \in RemoteHosts /\ tv_input = pending_switch
-          /\ input_signal[tv_input] = TRUE /\ RemoteReadyForControl(tv_input))
-    /\ ~(pending_switch = SERVER_HOST /\ tv_input = SERVER_HOST
-          /\ input_signal[SERVER_HOST] = TRUE)
-    /\ switch_timer' = 0
-    /\ tv_mode' = "fullscreen"
-    /\ tv_input' = SERVER_HOST
+    /\ switch_timer' = SWITCH_TIMEOUT
+    /\ tv_mode' = "transitioning"
     /\ input_owner' = SERVER_HOST
     /\ cursor' = SERVER_HOST
     /\ capture' = "idle"
-    /\ pending_switch' = "none"
+    /\ pending_switch' = SERVER_HOST
+    /\ protocol' = [protocol EXCEPT
+                       !.commanded_input = SERVER_HOST,
+                       !.phase = "fallback_command_pending",
+                       !.switch_epoch = protocol.switch_epoch + 1,
+                       !.grant_epoch = 0,
+                       !.reservation_target = "none",
+                       !.reservation_epoch = 0,
+                       !.keyboard_owner = SERVER_HOST,
+                       !.pointer_owner = SERVER_HOST,
+                       !.fallback_required = TRUE]
     /\ UNCHANGED <<ws_state, subscribe_active, daemon_healthy, reconnect_count,
-                   wake_timer, input_signal, remote_online, remote_input_ready,
-                   wake_pending>>
+                   tv_input, wake_timer, input_signal, remote_online,
+                   remote_input_ready, wake_pending>>
+
+\* Fallback timeout never declares success. It reissues the idempotent server
+\* command under a new switch epoch and remains degraded until fresh verify.
+FallbackTimeout ==
+    /\ protocol.phase \in {
+         "fallback_command_pending", "fallback_verification_pending"
+       }
+    /\ pending_switch = SERVER_HOST
+    /\ switch_timer = 1
+    /\ daemon_healthy
+    /\ switch_timer' = SWITCH_TIMEOUT
+    /\ protocol' = [protocol EXCEPT
+                       !.commanded_input = SERVER_HOST,
+                       !.phase = "fallback_command_pending",
+                       !.switch_epoch = protocol.switch_epoch + 1,
+                       !.fallback_required = TRUE]
+    /\ UNCHANGED <<tv_mode, tv_input, cursor, capture, input_owner, ws_state,
+                   subscribe_active, daemon_healthy, pending_switch,
+                   reconnect_count, wake_timer, input_signal, remote_online,
+                   remote_input_ready, wake_pending>>
 
 \* Timer tick — models time passing during switch.
 TimerTick ==
@@ -421,47 +795,100 @@ TimerTick ==
     /\ UNCHANGED <<tv_mode, tv_input, cursor, capture, input_owner, ws_state,
                    subscribe_active, daemon_healthy, pending_switch,
                    reconnect_count, wake_timer, input_signal, remote_online,
-                   remote_input_ready, wake_pending>>
+                   remote_input_ready, wake_pending, protocol>>
 
 \* =====================================================================
-\* SIGNAL STATUS TRACKING (authoritative TV-reported signal presence)
+\* SIGNAL STATUS TRACKING (epoch-tagged TV observations)
 \* =====================================================================
 
-\* Periodic query to TV: getExternalInputList or equivalent.
-\* Returns per-port signal presence. This is the authoritative source
-\* for whether a display is actually usable — replaces stale tv_input guess.
-\* Fires non-deterministically to model arbitrary timing of periodic poll.
+\* Periodic single-flight query to TV: getExternalInputList or equivalent.
+\* The result is an observation, not permanent truth. The implementation uses
+\* a monotonic schedule; repeated bad polls cannot reset an armed deadline.
 SignalUpdate ==
     /\ ws_state = "connected"
     /\ input_signal' \in [ActiveInput -> BOOLEAN]
-\* If currently on a remote host and signal drops, start revert timer.
-    /\ IF tv_mode = "fullscreen" /\ tv_input \in RemoteHosts
-          /\ input_signal'[tv_input] = FALSE THEN
+    /\ IF daemon_healthy
+          /\ tv_mode = "fullscreen"
+          /\ input_owner = SERVER_HOST
+          /\ protocol.phase = "idle"
+          /\ input_signal'[SERVER_HOST] = FALSE THEN
+           /\ tv_mode' = "transitioning"
+           /\ pending_switch' = SERVER_HOST
            /\ switch_timer' = SWITCH_TIMEOUT
+           /\ protocol' = [protocol EXCEPT
+                              !.commanded_input = SERVER_HOST,
+                              !.phase = "fallback_command_pending",
+                              !.switch_epoch = protocol.switch_epoch + 1,
+                              !.grant_epoch = 0,
+                              !.reservation_target = "none",
+                              !.reservation_epoch = 0,
+                              !.keyboard_owner = SERVER_HOST,
+                              !.pointer_owner = SERVER_HOST,
+                              !.fallback_required = TRUE]
+       ELSE IF protocol.phase = "grant_pending"
+               /\ protocol.request_target \in RemoteHosts
+               /\ input_signal'[protocol.request_target] = FALSE THEN
+           /\ tv_mode' = "transitioning"
+           /\ pending_switch' = SERVER_HOST
+           /\ switch_timer' = SWITCH_TIMEOUT
+           /\ protocol' = [protocol EXCEPT
+                              !.commanded_input = SERVER_HOST,
+                              !.phase = "fallback_command_pending",
+                              !.switch_epoch = protocol.switch_epoch + 1,
+                              !.grant_epoch = 0,
+                              !.reservation_target = "none",
+                              !.reservation_epoch = 0,
+                              !.keyboard_owner = SERVER_HOST,
+                              !.pointer_owner = SERVER_HOST,
+                              !.fallback_required = TRUE]
+       ELSE IF tv_mode = "fullscreen" /\ tv_input \in RemoteHosts
+          /\ protocol.phase = "remote_owned"
+          /\ input_signal'[tv_input] = FALSE THEN
+           /\ UNCHANGED <<tv_mode, pending_switch, protocol>>
+           /\ IF switch_timer = 0 THEN
+                  /\ switch_timer' = SWITCH_TIMEOUT
+              ELSE
+                  /\ UNCHANGED switch_timer
+       ELSE IF protocol.phase = "remote_owned"
+               /\ switch_timer > 0
+               /\ input_signal'[tv_input] = TRUE THEN
+           /\ switch_timer' = 0
+           /\ UNCHANGED <<tv_mode, pending_switch, protocol>>
        ELSE
            /\ UNCHANGED switch_timer
-    /\ UNCHANGED <<tv_mode, tv_input, cursor, capture, input_owner, ws_state,
-                   subscribe_active, daemon_healthy, pending_switch,
-                   reconnect_count, wake_timer, remote_online,
-                   remote_input_ready, wake_pending>>
+           /\ UNCHANGED <<tv_mode, pending_switch, protocol>>
+    /\ UNCHANGED <<tv_input, cursor, capture, input_owner, ws_state,
+                   subscribe_active, daemon_healthy, reconnect_count,
+                   wake_timer, remote_online, remote_input_ready, wake_pending>>
 
 \* Signal-loss revert: fullscreen on remote, signal just went dead, timer expired.
 \* Revert display to SERVER_HOST and force keyboard+mouse back to local ownership.
 SignalLossRevert ==
     /\ tv_mode = "fullscreen"
     /\ tv_input \in RemoteHosts
+    /\ protocol.phase = "remote_owned"
     /\ ~input_signal[tv_input]
     /\ switch_timer = 1
-    /\ switch_timer' = 0
+    /\ daemon_healthy
+    /\ switch_timer' = SWITCH_TIMEOUT
     /\ tv_mode' = "transitioning"
-    /\ tv_input' = SERVER_HOST
     /\ input_owner' = SERVER_HOST
     /\ cursor' = SERVER_HOST
     /\ capture' = "idle"
     /\ pending_switch' = SERVER_HOST
+    /\ protocol' = [protocol EXCEPT
+                       !.commanded_input = SERVER_HOST,
+                       !.phase = "fallback_command_pending",
+                       !.switch_epoch = protocol.switch_epoch + 1,
+                       !.grant_epoch = 0,
+                       !.reservation_target = "none",
+                       !.reservation_epoch = 0,
+                       !.keyboard_owner = SERVER_HOST,
+                       !.pointer_owner = SERVER_HOST,
+                       !.fallback_required = TRUE]
     /\ UNCHANGED <<ws_state, subscribe_active, daemon_healthy, reconnect_count,
-                   wake_timer, input_signal, remote_online, remote_input_ready,
-                   wake_pending>>
+                   tv_input, wake_timer, input_signal, remote_online,
+                   remote_input_ready, wake_pending>>
 
 \* =====================================================================
 \* REMOTE HOST HEALTH (lan-mouse spoke connectivity)
@@ -481,8 +908,19 @@ SendWoL(host) ==
     /\ ws_state = "connected"
     /\ ~remote_online[host]            \* host is asleep/offline
     /\ wake_pending = "none"
-    /\ wake_pending' = host
-    /\ wake_timer' = WAKE_TIMEOUT
+    /\ protocol.phase = "idle"
+    /\ LET request == protocol.request_epoch + 1 IN
+       /\ wake_pending' = host
+       /\ wake_timer' = WAKE_TIMEOUT
+       /\ protocol' = [protocol EXCEPT
+                          !.phase = "waking",
+                          !.request_target = host,
+                          !.request_epoch = request,
+                          !.grant_epoch = 0,
+                          !.reservation_target = "none",
+                          !.reservation_epoch = 0,
+                          !.keyboard_owner = SERVER_HOST,
+                          !.pointer_owner = SERVER_HOST]
     /\ UNCHANGED <<tv_mode, tv_input, cursor, capture, input_owner, ws_state,
                    subscribe_active, daemon_healthy, pending_switch,
                    reconnect_count, switch_timer, input_signal, remote_online,
@@ -497,13 +935,15 @@ WakeTimerTick ==
     /\ UNCHANGED <<tv_mode, tv_input, cursor, capture, input_owner, ws_state,
                    subscribe_active, daemon_healthy, pending_switch,
                    reconnect_count, switch_timer, input_signal, remote_online,
-                   remote_input_ready, wake_pending>>
+                   remote_input_ready, wake_pending, protocol>>
 
 \* Host did not wake. Cancel the pending wake and settle display/input on
 \* SERVER_HOST.
 WakeTimeout ==
     /\ wake_pending \in RemoteHosts
+    /\ protocol.phase = "waking"
     /\ wake_timer = 1
+    /\ ~RemoteReadyForControl(wake_pending)
     /\ wake_timer' = 0
     /\ wake_pending' = "none"
     /\ input_owner' = SERVER_HOST
@@ -511,52 +951,92 @@ WakeTimeout ==
     /\ capture' = "idle"
     /\ pending_switch' = "none"
     /\ switch_timer' = 0
-    /\ IF daemon_healthy /\ ws_state = "connected" THEN
-           /\ tv_mode' = "fullscreen"
-           /\ tv_input' = SERVER_HOST
-       ELSE
-           /\ UNCHANGED <<tv_mode, tv_input>>
+    /\ protocol' = [protocol EXCEPT
+                       !.phase = "idle",
+                       !.request_target = "none",
+                       !.grant_epoch = 0,
+                       !.reservation_target = "none",
+                       !.reservation_epoch = 0,
+                       !.keyboard_owner = SERVER_HOST,
+                       !.pointer_owner = SERVER_HOST]
+    /\ UNCHANGED <<tv_mode, tv_input>>
     /\ UNCHANGED <<ws_state, subscribe_active, daemon_healthy,
                    reconnect_count, input_signal, remote_online,
                    remote_input_ready>>
 
-\* Now that the host is online and both keyboard+pointer paths are ready,
-\* EnterOtherHost(host) becomes enabled.
+\* The original request remains live and is polled by lan-mouse using its
+\* request epoch. Readiness advances that same request directly into a held
+\* bundle reservation and TV command; no uncorrelated auto-switch is allowed.
 WakeAndRetry(host) ==
     /\ host \in RemoteHosts
     /\ wake_pending = host
+    /\ protocol.phase = "waking"
+    /\ protocol.request_target = host
     /\ RemoteReadyForControl(host)     \* host woke up and input paths are ready
-    /\ wake_pending' = "none"
-    /\ wake_timer' = 0
-    /\ UNCHANGED <<tv_mode, tv_input, cursor, capture, input_owner, ws_state,
-                   subscribe_active, daemon_healthy, pending_switch,
-                   reconnect_count, switch_timer, input_signal, remote_online,
-                   remote_input_ready>>
-                   \* wake_pending and wake_timer set explicitly above
+    /\ daemon_healthy
+    /\ pending_switch = "none"
+    /\ LET switch == protocol.switch_epoch + 1 IN
+       /\ wake_pending' = "none"
+       /\ wake_timer' = 0
+       /\ tv_mode' = "transitioning"
+       /\ pending_switch' = host
+       /\ switch_timer' = SWITCH_TIMEOUT
+       /\ protocol' = [protocol EXCEPT
+                          !.commanded_input = host,
+                          !.phase = "command_pending",
+                          !.switch_epoch = switch,
+                          !.grant_epoch = 0,
+                          !.reservation_target = host,
+                          !.reservation_epoch = protocol.request_epoch]
+    /\ UNCHANGED <<tv_input, cursor, capture, input_owner, ws_state,
+                   subscribe_active, daemon_healthy, reconnect_count,
+                   input_signal, remote_online, remote_input_ready>>
 
 \* Online spoke readiness can change independently from connectivity.
 \* Both keyboard and pointer must be ready before remote control is allowed.
 RemoteInputReadinessUpdate(host) ==
     /\ host \in RemoteHosts
     /\ remote_online[host] = TRUE
-    /\ \E next_ready \in [RemoteHosts -> [InputCapabilities -> BOOLEAN]] :
-       /\ remote_input_ready' = next_ready
-       /\ IF (input_owner = host \/ pending_switch = host)
-             /\ ~(next_ready[host]["keyboard"] /\ next_ready[host]["pointer"]) THEN
+    /\ \E next_ready \in [InputCapabilities -> BOOLEAN] :
+       /\ remote_input_ready' =
+            [remote_input_ready EXCEPT ![host] = next_ready]
+       /\ IF (input_owner = host \/ pending_switch = host
+               \/ protocol.reservation_target = host)
+             /\ ~(next_ready["keyboard"] /\ next_ready["pointer"]) THEN
              /\ input_owner' = SERVER_HOST
              /\ cursor' = SERVER_HOST
              /\ capture' = "idle"
              /\ IF daemon_healthy /\ ws_state = "connected"
-                   /\ tv_mode \in {"fullscreen", "transitioning"} THEN
+                   /\ protocol.tv_control_available THEN
                    /\ tv_mode' = "transitioning"
-                   /\ tv_input' = SERVER_HOST
                    /\ pending_switch' = SERVER_HOST
                    /\ switch_timer' = SWITCH_TIMEOUT
+                   /\ protocol' = [protocol EXCEPT
+                                      !.commanded_input = SERVER_HOST,
+                                      !.phase = "fallback_command_pending",
+                                      !.switch_epoch = protocol.switch_epoch + 1,
+                                      !.grant_epoch = 0,
+                                      !.reservation_target = "none",
+                                      !.reservation_epoch = 0,
+                                      !.keyboard_owner = SERVER_HOST,
+                                      !.pointer_owner = SERVER_HOST,
+                                      !.fallback_required = TRUE]
                 ELSE
-                   /\ UNCHANGED <<tv_mode, tv_input, pending_switch, switch_timer>>
+                   /\ pending_switch' = "none"
+                   /\ switch_timer' = 0
+                   /\ protocol' = [protocol EXCEPT
+                                      !.phase = "fallback_deferred",
+                                      !.grant_epoch = 0,
+                                      !.reservation_target = "none",
+                                      !.reservation_epoch = 0,
+                                      !.keyboard_owner = SERVER_HOST,
+                                      !.pointer_owner = SERVER_HOST,
+                                      !.fallback_required = TRUE]
+                   /\ UNCHANGED tv_mode
+             /\ UNCHANGED tv_input
           ELSE
              /\ UNCHANGED <<tv_mode, tv_input, cursor, capture, input_owner,
-                            pending_switch, switch_timer>>
+                            pending_switch, switch_timer, protocol>>
     /\ UNCHANGED <<ws_state, subscribe_active, daemon_healthy,
                    reconnect_count, wake_timer, input_signal, remote_online,
                    wake_pending>>
@@ -573,40 +1053,54 @@ RemoteInputNotReadyReject(host) ==
     /\ ws_state = "connected"
     /\ remote_online[host] = TRUE
     /\ ~RemoteReadyForControl(host)
-    /\ tv_input' = SERVER_HOST
-    /\ cursor' = SERVER_HOST
-    /\ input_owner' = SERVER_HOST
-    /\ capture' = "idle"
-    /\ switch_timer' = 0
-    /\ UNCHANGED <<tv_mode, ws_state, subscribe_active, daemon_healthy,
-                   pending_switch, reconnect_count, wake_timer, input_signal,
-                   remote_online, remote_input_ready, wake_pending>>
+    /\ UNCHANGED <<tv_mode, tv_input, cursor, capture, input_owner, ws_state,
+                   subscribe_active, daemon_healthy, pending_switch,
+                   reconnect_count, switch_timer, wake_timer, input_signal,
+                   remote_online, remote_input_ready, wake_pending, protocol>>
 
 \* Remote host disconnects (power off, crash, network loss).
-\* If currently displaying or switching to that host, initiate revert to
-\* SERVER_HOST. If multiView owns input for that host, release input to
-\* SERVER_HOST even though the TV remains in multiView.
+\* If displaying, switching to, reserving, or controlling that host, release
+\* both input paths and initiate verified fullscreen SERVER_HOST fallback.
 RemoteHostOffline(host) ==
     /\ host \in RemoteHosts
     /\ remote_online[host] = TRUE
     /\ remote_online' = [remote_online EXCEPT ![host] = FALSE]
-    /\ IF tv_mode \in {"fullscreen", "transitioning"}
-          /\ (tv_input = host \/ pending_switch = host) THEN
-           /\ tv_mode' = "transitioning"
-           /\ tv_input' = SERVER_HOST
+    /\ IF (input_owner = host \/ pending_switch = host
+            \/ protocol.reservation_target = host) THEN
            /\ input_owner' = SERVER_HOST
            /\ cursor' = SERVER_HOST
            /\ capture' = "idle"
-           /\ pending_switch' = SERVER_HOST
-           /\ switch_timer' = SWITCH_TIMEOUT
-       ELSE IF input_owner = host THEN
-           /\ input_owner' = SERVER_HOST
-           /\ cursor' = SERVER_HOST
-           /\ capture' = "idle"
-           /\ UNCHANGED <<tv_mode, tv_input, pending_switch, switch_timer>>
+           /\ IF daemon_healthy /\ ws_state = "connected"
+                 /\ protocol.tv_control_available THEN
+                /\ tv_mode' = "transitioning"
+                /\ pending_switch' = SERVER_HOST
+                /\ switch_timer' = SWITCH_TIMEOUT
+                /\ protocol' = [protocol EXCEPT
+                                   !.commanded_input = SERVER_HOST,
+                                   !.phase = "fallback_command_pending",
+                                   !.switch_epoch = protocol.switch_epoch + 1,
+                                   !.grant_epoch = 0,
+                                   !.reservation_target = "none",
+                                   !.reservation_epoch = 0,
+                                   !.keyboard_owner = SERVER_HOST,
+                                   !.pointer_owner = SERVER_HOST,
+                                   !.fallback_required = TRUE]
+             ELSE
+                /\ pending_switch' = "none"
+                /\ switch_timer' = 0
+                /\ protocol' = [protocol EXCEPT
+                                   !.phase = "fallback_deferred",
+                                   !.grant_epoch = 0,
+                                   !.reservation_target = "none",
+                                   !.reservation_epoch = 0,
+                                   !.keyboard_owner = SERVER_HOST,
+                                   !.pointer_owner = SERVER_HOST,
+                                   !.fallback_required = TRUE]
+                /\ UNCHANGED tv_mode
+           /\ UNCHANGED tv_input
        ELSE
            /\ UNCHANGED <<tv_mode, tv_input, cursor, capture, input_owner,
-                          pending_switch, switch_timer>>
+                          pending_switch, switch_timer, protocol>>
     /\ remote_input_ready' = [remote_input_ready EXCEPT ![host] = ["keyboard" |-> FALSE, "pointer" |-> FALSE]]
     /\ UNCHANGED <<ws_state, subscribe_active, daemon_healthy, reconnect_count,
                    wake_timer, input_signal, wake_pending>>
@@ -615,43 +1109,63 @@ RemoteHostOnline(host) ==
     /\ host \in RemoteHosts
     /\ remote_online[host] = FALSE
     /\ remote_online' = [remote_online EXCEPT ![host] = TRUE]
-    /\ remote_input_ready' \in [RemoteHosts -> [InputCapabilities -> BOOLEAN]]
+    /\ remote_input_ready' =
+         [remote_input_ready EXCEPT
+            ![host] = ["keyboard" |-> FALSE, "pointer" |-> FALSE]]
     /\ UNCHANGED <<tv_mode, tv_input, cursor, capture, input_owner, ws_state,
                    subscribe_active, daemon_healthy, pending_switch,
                    reconnect_count, switch_timer, wake_timer, input_signal,
-                   wake_pending>>
+                   wake_pending, protocol>>
 
 \* =====================================================================
 \* MULTIVIEW TRANSITIONS (Side-by-side / PIP)
 \* =====================================================================
 
-\* F→M: Enable multiView via splitscreenEnable SSAP command.
-\* Atomic SSAP call — no settle delay. pending_switch set during call, cleared on return.
+\* F→M: confirmed result of the serialized splitscreenEnable SSAP command.
+\* The implementation keeps the command pending until its response/callback;
+\* this abstract action represents that confirmed completion.
 EnterMultiView ==
     /\ tv_mode = "fullscreen"
     /\ pending_switch = "none"
+    /\ input_owner = SERVER_HOST
+    /\ protocol.phase = "idle"
+    /\ ~protocol.fallback_required
     /\ daemon_healthy
     /\ ws_state = "connected"
     /\ tv_mode' = "multiview"
     /\ pending_switch' = "none"
     /\ UNCHANGED <<tv_input, cursor, capture, input_owner, ws_state,
-                   subscribe_active, reconnect_count, switch_timer, wake_timer,
-                   input_signal, remote_online, remote_input_ready, wake_pending>>
+                   subscribe_active, daemon_healthy, reconnect_count,
+                   switch_timer, wake_timer, input_signal, remote_online,
+                   remote_input_ready, wake_pending, protocol>>
 
-\* M→F: Disable multiView, return to fullscreen.
-\* Atomic SSAP call. Restore TV input to the host that owns both keyboard and mouse.
+\* M→F: begin the serialized disable + verified SERVER_HOST fallback. Input is
+\* first released locally; fullscreen is not declared from command intent.
 ExitMultiView ==
     /\ tv_mode = "multiview"
     /\ pending_switch = "none"
+    /\ input_owner = SERVER_HOST
+    /\ protocol.phase = "idle"
+    /\ ~protocol.fallback_required
     /\ daemon_healthy
     /\ ws_state = "connected"
-    /\ tv_mode' = "fullscreen"
-    /\ tv_input' = CASE input_owner \in Host -> input_owner
-                     [] OTHER -> SERVER_HOST
-    /\ pending_switch' = "none"
-    /\ UNCHANGED <<cursor, capture, input_owner, ws_state, subscribe_active,
-                   reconnect_count, switch_timer, wake_timer, input_signal,
-                   remote_online, remote_input_ready, wake_pending>>
+    /\ tv_mode' = "transitioning"
+    /\ pending_switch' = SERVER_HOST
+    /\ switch_timer' = SWITCH_TIMEOUT
+    /\ protocol' = [protocol EXCEPT
+                       !.commanded_input = SERVER_HOST,
+                       !.phase = "fallback_command_pending",
+                       !.switch_epoch = protocol.switch_epoch + 1,
+                       !.grant_epoch = 0,
+                       !.reservation_target = "none",
+                       !.reservation_epoch = 0,
+                       !.keyboard_owner = SERVER_HOST,
+                       !.pointer_owner = SERVER_HOST,
+                       !.fallback_required = TRUE]
+    /\ UNCHANGED <<tv_input, cursor, capture, input_owner, ws_state,
+                   subscribe_active, daemon_healthy, reconnect_count,
+                   wake_timer, input_signal, remote_online,
+                   remote_input_ready, wake_pending>>
 
 \* Cursor crosses edge while in multiView: update keyboard+mouse owner only.
 \* Do NOT switch TV input — it's showing multiple sources already.
@@ -659,10 +1173,23 @@ EnterMultiViewHost(host) ==
     /\ host \in RemoteHosts
     /\ tv_mode = "multiview"
     /\ pending_switch = "none"
+    /\ protocol.phase = "idle"
+    /\ ~protocol.fallback_required
     /\ RemoteReadyForControl(host)
-    /\ input_owner' = host
-    /\ cursor' = host
-    /\ capture' = CaptureFor(host)
+    /\ input_signal[host]
+    /\ LET request == protocol.request_epoch + 1 IN
+       /\ input_owner' = host
+       /\ cursor' = host
+       /\ capture' = CaptureFor(host)
+       /\ protocol' = [protocol EXCEPT
+                          !.phase = "multiview_owned",
+                          !.request_target = host,
+                          !.request_epoch = request,
+                          !.grant_epoch = request,
+                          !.reservation_target = host,
+                          !.reservation_epoch = request,
+                          !.keyboard_owner = host,
+                          !.pointer_owner = host]
     /\ UNCHANGED <<tv_mode, tv_input, ws_state, subscribe_active,
                    daemon_healthy, pending_switch, reconnect_count,
                    switch_timer, wake_timer, input_signal, remote_online,
@@ -685,46 +1212,58 @@ ReturnToServerHost ==
            /\ daemon_healthy
            /\ ws_state = "connected"
            /\ tv_mode' = "transitioning"
-           /\ tv_input' = SERVER_HOST
            /\ pending_switch' = SERVER_HOST
            /\ switch_timer' = SWITCH_TIMEOUT
+           /\ protocol' = [protocol EXCEPT
+                              !.commanded_input = SERVER_HOST,
+                              !.phase = "fallback_command_pending",
+                              !.switch_epoch = protocol.switch_epoch + 1,
+                              !.grant_epoch = 0,
+                              !.reservation_target = "none",
+                              !.reservation_epoch = 0,
+                              !.keyboard_owner = SERVER_HOST,
+                              !.pointer_owner = SERVER_HOST,
+                              !.fallback_required = TRUE]
        ELSE
-           /\ UNCHANGED <<tv_mode, tv_input, pending_switch, switch_timer,
-                          daemon_healthy, ws_state, wake_pending>>
-    /\ UNCHANGED <<subscribe_active, reconnect_count,
-                   wake_timer, input_signal, remote_online,
+           /\ protocol' = [protocol EXCEPT
+                              !.phase = "idle",
+                              !.request_target = "none",
+                              !.grant_epoch = 0,
+                              !.reservation_target = "none",
+                              !.reservation_epoch = 0,
+                              !.keyboard_owner = SERVER_HOST,
+                              !.pointer_owner = SERVER_HOST]
+           /\ UNCHANGED <<tv_mode, pending_switch, switch_timer>>
+    /\ UNCHANGED <<tv_input, ws_state, daemon_healthy, subscribe_active,
+                   reconnect_count, wake_timer, input_signal, remote_online,
                    remote_input_ready, wake_pending>>
 
 \* =====================================================================
 \* RECONNECT LIFECYCLE
 \* =====================================================================
 
-\* Reconnect attempt failed. Exponential backoff external to spec.
+\* Reconnect failure is tied to the lifecycle phase that actually failed.
+\* RECONNECT_CAP is an alert threshold, not a terminal process state.
 ReconnectFails ==
-    /\ ~daemon_healthy
-    /\ reconnect_count < RECONNECT_CAP
-    /\ reconnect_count' = reconnect_count + 1
-    /\ UNCHANGED <<tv_mode, tv_input, cursor, capture, input_owner, ws_state,
-                   subscribe_active, daemon_healthy, pending_switch,
-                   switch_timer, wake_timer, input_signal, remote_online,
-                   remote_input_ready, wake_pending>>
+    SSAPConnectFailed \/ SSAPRegisterFailed
 
-\* Retry cap reached. This is an explicit stuttering terminal state for the
-\* daemon process; systemd Restart=on-failure gives a fresh start with
-\* reconnect_count=0 (Init) outside this spec behavior.
-DaemonExits ==
-    /\ ~daemon_healthy
-    /\ reconnect_count = RECONNECT_CAP
-    /\ UNCHANGED <<tv_mode, tv_input, cursor, capture, input_owner, ws_state,
-                   subscribe_active, daemon_healthy, pending_switch,
-                   reconnect_count, switch_timer, wake_timer, input_signal,
-                   remote_online, remote_input_ready, wake_pending>>
+ReconnectAlert == reconnect_count >= RECONNECT_CAP
+
+RemoteCommandOutcome == SwitchCommandAck \/ SwitchFailed
+RemoteVerificationOutcome == SwitchVerificationObserved \/ SwitchTimeout
+GrantOutcome == LanMouseCommitGrant \/ GrantTimeout
+FallbackCommandOutcome == FallbackCommandAck \/ FallbackTimeout
+FallbackVerificationOutcome ==
+    FallbackVerificationObserved \/ FallbackTimeout
+WakeRetryOutcome ==
+    \E host \in RemoteHosts : WakeAndRetry(host)
 
 \* =====================================================================
 \* COMPOSITE NEXT
 \* =====================================================================
 
 Next ==
+    \/ TVControlAvailable
     \/ SSAPConnecting
     \/ SSAPRegistering
     \/ SSAPRegistered
@@ -735,11 +1274,14 @@ Next ==
     \/ \E host \in RemoteHosts : SendWoL(host)
     \/ WakeTimerTick
     \/ WakeTimeout
-    \/ \E host \in RemoteHosts : WakeAndRetry(host)
+    \/ WakeRetryOutcome
+    \/ RemoteCommandOutcome
+    \/ RemoteVerificationOutcome
     \/ SwitchComplete
+    \/ GrantOutcome
+    \/ FallbackCommandOutcome
+    \/ FallbackVerificationOutcome
     \/ ServerHostSwitchComplete
-    \/ SwitchFailed
-    \/ SwitchTimeout
     \/ TimerTick
     \/ SignalUpdate
     \/ SignalLossRevert
@@ -752,43 +1294,55 @@ Next ==
     \/ \E host \in RemoteHosts : EnterMultiViewHost(host)
     \/ ReturnToServerHost
     \/ ReconnectFails
-    \/ DaemonExits
 
 Spec == Init /\ [][Next]_vars
           /\ WF_vars(SSAPConnecting)
           /\ WF_vars(SSAPRegistering)
-          /\ WF_vars(ReturnToServerHost)
           /\ WF_vars(SSAPRegistered)
           /\ WF_vars(SSAPSubscribe)
           /\ WF_vars(ReconnectFails)
           /\ WF_vars(TimerTick)
+          /\ WF_vars(RemoteCommandOutcome)
+          /\ WF_vars(RemoteVerificationOutcome)
           /\ WF_vars(SwitchComplete)
+          /\ WF_vars(GrantOutcome)
+          /\ WF_vars(FallbackCommandOutcome)
+          /\ WF_vars(FallbackVerificationOutcome)
           /\ WF_vars(ServerHostSwitchComplete)
-          /\ WF_vars(SwitchTimeout)
           /\ WF_vars(SignalLossRevert)
           /\ WF_vars(WakeTimerTick)
           /\ WF_vars(WakeTimeout)
+          /\ WF_vars(WakeRetryOutcome)
 
 \* =====================================================================
 \* LIVENESS
 \* =====================================================================
 
-\* Daemon eventually reconnects or reaches the retry cap.
-\* This depends on weak fairness for SSAPConnecting, SSAPRegistering,
-\* SSAPRegistered, SSAPSubscribe, and ReconnectFails.
+\* Reconnection is promised only when the environment eventually leaves the
+\* TV control path available. A permanently unavailable TV is not a software
+\* liveness failure, and transient failures never terminate the daemon.
 EventuallyReconnect ==
-    (~daemon_healthy /\ ws_state = "disconnected")
-        ~> (daemon_healthy /\ ws_state = "connected" \/ reconnect_count = RECONNECT_CAP)
+    (<>[]protocol.tv_control_available) =>
+      ((~daemon_healthy /\ ws_state = "disconnected")
+        ~> (daemon_healthy /\ ws_state = "connected"))
 
-\* If a remote host is selected but unusable, eventually revert to SERVER_HOST.
-\* This depends on weak fairness for TimerTick, SwitchTimeout, SignalLossRevert,
-\* and ServerHostSwitchComplete; otherwise a model can stutter forever with an
-\* enabled recovery action.
+\* Revert means freshly verified fullscreen SERVER_HOST, not merely that a
+\* server command was issued. Input ownership returns immediately; display
+\* convergence depends on restored TV control and server HDMI signal.
 EventuallyRevert ==
-    (tv_mode = "fullscreen" /\ tv_input \in RemoteHosts
-     /\ (~input_signal[tv_input] \/ ~RemoteReadyForControl(tv_input)))
-        ~> (tv_input = SERVER_HOST /\ input_owner = SERVER_HOST
-            /\ cursor = SERVER_HOST /\ capture = "idle")
+    (<>[]protocol.tv_control_available
+     /\ []<>input_signal[SERVER_HOST]) =>
+      (protocol.fallback_required
+        ~> (tv_mode = "fullscreen"
+            /\ tv_input = SERVER_HOST
+            /\ input_signal[SERVER_HOST]
+            /\ input_owner = SERVER_HOST
+            /\ protocol.keyboard_owner = SERVER_HOST
+            /\ protocol.pointer_owner = SERVER_HOST
+            /\ protocol.phase = "idle"
+            /\ ~protocol.fallback_required
+            /\ pending_switch = "none"
+            /\ cursor = SERVER_HOST /\ capture = "idle"))
 
 \* A wake attempt must either complete with remote input readiness or cancel.
 \* This depends on weak fairness for WakeTimerTick and WakeTimeout.
@@ -796,73 +1350,65 @@ EventuallyWakeSettles ==
     (wake_pending \in RemoteHosts)
         ~> (wake_pending = "none")
 
+EventuallyGrantSettles ==
+    (protocol.phase = "grant_pending")
+        ~> (protocol.phase # "grant_pending")
+
 \* =====================================================================
 \* DESIGN DECISIONS
 \* =====================================================================
 
-\* C1 (stuck pending): EnterMultiView/ExitMultiView clear pending directly
-\*     (atomic SSAP calls). ReturnToServerHost routes through transitioning
-\*     like EnterOtherHost. SwitchFailed/SwitchTimeout clear pending.
+\* C1 (stuck pending): every command has an outcome or deadline. A remote
+\*     failure starts fallback; it does not clear pending and claim recovery.
 \* C2 (DisplayMatchesInputOwner violations): Resolved by SwitchFailed,
 \*     SwitchTimeout, SignalLossRevert, and RemoteHostOffline — all revert
 \*     to SERVER_HOST when the display is unusable. SubscriptionFires handles
 \*     TvRemoteOverride races.
-\* C3 (deadlock at cap): DaemonExits → systemd restart → fresh Init with
-\*     reconnect_count = 0.
-\* C4 (TvRemoteOverride): SubscriptionFires clears pending_switch.
-\*     tv_mode' restricted to {"fullscreen","multiview"} — remote can't
-\*     set transitioning.
+\* C3 (reconnect lifecycle): connecting/registering failures return to
+\*     disconnected and increment telemetry. RECONNECT_CAP alerts but does not
+\*     stop retries; fatal configuration/authentication errors are separate.
+\* C4 (TvRemoteOverride): expected callbacks preserve the matching epoch and
+\*     target. Unexpected fullscreen callbacks revoke grants and start fallback.
 \* C5 (liveness violated by user): EventuallyReturn dropped (user may
 \*     never return input). Instead: EventuallyRevert ensures the
 \*     system recovers from host failure. EventuallyReconnect covers the
-\*     SSAP health path. SSAPConnecting, SSAPRegistering, SSAPRegistered,
-\*     SSAPSubscribe, ReconnectFails, TimerTick, SwitchTimeout,
-\*     SignalLossRevert, ServerHostSwitchComplete, WakeTimerTick, and
-\*     WakeTimeout have weak fairness so these liveness properties are
-\*     non-vacuous.
+\*     SSAP health path under an explicit eventual-availability assumption.
+\*     Internal command, verification, grant, fallback, and timer outcomes
+\*     have fairness so the model cannot hide in an internal phase forever.
 \* C6 (stale-state no-op): REMOVED. Approach 1: always issue set_input(),
 \*     never skip based on cached tv_input. set_input() is idempotent.
-\*     tv_input is now informational-only — not a gating condition.
-\* C7 (stale state elimination): tv_input is no longer the authority on
-\*     what the TV displays. input_signal (from TV SSAP query) and
-\*     remote_online plus remote_input_ready (from lan-mouse spoke) are
-\*     the authoritative sources.
+\*     tv_input is observed TV state; commanded_input is separate.
+\* C7 (stale state elimination): an observation must carry the current
+\*     switch_epoch. Cached tv_input/input_signal values cannot complete a new
+\*     transaction. Spoke readiness is converted into a held bundle lease.
 \* C8 (always-availability): ServerHostAlwaysAvailable and
 \*     ServerHostNormalFallback are enforced by SwitchFailed, SwitchTimeout,
 \*     SignalLossRevert, RemoteHostOffline, WakeTimeout, and
 \*     RemoteInputNotReadyReject. SSAPDisconnect immediately releases
-\*     keyboard+mouse to SERVER_HOST; SSAPSubscribe resyncs the display to
-\*     SERVER_HOST after TV control is healthy again. The system never gets
-\*     stuck on a dead display or a half-ready input host.
+\*     keyboard+mouse to SERVER_HOST; SSAPSubscribe resumes the preserved
+\*     fallback intent. Recovery is not declared until fresh server signal and
+\*     active-input verification succeed.
 \* C9 (unified design): SSAP lifecycle (ws_state, subscribe_active) and
 \*     daemon state machine (tv_mode, tv_input, input_owner, cursor,
 \*     capture) are
 \*     modeled in one spec. The HealthDefinition invariant ties them
 \*     together: daemon_healthy iff connected AND subscribed.
-\* C10 (two-phase atomic enter): EnterOtherHost switches only the TV input.
-\*     Keyboard and mouse ownership stay on SERVER_HOST during Phase 1.
-\*     SwitchComplete moves both keyboard and mouse to the target only after
-\*     signal is present, pending_switch still names the target, and
-\*     RemoteReadyForControl(target) is re-checked at commit time. SwitchFailed
-\*     or SwitchTimeout leaves keyboard+mouse on SERVER_HOST. This prevents the
-\*     transition race where a lan-mouse spoke dies after EnterOtherHost but
-\*     before SwitchComplete, plus the split-input trap (keyboard remote,
-\*     pointer local, or pointer remote, keyboard local).
+\* C10 (fenced enter): reserve keyboard+pointer, issue TV command, acknowledge,
+\*     obtain a fresh epoch-tagged observation, issue an expiring grant, then
+\*     let lan-mouse atomically commit both owners. These are separate actions.
 \* C11 (pre-switch wake): EnterOtherHost requires
 \*     RemoteReadyForControl(target) = TRUE for remote hosts. If the
 \*     host is asleep/offline, SendWoL fires instead — sends Wake-on-LAN,
 \*     sets wake_pending, returns "waking" to lan-mouse. When the host comes
 \*     online and reports keyboard+pointer readiness (RemoteHostOnline plus
 \*     RemoteInputReadinessUpdate),
-\*     WakeAndRetry clears wake_pending, and EnterOtherHost becomes
-\*     enabled again (auto-retry). The user never needs to re-trigger
-\*     the edge crossing. If the host never wakes, WakeTimeout clears
-\*     wake_pending and keeps keyboard+mouse on SERVER_HOST.
-\* C12 (synchronous capture gate): lan-mouse must pause capture before the
-\*     enter hook and wait for an explicit allow result from tv-multiview.
-\*     The old asynchronous "spawn hook after ClientEntered" contract cannot
-\*     enforce C10, because input may already be captured/sent before display
-\*     and readiness are verified.
+\*     WakeAndRetry advances the same request_epoch. lan-mouse polls that
+\*     request and never treats an uncorrelated daemon retry as permission.
+\* C12 (client commit gate): lan-mouse pauses both input paths, waits/polls for
+\*     a matching grant, validates the lease and epoch, then commits keyboard
+\*     and pointer together. Timeout or hook failure keeps both local.
+\* C13 (single SSAP owner): one actor serializes writes, correlates responses,
+\*     and publishes state events. No state mutex is held across an await.
 
 =================================================================================
 ```
@@ -895,17 +1441,25 @@ long-lived WebSocket.
 
 The daemon uses the same .aiopylgtv.sqlite client-key file as LG_Buddy
 (at ~/.config/lg-buddy/), so one TV pairing works for both tools.
+
+One dedicated SSAP actor owns the socket, request IDs, response correlation,
+subscription callbacks, and a bounded command queue. HTTP handlers send
+messages to that actor and never read/write the WebSocket directly. No shared
+state lock may be held while awaiting SSAP I/O or lan-mouse commit.
 ```
 
 ### API Endpoints
 
 | Method | Path | Purpose | Returns |
 |---|---|---|---|
-| GET | `/enter/{target}` | lan-mouse enter_hook. Switch to `target`. Always issues set_input() (no stale-state no-op). | TV mode string |
-| GET | `/multiview/on` | Enable multiView via `splitscreenEnable` SSAP command. | TV mode string |
-| GET | `/multiview/off` | Disable multiView. | TV mode string |
-| GET | `/status` | Health + current state + signal status. | JSON |
+| POST | `/enter/{target}` | Create one fenced enter request; reserve both input paths before issuing `set_input()`. | Typed JSON: request ID, epoch, state, deadline |
+| GET | `/enter/request/{id}` | Poll a waking or switching request without creating a second switch. | Typed JSON: pending, grant, denied, or fallback |
+| POST | `/enter/request/{id}/commit` | Acknowledge that lan-mouse atomically committed the matching keyboard+pointer grant. | Typed JSON commit result |
+| POST | `/multiview/on` | Enable multiView through the serialized SSAP actor. | Typed JSON command result |
+| POST | `/multiview/off` | Disable multiView, release input locally, then verify fullscreen `SERVER_HOST`. | Typed JSON command result |
+| GET | `/status` | Health, protocol phase, command/observation epochs, owners, lease, and signal status. | JSON |
 | GET | `/health` | Liveness probe (always 200 if process alive). | `"ok"` |
+| GET | `/ready` | Readiness probe; 200 only when SSAP is subscribed and no unresolved fallback exists. | Typed JSON readiness |
 
 ### State Machine (Daemon Internal)
 
@@ -946,41 +1500,59 @@ The daemon uses the same .aiopylgtv.sqlite client-key file as LG_Buddy
                    └─────────────────────────────────────────────────────┘
 
 Pending switch gating: pending_switch != "none" blocks all new transitions
-that produce a TV command (natural debounce).
+that produce a TV command. A concurrent request receives an explicit `409
+busy` containing the active request ID; it never receives a success-shaped
+`200 current_mode` response.
+
+The diagram compresses four distinct protocol transitions: SSAP command
+acknowledgement, fresh active-input/signal observation, grant issuance, and
+lan-mouse commit. `SwitchComplete` issues a grant; only
+`LanMouseCommitGrant` changes data-plane ownership.
 
 Failure is always recoverable: SwitchFailed, SwitchTimeout, SignalLossRevert,
 WakeTimeout, RemoteInputNotReadyReject, RemoteHostOffline, and
-SSAPDisconnect plus SSAPSubscribe recovery all converge to
-`tv_input = SERVER_HOST`, `input_owner = SERVER_HOST`,
-`cursor = SERVER_HOST`, `capture = "idle"` when TV control is healthy. During
-TV-control outage, keyboard+mouse still fall back immediately to SERVER_HOST.
+SSAPDisconnect plus SSAPSubscribe recovery all converge to freshly observed
+fullscreen `SERVER_HOST`, server HDMI signal present, keyboard and pointer
+owners both on `SERVER_HOST`, and idle capture. During a TV-control outage,
+input falls back immediately while display recovery remains explicitly
+`fallback_deferred`; it is never reported as completed from command intent.
 ```
 
 ### Reliability Design
 
 #### 0. lan-mouse Integration Contract
 
-The TV switch daemon cannot enforce the two-phase protocol by itself. The
-lan-mouse side must provide a synchronous enter gate:
+The TV switch daemon cannot enforce the protocol by itself. The lan-mouse side
+must provide a request-correlated commit gate:
 
 1. Pointer crosses the screen edge.
 2. lan-mouse pauses remote capture and sends no keyboard, pointer-motion,
    pointer-button, or scroll events to the target yet.
-3. lan-mouse calls `/enter/{target}` and waits for an explicit allow/deny
-   result.
-4. Only an allow result after display signal and remote input readiness are
-   verified may move input ownership to the remote host.
-5. Any other result (`waking`, `multiview`, `not_ready`, 4xx/5xx, timeout,
-   hook crash) keeps keyboard and mouse on the lan-mouse server host as one
-   unit.
+3. lan-mouse creates one `/enter/{target}` request and stores its request ID,
+   epoch, and deadline. `409 busy` never means allow.
+4. If the request is waking, lan-mouse keeps both input paths local and polls
+   that request ID. The daemon cannot switch input later without client commit.
+5. Before the TV command, the lan-mouse hub reserves keyboard and pointer
+   capacity as one expiring bundle lease. Partial reservation is failure.
+6. The daemon issues `set_input`, receives its correlated acknowledgement,
+   then obtains a fresh active-input and signal observation tagged with the
+   current switch epoch.
+7. The daemon returns an expiring grant containing request epoch and lease ID.
+   lan-mouse revalidates both, atomically commits keyboard+pointer, and reports
+   commit. A stale or late grant is rejected.
+8. Any other result (`waking`, `multiview`, `not_ready`, `busy`, 4xx/5xx,
+   timeout, hook crash, lease loss) keeps keyboard and mouse on `SERVER_HOST`.
 
 This is a hard contract. An asynchronous best-effort `enter_hook` that starts
-after capture has already begun does not satisfy C10.
+after capture has already begun, or a daemon-side auto-retry with no matching
+client request, does not satisfy C10.
 
 Input ownership is atomic: keyboard, pointer motion, pointer buttons, and
 scroll events are switched together. The design must never allow a state where
 keyboard is sent to a remote host while the pointer remains on the server host,
 or where the pointer is captured remotely while keyboard remains local.
+The formal model therefore keeps `keyboard_owner` and `pointer_owner` separate
+and checks equality as an invariant instead of assuming one owner variable.
 
 #### 1. SSAP Lifecycle (persistent wss://)
 
@@ -1002,93 +1574,107 @@ as a benchmark.
 5. daemon_healthy = TRUE only after all of the above succeed.
 
 **Keepalive:** WebSocket-level ping/pong (tokio-tungstenite built-in).
-No separate heartbeat command needed. If the TV misses 3 consecutive pongs,
-the WebSocket is declared dead and `SSAPDisconnect` fires.
+No separate heartbeat command is needed. The miss threshold and interval are
+configuration derived from measured healthy latency and the required fallback
+detection budget; three missed pongs is only an initial candidate.
 
 **Reconnect:** Exponential backoff (1s → 2s → 4s → ... → 60s cap).
-After RECONNECT_CAP (30) consecutive failures, the process exits.
-systemd `Restart=on-failure` gives a fresh start.
+Transient connection failures retry indefinitely at the bounded backoff.
+`RECONNECT_CAP` is an observability alert threshold, not a process-exit gate.
+Only fatal local configuration, invalid credentials, or an unrecoverable
+protocol incompatibility exits for systemd restart. The counter resets only
+after registration, subscription, and initial state synchronization succeed.
 
 #### 2. Enter Hook Logic
 
 ```
-curl → /enter/{target}:                               [keyboard+mouse still on SERVER_HOST]
-  1. If daemon_healthy=false → 503
-  2. If pending_switch != none → 200 current_mode  (debounce)
-  3. If mode=multiview → 200 "multiview"           (skip, don't disturb multiView)
-  4. If mode=fullscreen → CHECK TARGET ONLINE + INPUT READY:
-     a. If remote_online[target] = FALSE:
-        → send WoL, set wake_pending=target         [C11: pre-switch wake]
-        → return 202 "waking" to lan-mouse
-        → if wake_timer expires, clear wake_pending and keep input on SERVER_HOST
-        → when host comes online and keyboard+pointer are ready → auto-retry step 4
-     b. If remote_online[target] = TRUE but keyboard or pointer is not ready:
-        → return 409 "not_ready" to lan-mouse
-        → keyboard+mouse stay on SERVER_HOST; no partial switch
-     c. If remote_online[target] = TRUE and both keyboard+pointer are ready:
-        → TWO-PHASE ENTER:
-        i.   set_input(target) always  (APPROACH 1: no stale-state no-op)
-        ii.  Await SSAP response:
-             ├─ error → SwitchFailed  → revert to SERVER_HOST → 502
-             └─ success → Proceed
-        iii. Query signal status and re-check remote input readiness:
-             ├─ signal present and keyboard+pointer still ready
-             │  → SwitchComplete → keyboard+mouse move → 200 "fullscreen"
-             └─ no signal or readiness lost
-                → SwitchTimeout / readiness fallback → SERVER_HOST → 502
-        [CRITICAL: keyboard+mouse only move in step (iii) AFTER signal and
-         input readiness are re-verified at commit time. If signal is absent
-         or input readiness is incomplete, input never leaves SERVER_HOST —
-         user is never trapped.]
+POST /enter/{target}:                                 [both owners on SERVER_HOST]
+  1. daemon_healthy=false or fallback unresolved -> 503 unavailable
+  2. another request/command exists -> 409 busy + active request_id
+  3. mode=multiview -> use the multiView bundle-commit path; no TV input change
+  4. mode=fullscreen:
+     a. target offline:
+        -> allocate request_id/request_epoch, send WoL, state=waking
+        -> return 202 pending; lan-mouse polls this same request_id
+        -> timeout/cancel clears request; both owners remain SERVER_HOST
+     b. target online but either path unavailable:
+        -> 409 not_ready; no request, TV command, or ownership change
+     c. both paths available:
+        i.   reserve keyboard+pointer as one lease for request_epoch
+        ii.  always issue set_input(target) with switch_epoch
+        iii. await the correlated SSAP acknowledgement
+        iv.  obtain a fresh active-input and signal observation for switch_epoch
+        v.   revalidate the lease and issue an expiring grant
+        vi.  lan-mouse validates request_epoch + lease, atomically commits both
+             owners, and POSTs /enter/request/{id}/commit
+
+  Any command error, negative/freshness-mismatched observation, lease loss,
+  grant expiry, client timeout, or commit failure:
+        -> release both owners to SERVER_HOST immediately
+        -> enter the verified SERVER_HOST fallback transaction
+        -> do not report recovery until active input + signal are freshly seen
 ```
 
 The key change from the previous design (C6): step 4 no longer checks
-`tv_input == target`. It always issues `set_input()`. The TV's actual
-state is determined by `input_signal` (from SSAP query), `remote_online`,
-and `remote_input_ready` (from lan-mouse spoke), not by cached `tv_input`.
+`tv_input == target`. It always issues `set_input()`. `commanded_input` records
+intent; `tv_input` and `input_signal` are observations. Only observations tagged
+with the current `switch_epoch`, plus a valid input bundle lease, can authorize
+a grant.
 
-The second key change (C10): keyboard and mouse ownership do NOT move to
-the target until signal and remote keyboard+pointer readiness are verified
-again at `SwitchComplete`. This prevents the race where a host is ready at
-`EnterOtherHost`, its HDMI signal remains present, but its lan-mouse spoke
-dies before ownership moves.
+The second key change (C10): `SwitchComplete` issues a fenced grant but does not
+change ownership. `LanMouseCommitGrant` is the only remote ownership transition,
+and it changes `keyboard_owner` and `pointer_owner` together after validating
+the request epoch, grant epoch, and held bundle reservation. This closes the
+daemon-response delay race and makes split ownership representable in the
+model.
 
-The third key change (C11): if the target host is offline, the daemon
-sends Wake-on-LAN and defers the switch. When the host wakes up and its
-lan-mouse spoke connects and reports keyboard+pointer readiness, the daemon
-auto-retries the enter. If wake times out, the daemon clears `wake_pending`
-and keeps input on SERVER_HOST. The user never needs to manually re-cross the
-screen edge for a successful wake, and is never trapped on a failed wake.
+The third key change (C11): if the target host is offline, the daemon sends
+Wake-on-LAN and preserves the original request ID/epoch. lan-mouse polls that
+request while keeping both owners local. Readiness advances the same request;
+the daemon cannot perform an uncorrelated auto-switch after returning `202`.
+Wake timeout or cancellation invalidates the request and every later response.
 
 #### 3. Failure Recovery Paths
 
 All failures converge to the same recovery state:
-`tv_input = SERVER_HOST`, `input_owner = SERVER_HOST`,
-`cursor = SERVER_HOST`, `capture = "idle"`.
+freshly observed fullscreen `tv_input = SERVER_HOST`, server signal present,
+`input_owner = keyboard_owner = pointer_owner = SERVER_HOST`,
+`cursor = SERVER_HOST`, `capture = "idle"`, `pending_switch = none`, and
+`fallback_required = false`. Command intent alone never satisfies recovery.
 
 | Failure | Detection | Recovery Time | Transition |
 |---|---|---|---|
-| set_input() SSAP error | Immediate (response code) | <1s | SwitchFailed |
-| Source has no HDMI signal | switch_timer expires (5s) | 5s | SwitchTimeout |
-| Signal drops after stable connection | SignalUpdate periodic poll | 5s (SWITCH_TIMEOUT) | SignalLossRevert |
+| `set_input()` SSAP error | Correlated response | Input local immediately; display by fallback deadline | SwitchFailed → fallback command/verify |
+| Target active-input mismatch or no HDMI signal | Fresh epoch-tagged query | Input remains local; display by fallback deadline | SwitchTimeout → fallback command/verify |
+| Signal drops after stable connection | Single-flight periodic observation | Input local when detected; display by fallback deadline | SignalLossRevert → fallback command/verify |
 | Remote host input readiness missing before enter | lan-mouse hub readiness report | immediate | RemoteInputNotReadyReject |
-| Remote host input readiness lost while pending/owned | lan-mouse hub readiness update | immediate fallback or switch timeout | RemoteInputReadinessUpdate → ServerHost fallback |
-| Wake attempt never completes | wake_timer expires | 60s | WakeTimeout |
-| Remote host spoke disconnects | lan-mouse hub event | <3s | RemoteHostOffline |
-| WebSocket disconnects | ping timeout (~15s) | input immediate; display after reconnect | SSAPDisconnect → SSAPSubscribe resync |
-| TV reboot | ping timeout → reconnect | input immediate; display after reconnect | SSAPDisconnect → reconnect → SSAPRegistered → SSAPSubscribe resync |
+| Bundle reservation or readiness lost while pending/owned | Named-host hub update | input immediate | RemoteInputReadinessUpdate → verified fallback |
+| Grant is stale, expires, or is not committed | Request/lease epoch and deadline | input remains local | GrantTimeout → verified fallback |
+| Wake attempt never completes | Configured wake deadline | input remains local | WakeTimeout invalidates request epoch |
+| Remote host spoke disconnects | lan-mouse hub event | input immediate | RemoteHostOffline → active/deferred fallback |
+| Unexpected subscription callback | Target/phase mismatch | input immediate | SubscriptionFires → verified fallback |
+| WebSocket disconnects | Configured keepalive budget | input immediate; display after reconnect | SSAPDisconnect → fallback_deferred → resume |
+| TV reboot | disconnect/reconnect lifecycle | input immediate; display after verified resync | reconnect → subscribe → fallback command/verify |
+
+If TV control or the physical `SERVER_HOST` HDMI signal remains unavailable,
+the system stays degraded with input local and retries display recovery. It
+must not fabricate a successful fallback state that the user cannot see.
 
 #### 4. Signal Status Tracking
 
 The daemon periodically queries the TV for per-input signal presence
-(via SSAP `getExternalInputList` or equivalent endpoint). This is the
-**authoritative** source for whether a display is actually usable — it
-replaces the old approach of trusting the cached `tv_input` variable.
+(via SSAP `getExternalInputList` or equivalent endpoint). Each response is a
+time-bounded observation, not permanent truth. `commanded_input`, observed
+`tv_input`, observed `input_signal`, and `switch_epoch` are separate. A switch
+can complete only from an observation produced for its current epoch.
 
-Query frequency: once after each switch (to confirm signal), then every
-10s while a remote host is selected (to detect mid-session signal loss).
-No query while on SERVER_HOST (zero overhead for the always-available
-baseline).
+Query immediately after every command acknowledgement, after reconnect, and
+after every fallback command. While a remote host owns input, run one
+single-flight poll on a monotonic schedule. The initial 10-second interval is
+a candidate to validate against measured TV load and the required detection
+budget. A bad poll arms recovery only when no deadline is active; repeated bad
+polls cannot postpone fallback. A good poll cancels an armed loss deadline.
+No steady poll is required on a freshly verified `SERVER_HOST` baseline.
 
 #### 5. Remote Host Health and Input Readiness Tracking
 
@@ -1105,7 +1691,19 @@ that both input paths are ready:
 `RemoteReadyForControl(host)` is true only when the spoke is online and both
 input capabilities are available. A host that is online but lacks pointer
 capacity, keyboard capacity, or permission for either path is not eligible for
-`SwitchComplete`.
+reservation. Before switching the TV, the hub atomically converts readiness
+into one expiring keyboard+pointer lease. Capacity cannot be consumed by a
+different request while that lease is held. Permission loss, spoke loss, or
+lease invalidation releases both owners and starts fallback.
+After commit, the reservation becomes the active session lease and is renewed
+by the same spoke-health channel; renewal expiry is handled as readiness loss.
+
+Readiness updates are per-host `EXCEPT` updates. A Windows readiness event
+cannot alter macOS readiness. `keyboard_owner` and `pointer_owner` remain
+separate modeled fields and must be equal in every externally visible state.
+An input-capture or emulation error such as `no capacity available` is a bundle
+reservation failure: log both capability states, deny/revoke the grant, and
+keep or return both owners to `SERVER_HOST`.
 
 This covers:
 - macOS powered off after being selected.
@@ -1137,25 +1735,45 @@ fact.
 {"ts":"...","event":"ssap_connecting","tv_ip":"192.0.2.20"}
 {"ts":"...","event":"ssap_registered","client_key_present":true}
 {"ts":"...","event":"subscribed","topic":"multiViewStatus"}
-{"ts":"...","event":"enter","target":"mac","action":"switch","input":"HDMI_3"}
-{"ts":"...","event":"switch_complete","input":"mac","signal":true}
-{"ts":"...","event":"switch_timeout","target":"mac","action":"revert_to_server_host","server_host":"linux"}
+{"ts":"...","event":"enter","request_id":"...","request_epoch":41,"target":"mac","phase":"command_pending","commanded_input":"mac"}
+{"ts":"...","event":"switch_observed","request_epoch":41,"switch_epoch":87,"observed_input":"mac","signal":true,"observation_age_ms":0}
+{"ts":"...","event":"grant_issued","request_epoch":41,"grant_epoch":41,"lease_id":"...","target":"mac"}
+{"ts":"...","event":"input_commit","request_epoch":41,"keyboard_owner":"mac","pointer_owner":"mac"}
+{"ts":"...","event":"switch_timeout","request_epoch":41,"switch_epoch":87,"target":"mac","phase":"fallback_command_pending","action":"revert_to_server_host","server_host":"linux"}
 {"ts":"...","event":"switch_failed","target":"windows","error":"timeout","action":"revert_to_server_host","server_host":"linux"}
 {"ts":"...","event":"signal_loss","input":"mac","action":"revert_to_server_host","server_host":"linux"}
 {"ts":"...","event":"remote_offline","host":"mac","action":"revert_to_server_host","server_host":"linux"}
 {"ts":"...","event":"ssap_disconnect","reason":"ping_timeout"}
 ```
 
+Every transition log includes request/switch epoch where applicable, previous
+and next phase, commanded and observed input, keyboard and pointer owners,
+reservation/grant identity, observation age, command latency, and fallback
+reason. The logging sink is bounded and non-blocking; rotation or a stalled
+file sink must not block the SSAP actor or input-release path.
+
 **`/status` response:**
 ```json
 {
   "mode": "fullscreen",
-  "input": "linux",
+  "observed_input": "linux",
+  "commanded_input": "linux",
   "healthy": true,
+  "ready": true,
   "ws_state": "connected",
   "subscribe_active": true,
+  "protocol_phase": "idle",
+  "request_id": null,
+  "request_epoch": 41,
+  "switch_epoch": 88,
+  "verified_epoch": 88,
   "pending_switch": null,
   "switch_timer": 0,
+  "fallback_required": false,
+  "keyboard_owner": "linux",
+  "pointer_owner": "linux",
+  "reservation_target": null,
+  "grant_epoch": null,
   "input_signal": {"linux": true, "mac": false, "windows": true},
   "remote_online": {"mac": false, "windows": true},
   "uptime_seconds": 3600,
@@ -1179,6 +1797,36 @@ StartLimitBurst=10
 Signal handling: SIGTERM → graceful WebSocket close → shutdown.
 SIGUSR1 → dump full state to stderr (debugging).
 
+Transient TV/network failures are handled inside the daemon and do not cause
+process exit. `Restart=on-failure` is reserved for fatal local errors or an
+unexpected crash. Persistent logs require rotation on every platform.
+
+#### 8. Performance and Deadlock Constraints
+
+- One SSAP actor owns the socket and serializes commands. The queue is bounded;
+  duplicate signal polls are coalesced and a fallback command has priority over
+  ordinary mode requests.
+- HTTP handlers and subscription processing never hold a state mutex while
+  awaiting SSAP, lan-mouse, file I/O, or timers. State changes use short critical
+  sections or actor messages, excluding the lock/response circular wait.
+- There is at most one signal query in flight. Poll scheduling and transaction
+  deadlines use monotonic time; a callback cannot extend a deadline unless it
+  starts a new epoch.
+- A pending enter request owns one bundle lease and one TV command slot. New
+  requests receive `409 busy`; they do not allocate unbounded tasks or queue
+  duplicate TV commands.
+- Wake/request polling is implemented by native lan-mouse integration or one
+  bounded helper lifecycle. It must not spawn a new `curl` process on every
+  poll tick; process-spawn cost and cancellation are measured separately.
+- The 5-second switch, 60-second wake, 10-second poll, ping-miss, and reconnect
+  values are initial candidates, not correctness constants. Production values
+  require recorded p50/p95/p99 command, observation, wake, and disconnect data
+  plus a documented safety margin.
+- Persistent WebSocket latency numbers describe transport/request overhead only;
+  end-to-end switch latency also includes TV settle, fresh observation, lease
+  validation, and lan-mouse commit. No `<5ms` end-to-end claim is permitted
+  without measurement.
+
 ## Architecture Decision Records
 
 ### ADR-001: Separate daemon
@@ -1186,7 +1834,8 @@ SIGUSR1 → dump full state to stderr (debugging).
 **Decision:** Run tv-multiview as a standalone HTTP daemon alongside lan-mouse.
 
 **Rationale:**
-- lan-mouse `enter_hook` is synchronous (`sh -c "curl ..."`) — no async integration
+- lan-mouse starts the request synchronously, then polls the same request ID
+  while capture remains paused; a daemon-side delayed switch is never implicit
 - TV subscription needs persistent WebSocket — lan-mouse is event-driven
 - HTTP API is universal: any OS, any enter_hook
 - Separate crash domain: daemon death doesn't crash lan-mouse
@@ -1223,7 +1872,9 @@ per-command TLS handshake.
   `bscpylgtvcommand` every 5s). The earlier ~28% CPU observation must be
   tied to a recorded measurement command/workload before it is used as a
   benchmark.
-- Reduces per-command latency from 300-500ms to <5ms
+- Removes repeated process/TLS/register overhead. Transport/request latency and
+  end-to-end switch latency are measured separately; no fixed `<5ms` claim is
+  accepted without a recorded workload and percentile data.
 - Connection health is immediate (socket error on next write) vs.
   discovered via 5s heartbeat
 - Subscriptions (push updates from TV) require a persistent connection
@@ -1232,11 +1883,12 @@ per-command TLS handshake.
 ### ADR-005: Approach 1 — always switch, never skip on stale state
 
 **Decision:** `/enter/{target}` always issues `set_input(target)`.
-There is no "already on target" no-op guard. `tv_input` is
-informational-only (for `/status`), not a gating condition.
+There is no "already on target" no-op guard. `commanded_input` records intent;
+`tv_input` is the latest TV observation. Neither cached field can complete a
+request without a current `switch_epoch` observation.
 
 **Rationale:**
-- `tv_input` can become stale (user pressed remote, TV rebooted,
+- observed `tv_input` can become stale (user pressed remote, TV rebooted,
   previous switch silently failed)
 - `set_input()` is idempotent — sending the same HDMI port when already
   on it is harmless
@@ -1257,19 +1909,22 @@ the invariant is `ServerHostAlwaysAvailable`, not Linux-specific.
   (can't move cursor back because screen edge is unreachable)
 - Detect via: SSAP signal query (no HDMI signal), lan-mouse spoke
   disconnect (host offline), SSAP command failure (set_input error)
-- All failure paths converge to the same recovery: server-host display,
-  server-host input, server-host cursor, idle capture
+- All failure paths first release keyboard and pointer to the server host, then
+  converge through one fallback command/ack/observation transaction
+- Recovery is complete only after fullscreen server input and server HDMI signal
+  are freshly observed; unavailable TV control remains `fallback_deferred`
 
 ### ADR-007: SSAP + daemon unified in one TLA+ spec
 
 **Decision:** The TLA+ spec models both the SSAP client lifecycle
 (`ws_state`, `subscribe_active`) and the daemon state machine
-(`tv_mode`, `tv_input`, `cursor`, `capture`) in one module.
+(`tv_mode`, observed `tv_input`, `protocol`, owners, reservation, grant,
+`cursor`, `capture`) in one module.
 
 **Rationale:**
-- The daemon's state machine depends on SSAP events (disconnect →
-  DaemonDies, register → DaemonReconnects, subscribe fires →
-  SubscriptionFires)
+- The daemon's state machine depends on SSAP events (disconnect → deferred
+  fallback, registration/subscription → healthy, callback → expected event or
+  manual override)
 - The `HealthDefinition` invariant ties them together: daemon_healthy
   iff connected AND subscribed
 - Modeling them separately would miss race conditions between SSAP
@@ -1277,3 +1932,42 @@ the invariant is `ServerHostAlwaysAvailable`, not Linux-specific.
 - In code, they are separated by a module boundary (`src/ssap/`) within
   a single Rust crate, not a crate boundary — so the unified spec
   matches the implementation structure
+
+### ADR-008: Fenced request, bundle reservation, and client commit
+
+**Decision:** Every enter attempt has a request epoch. The lan-mouse hub reserves
+keyboard and pointer capacity as one lease before any TV command. After a fresh
+switch-epoch observation, the daemon issues an expiring grant; lan-mouse validates
+the request, grant, and lease epochs and commits both owners atomically.
+
+**Rationale:**
+- A readiness snapshot does not reserve capacity and is vulnerable to TOCTOU
+- An HTTP response can be delayed past timeout, cancellation, or remote failure
+- Separate keyboard/pointer owners let the model detect the observed split-input
+  failure instead of assuming it away
+- A stale grant is harmless because its epoch or lease cannot commit
+
+### ADR-009: One SSAP actor with bounded work
+
+**Decision:** One actor exclusively owns the WebSocket and a bounded command
+queue. It correlates IDs, coalesces duplicate polls, and prioritizes fallback.
+No state lock is held across asynchronous I/O.
+
+**Rationale:**
+- Multiple HTTP handlers must not interleave writes or consume each other's replies
+- Holding shared state while waiting for the reader task creates a lock/response
+  circular wait
+- Bounded single-flight polling prevents task growth and timer starvation
+
+### ADR-010: Retry transient failures; never fabricate availability
+
+**Decision:** Transient SSAP failures retry indefinitely with bounded backoff.
+The reconnect threshold raises an alert but does not exit. Fatal local
+configuration/authentication errors may exit. Server fallback retries until a
+fresh server-input and HDMI-signal observation succeeds.
+
+**Rationale:**
+- Restarting after a transient retry count resets backoff without improving reachability
+- A command acknowledgement proves acceptance, not visible display state
+- Keeping input local with `fallback_required=true` is honest degraded service;
+  declaring an unverified server display would violate the availability contract
