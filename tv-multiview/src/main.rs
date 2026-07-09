@@ -74,7 +74,12 @@ async fn maintain_connection(
     // Initial state: dead (healthy=false from Default)
     // ReconnectFails loop
     loop {
-        info!(event = "connect", retry = daemon.reconnect_count.load(std::sync::atomic::Ordering::SeqCst));
+        info!(
+            event = "connect",
+            retry = daemon
+                .reconnect_count
+                .load(std::sync::atomic::Ordering::SeqCst)
+        );
         if let Err(e) = client.get_sw_info().await {
             error!(error = %e, "connect_failed");
             if daemon.reconnect_failed() {
@@ -103,7 +108,9 @@ async fn maintain_connection(
 
         // DaemonDies
         daemon.mark_dead();
-        daemon.reconnect_count.store(0, std::sync::atomic::Ordering::SeqCst);
+        daemon
+            .reconnect_count
+            .store(0, std::sync::atomic::Ordering::SeqCst);
 
         // Reconnect delay
         tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;

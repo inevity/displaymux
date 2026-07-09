@@ -41,7 +41,10 @@ impl TvClient {
 
     /// Set the TV input to the given HDMI port.
     pub async fn set_input(&self, hdmi: &str) -> Result<(), String> {
-        let out = self.run(&["set_input", hdmi]).await.map_err(|e| e.to_string())?;
+        let out = self
+            .run(&["set_input", hdmi])
+            .await
+            .map_err(|e| e.to_string())?;
         if out.status.success() {
             Ok(())
         } else {

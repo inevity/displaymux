@@ -2,11 +2,11 @@
 use std::sync::Arc;
 
 use axum::{
-    Router,
     extract::{Path, State},
     http::StatusCode,
     response::IntoResponse,
     routing::get,
+    Router,
 };
 use tracing::{error, info};
 
@@ -61,7 +61,10 @@ async fn enter(
 
     // P0.4: 503 when daemon dead
     if !*state.daemon.healthy.lock().unwrap() {
-        return (StatusCode::SERVICE_UNAVAILABLE, "tv disconnected".to_string());
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "tv disconnected".to_string(),
+        );
     }
 
     // P0.3: pending_switch gate (debounce)
@@ -125,7 +128,7 @@ async fn enter(
         .hdmi_map
         .get(&target)
         .cloned()
-        .unwrap_or_else(|| format!("HDMI_UNKNOWN"));
+        .unwrap_or_else(|| "HDMI_UNKNOWN".to_string());
 
     info!(target = %target, action = "switch", input = %hdmi, "enter");
 
@@ -150,7 +153,10 @@ async fn enter(
 // ---- /multiview/on (EnterMultiView) ----
 async fn multiview_on(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     if !*state.daemon.healthy.lock().unwrap() {
-        return (StatusCode::SERVICE_UNAVAILABLE, "tv disconnected".to_string());
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "tv disconnected".to_string(),
+        );
     }
 
     let entered = state.daemon.enter_multiview();
@@ -174,7 +180,10 @@ async fn multiview_on(State(state): State<Arc<AppState>>) -> impl IntoResponse {
 // ---- /multiview/off (ExitMultiView) ----
 async fn multiview_off(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     if !*state.daemon.healthy.lock().unwrap() {
-        return (StatusCode::SERVICE_UNAVAILABLE, "tv disconnected".to_string());
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "tv disconnected".to_string(),
+        );
     }
 
     let exited = state.daemon.exit_multiview(Input::Linux); // default to linux
