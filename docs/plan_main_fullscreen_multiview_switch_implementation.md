@@ -2,11 +2,14 @@
 
 ## Plan Control
 
-- Status: proposed; implementation has not started.
+- Status: in progress; Phase 0 characterization and capture-boundary work started on 2026-07-11.
 - Design baseline: `fullscreenmultiviewswitchdesign.md` at commit `319b762`.
 - Rust daemon baseline: current clean `tv-multiview` crate at commit `319b762`.
 - lan-mouse baseline: local clean checkout `../../lan-mouse` at commit `392af44`, matching `lan_mouse_release_tag: main-392af44`.
 - Controlling objective: implement the approved design without allowing keyboard and pointer ownership to split, and without claiming server-host fallback before the TV state is freshly observed.
+- Compatibility policy: there is no legacy mutation API, compatibility flag,
+  fire-and-forget hook authorization, or mixed-version operation. Old peers and
+  old clients fail closed; deployment replaces daemon and lan-mouse together.
 - This plan supersedes `fullscreenmultiviewswitchplan.md` and `fullscreenmultiviewswitchplanrust.md` for new work. Those files remain historical artifacts.
 
 Linked child plans:
@@ -101,6 +104,16 @@ Gate evidence:
 - A manual backend test proves pointer buttons, motion, scroll, and keyboard remain usable on `SERVER_HOST` while pending and after every denial/failure.
 - Cancellation and timeout release any backend capture without waiting for the TV daemon.
 
+Gate 0 decision (2026-07-11): use the conservative two-crossing refinement.
+The current backend-neutral API reports `CaptureEvent::Begin` only after the
+backend has entered exclusive capture, so a portable one-crossing pre-capture
+candidate does not exist. On the first crossing, lan-mouse must emit only a
+candidate, call the existing backend-neutral `capture.release()`, and keep all
+input local while obtaining an expiring grant. Only a matching second crossing
+may revalidate that grant and emit `ProtoEvent::Enter`. This decision remains
+subject to the automated event-order and native-backend verification gates
+below; no backend may buffer input while the grant is pending.
+
 ## Interface Decision Required Before Phase 3
 
 The approved public API defines create, poll, and commit, but the implementation also needs a transport for lease invalidation, active-session renewal, readiness loss, and client cancellation. Before coding those paths, add one documented internal contract to the design:
@@ -135,9 +148,10 @@ Owner: `plan_tv_multiview_daemon_refactor.md`.
 - Separate configuration, domain types, I/O adapters, HTTP adapters, and transition logic.
 - Replace independently locked fields with one coherent state owner and immutable snapshots.
 - Remove the lock-order cycle in a dedicated correctness commit, not hidden inside transport work.
-- Preserve legacy endpoint behavior temporarily so refactoring failures are separable from protocol changes.
+- Remove the old mutating GET routes when the coordinator becomes the
+  production state owner; do not preserve their response or switching behavior.
 
-Exit gate: legacy behavior tests pass, status snapshots are coherent, no lock is held across await, and `cargo check` plus `cargo test` pass.
+Exit gate: state/reducer tests pass, status snapshots are coherent, no lock is held across await, and `cargo check` plus `cargo test` pass.
 
 ### Phase 2: Pure Protocol Reducer
 
@@ -181,9 +195,10 @@ Owner: daemon child plan with lan-mouse integration tests.
 - Add typed POST create, GET poll, POST commit, internal cancel/readiness/renew operations, POST MultiView operations, `/status`, `/health`, and `/ready`.
 - Make duplicate client request IDs idempotent and conflicting requests explicit `409` responses containing the active request ID.
 - Route MultiView exit, remote loss, signal loss, SSAP loss, and manual unexpected callbacks through the same verified server fallback transaction.
-- Keep legacy GET endpoints behind an explicit compatibility switch during staging. They must not be enabled at final cutover.
+- Do not register legacy mutating GET endpoints. Only the fenced POST API may
+  create or commit switching work.
 
-Exit gate: black-box API tests prove status code, body schema, idempotency, stale commit rejection, cancellation, and fail-closed legacy behavior.
+Exit gate: black-box API tests prove status code, body schema, idempotency, stale commit rejection, cancellation, and absence of legacy mutation routes.
 
 ### Phase 6: Coordinated Deployment Cutover
 
@@ -197,7 +212,8 @@ Cutover order is intentionally fail-closed:
 4. Deploy the new hub with capture gate in observe-only mode; verify per-host keyboard and pointer readiness and session epochs.
 5. Force the TV and input to verified `SERVER_HOST` baseline.
 6. Enable fenced switching on the daemon and hub in one maintenance action.
-7. Remove `enter_hook = curl ...` from generated configs and disable legacy mutating GET routes.
+7. Deploy generated configs without `enter_hook = curl ...`; no legacy mutating
+   route is present in the daemon binary.
 8. Run the failure matrix before restoring unattended startup.
 
 Never deploy a daemon that can issue grants to the old fire-and-forget hook client. Never roll back only one side of the protocol.
@@ -210,7 +226,9 @@ Never deploy a daemon that can issue grants to the old fire-and-forget hook clie
 - Exercise all design failure rows, including target shutdown during command, readiness loss between observation and commit, stale delayed responses, TV reboot, SSAP disconnect, signal loss, daemon restart, hub restart, and Windows `no capacity available` equivalent.
 - Reconstruct each test from persistent logs using request ID, request epoch, switch epoch, lease ID, and previous/next phase.
 - Measure p50/p95/p99 command, observation, grant, commit, fallback, wake, and disconnect detection times. Set deadlines only from recorded data plus a documented margin.
-- Remove subprocess transport, legacy GET switching, compatibility flags, and obsolete Python daemon template only after the new path passes the complete matrix and rollback drill.
+- Remove the subprocess transport and obsolete Python daemon template as part
+  of the coordinated cutover; no compatibility flag or legacy GET switching is
+  implemented.
 
 TLC execution was separately authorized and completed after this plan was
 created. `tla/TvDisplaySwitchFinite.cfg` now checks the corrected finite model;
@@ -256,4 +274,4 @@ The objective is complete only when:
 - keyboard and pointer readiness, lease, grant, and owner are visible per host;
 - all failures converge to local input plus freshly verified server display or an honest `fallback_deferred` state;
 - deployment and rollback are repeatable across Linux, macOS, and Windows;
-- the obsolete plans and compatibility paths are marked historical or removed in a separate reviewed cleanup.
+- the obsolete plans are marked historical or removed in a separate reviewed cleanup, and no compatibility path remains in production code.

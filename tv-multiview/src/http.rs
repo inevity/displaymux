@@ -1,205 +1,668 @@
-// HTTP API: axum routes implementing the TLA+ state machine.
-use std::sync::Arc;
-
-use axum::{
-    extract::{Path, State},
-    http::StatusCode,
-    response::IntoResponse,
-    routing::get,
-    Router,
+use crate::{
+    coordinator::{CoordinatorError, CoordinatorHandle},
+    domain::{Host, LeaseIdentity, PeerReadiness, ProtocolState, RequestStatus},
+    protocol::{Event, ProtocolError},
 };
-use tracing::{error, info};
+use axum::{
+    extract::{Path, Request, State},
+    http::{HeaderMap, StatusCode},
+    middleware::{self, Next},
+    response::{IntoResponse, Response},
+    routing::{get, post},
+    Json, Router,
+};
+use serde::{Deserialize, Serialize};
+use std::{str::FromStr, sync::Arc};
+use tokio::sync::watch;
 
-use crate::state::{Input, TvDaemonState, TvMode};
-use crate::tv::TvClient;
+const PROTOCOL_VERSION: u16 = 1;
+const AUTHORIZATION: &str = "authorization";
 
-pub struct AppState {
-    pub daemon: Arc<TvDaemonState>,
-    pub tv_client: TvClient,
-    pub hdmi_map: std::collections::HashMap<String, String>,
+#[derive(Clone)]
+struct AppState {
+    coordinator: CoordinatorHandle,
+    snapshot_rx: watch::Receiver<Arc<ProtocolState>>,
+    controller_token: Arc<str>,
+    max_lease_ms: u64,
 }
 
 pub fn router(
-    daemon: Arc<TvDaemonState>,
-    tv_client: TvClient,
-    hdmi_map: std::collections::HashMap<String, String>,
+    coordinator: CoordinatorHandle,
+    controller_token: String,
+    max_lease_ms: u64,
 ) -> Router {
+    let snapshot_rx = coordinator.subscribe();
     let state = Arc::new(AppState {
-        daemon,
-        tv_client,
-        hdmi_map,
+        coordinator,
+        snapshot_rx,
+        controller_token: controller_token.into(),
+        max_lease_ms,
     });
-
+    let protected = Router::new()
+        .route("/ready", get(ready))
+        .route("/status", get(status))
+        .route("/enter/{target}", post(create_enter))
+        .route("/enter/request/{request_id}", get(poll_enter))
+        .route("/enter/request/{request_id}/commit", post(commit_enter))
+        .route(
+            "/internal/enter/request/{request_id}/cancel",
+            post(cancel_enter),
+        )
+        .route(
+            "/internal/enter/request/{request_id}/renew",
+            post(renew_enter),
+        )
+        .route("/internal/readiness/{host}", post(update_readiness))
+        .route("/multiview/on", post(multiview_on))
+        .route("/multiview/off", post(multiview_off))
+        .route_layer(middleware::from_fn_with_state(state.clone(), authenticate));
     Router::new()
         .route("/health", get(health))
-        .route("/status", get(status))
-        .route("/enter/{target}", get(enter))
-        .route("/multiview/on", get(multiview_on))
-        .route("/multiview/off", get(multiview_off))
+        .merge(protected)
         .with_state(state)
 }
 
-// ---- /health ----
-async fn health() -> impl IntoResponse {
+async fn authenticate(
+    State(state): State<Arc<AppState>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    if let Err(response) = authorize(request.headers(), &state.controller_token) {
+        return response;
+    }
+    next.run(request).await
+}
+
+async fn health() -> &'static str {
     "ok"
 }
 
-// ---- /status ----
-async fn status(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    axum::Json(state.daemon.status())
+async fn ready(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    if let Err(response) = authorize(&headers, &state.controller_token) {
+        return response;
+    }
+    let snapshot = state.snapshot_rx.borrow().clone();
+    let status = if snapshot.ready() {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    (
+        status,
+        Json(ApiEnvelope::new(ReadyResponse {
+            ready: snapshot.ready(),
+            phase: snapshot.phase,
+            fallback_required: snapshot.fallback_required,
+        })),
+    )
+        .into_response()
 }
 
-// ---- /enter/{target} ----
-async fn enter(
+async fn status(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    if let Err(response) = authorize(&headers, &state.controller_token) {
+        return response;
+    }
+    Json(ApiEnvelope::new(
+        (*state.snapshot_rx.borrow()).as_ref().clone(),
+    ))
+    .into_response()
+}
+
+async fn create_enter(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Path(target): Path<String>,
-) -> impl IntoResponse {
-    let input = Input::from_str(&target);
-    if input == Input::Unknown {
-        return (StatusCode::BAD_REQUEST, "unknown target".to_string());
+    Json(body): Json<CreateEnterRequest>,
+) -> Response {
+    if let Err(response) = authorize(&headers, &state.controller_token) {
+        return response;
     }
-
-    // P0.4: 503 when daemon dead
-    if !*state.daemon.healthy.lock().unwrap() {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "tv disconnected".to_string(),
+    let target = match Host::from_str(&target) {
+        Ok(target) => target,
+        Err(error) => return api_error(StatusCode::BAD_REQUEST, "invalid_host", error.to_string()),
+    };
+    if body.request_id.is_empty()
+        || body.client_id.is_empty()
+        || body.lease_id.is_empty()
+        || body.lease_ttl_ms == 0
+        || body.lease_ttl_ms > state.max_lease_ms
+    {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_identity",
+            "request, client, lease identity and bounded lease_ttl_ms are required",
         );
     }
-
-    // P0.3: pending_switch gate (debounce)
-    {
-        let pending = state.daemon.pending.lock().unwrap();
-        if pending.is_some() {
-            let mode = format!("{:?}", *state.daemon.tv_mode.lock().unwrap()).to_lowercase();
-            return (StatusCode::OK, mode);
-        }
+    let now_ms = state.coordinator.now_ms();
+    let request_id = body.request_id.clone();
+    let event = Event::CreateEnter {
+        request_id: body.request_id,
+        client_id: body.client_id,
+        target,
+        lease: LeaseIdentity {
+            lease_id: body.lease_id,
+            lease_epoch: body.lease_epoch,
+            peer_session_epoch: body.peer_session_epoch,
+            expires_at_ms: now_ms.saturating_add(body.lease_ttl_ms),
+        },
+    };
+    match state.coordinator.apply(event).await {
+        Ok(snapshot) => request_response(&snapshot, &request_id),
+        Err(error) => coordinator_error(error),
     }
-
-    // C6: no-op if already on target
-    {
-        let mode = *state.daemon.tv_mode.lock().unwrap();
-        let current = *state.daemon.tv_input.lock().unwrap();
-        if mode == TvMode::Fullscreen && input == current {
-            return (StatusCode::OK, "fullscreen".to_string());
-        }
-        if mode == TvMode::Multiview {
-            return (StatusCode::OK, "multiview".to_string());
-        }
-    }
-
-    // ReturnToLinux
-    if input == Input::Linux {
-        let should_switch = state.daemon.return_to_linux().unwrap_or(false);
-        if !should_switch {
-            return (StatusCode::OK, "multiview".to_string());
-        }
-
-        let hdmi = state
-            .hdmi_map
-            .get("linux")
-            .cloned()
-            .unwrap_or_else(|| "HDMI_4".to_string());
-
-        info!(target = "linux", action = "switch", input = %hdmi, "enter");
-
-        if let Err(e) = state.tv_client.set_input(&hdmi).await {
-            error!(error = %e, "switch_failed");
-            *state.daemon.last_error.lock().unwrap() = Some(e.clone());
-            state.daemon.switch_complete(); // C1: clear pending on failure
-            return (StatusCode::BAD_GATEWAY, format!("error: {}", e));
-        }
-
-        state.daemon.switch_complete();
-        state.daemon.switch_count.lock().unwrap().linux += 1;
-        info!(mode = "fullscreen", input = "linux", "switch_complete");
-        return (StatusCode::OK, "fullscreen".to_string());
-    }
-
-    // EnterOtherHost: switch to remote host
-    let entered = state.daemon.enter_other_host(input);
-    if !entered {
-        // Guard failed (e.g., tv_input == target after race)
-        let mode = format!("{:?}", *state.daemon.tv_mode.lock().unwrap()).to_lowercase();
-        return (StatusCode::OK, mode);
-    }
-
-    let hdmi = state
-        .hdmi_map
-        .get(&target)
-        .cloned()
-        .unwrap_or_else(|| "HDMI_UNKNOWN".to_string());
-
-    info!(target = %target, action = "switch", input = %hdmi, "enter");
-
-    if let Err(e) = state.tv_client.set_input(&hdmi).await {
-        error!(error = %e, "switch_failed");
-        *state.daemon.last_error.lock().unwrap() = Some(e.clone());
-        state.daemon.switch_complete();
-        return (StatusCode::BAD_GATEWAY, format!("error: {}", e));
-    }
-
-    // SwitchComplete
-    state.daemon.switch_complete();
-    match input {
-        Input::Mac => state.daemon.switch_count.lock().unwrap().mac += 1,
-        Input::Windows => state.daemon.switch_count.lock().unwrap().windows += 1,
-        _ => {}
-    }
-    info!(mode = "fullscreen", input = %target, "switch_complete");
-    (StatusCode::OK, "fullscreen".to_string())
 }
 
-// ---- /multiview/on (EnterMultiView) ----
-async fn multiview_on(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    if !*state.daemon.healthy.lock().unwrap() {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "tv disconnected".to_string(),
-        );
+async fn poll_enter(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(request_id): Path<String>,
+) -> Response {
+    if let Err(response) = authorize(&headers, &state.controller_token) {
+        return response;
     }
-
-    let entered = state.daemon.enter_multiview();
-    if !entered {
-        let mode = format!("{:?}", *state.daemon.tv_mode.lock().unwrap()).to_lowercase();
-        return (StatusCode::OK, mode);
-    }
-
-    info!(action = "on", "multiview");
-
-    if let Err(e) = state.tv_client.set_splitscreen(true).await {
-        error!(error = %e, "multiview_failed");
-        *state.daemon.last_error.lock().unwrap() = Some(e.clone());
-        *state.daemon.tv_mode.lock().unwrap() = TvMode::Fullscreen;
-        return (StatusCode::BAD_GATEWAY, format!("error: {}", e));
-    }
-
-    (StatusCode::OK, "multiview".to_string())
+    request_response(&state.snapshot_rx.borrow(), &request_id)
 }
 
-// ---- /multiview/off (ExitMultiView) ----
-async fn multiview_off(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    if !*state.daemon.healthy.lock().unwrap() {
-        return (
+async fn commit_enter(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(request_id): Path<String>,
+    Json(body): Json<CommitRequest>,
+) -> Response {
+    if let Err(response) = authorize(&headers, &state.controller_token) {
+        return response;
+    }
+    match state
+        .coordinator
+        .apply(Event::Commit {
+            request_id: request_id.clone(),
+            request_epoch: body.request_epoch,
+            grant_epoch: body.grant_epoch,
+            lease_id: body.lease_id,
+            lease_epoch: body.lease_epoch,
+        })
+        .await
+    {
+        Ok(snapshot) => request_response(&snapshot, &request_id),
+        Err(error) => coordinator_error(error),
+    }
+}
+
+async fn cancel_enter(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(request_id): Path<String>,
+    Json(body): Json<CancelRequest>,
+) -> Response {
+    if let Err(response) = authorize(&headers, &state.controller_token) {
+        return response;
+    }
+    match state
+        .coordinator
+        .apply_safety(Event::Cancel {
+            request_id: request_id.clone(),
+            reason: body.reason,
+        })
+        .await
+    {
+        Ok(snapshot) => request_response(&snapshot, &request_id),
+        Err(error) => coordinator_error(error),
+    }
+}
+
+async fn renew_enter(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(request_id): Path<String>,
+    Json(body): Json<RenewRequest>,
+) -> Response {
+    if let Err(response) = authorize(&headers, &state.controller_token) {
+        return response;
+    }
+    match state
+        .coordinator
+        .apply_safety(Event::Renew {
+            request_id,
+            lease_id: body.lease_id,
+            lease_epoch: body.lease_epoch,
+            peer_session_epoch: body.peer_session_epoch,
+        })
+        .await
+    {
+        Ok(snapshot) => Json(ApiEnvelope::new(RenewResponse {
+            renewed: snapshot.active_session.is_some(),
+            phase: snapshot.phase,
+        }))
+        .into_response(),
+        Err(error) => coordinator_error(error),
+    }
+}
+
+async fn update_readiness(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(host): Path<String>,
+    Json(body): Json<ReadinessRequest>,
+) -> Response {
+    if let Err(response) = authorize(&headers, &state.controller_token) {
+        return response;
+    }
+    let host = match Host::from_str(&host) {
+        Ok(host) => host,
+        Err(error) => return api_error(StatusCode::BAD_REQUEST, "invalid_host", error.to_string()),
+    };
+    let now_ms = state.coordinator.now_ms();
+    match state
+        .coordinator
+        .apply_safety(Event::PeerReadinessUpdated {
+            host,
+            readiness: PeerReadiness {
+                online: body.online,
+                keyboard_ready: body.keyboard_ready,
+                pointer_ready: body.pointer_ready,
+                session_epoch: body.session_epoch,
+                observed_at_ms: now_ms,
+            },
+        })
+        .await
+    {
+        Ok(snapshot) => Json(ApiEnvelope::new(ReadinessResponse {
+            host,
+            readiness: snapshot.peers.get(&host).cloned().unwrap_or_default(),
+        }))
+        .into_response(),
+        Err(error) => coordinator_error(error),
+    }
+}
+
+async fn multiview_on(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    multiview(state, headers, true).await
+}
+
+async fn multiview_off(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    multiview(state, headers, false).await
+}
+
+async fn multiview(state: Arc<AppState>, headers: HeaderMap, enabled: bool) -> Response {
+    if let Err(response) = authorize(&headers, &state.controller_token) {
+        return response;
+    }
+    match state
+        .coordinator
+        .apply_safety(Event::MultiViewRequested { enabled })
+        .await
+    {
+        Ok(snapshot) => (
+            StatusCode::ACCEPTED,
+            Json(ApiEnvelope::new(MultiViewResponse {
+                enabled,
+                phase: snapshot.phase,
+                switch_epoch: snapshot.switch_epoch,
+            })),
+        )
+            .into_response(),
+        Err(error) => coordinator_error(error),
+    }
+}
+
+fn request_response(state: &ProtocolState, request_id: &str) -> Response {
+    let Some(request) = state.request(request_id).cloned() else {
+        return api_error(
+            StatusCode::NOT_FOUND,
+            "request_not_found",
+            "request not found",
+        );
+    };
+    let status = match request.status {
+        RequestStatus::Waking | RequestStatus::Switching => StatusCode::ACCEPTED,
+        RequestStatus::Grant | RequestStatus::Committed => StatusCode::OK,
+        RequestStatus::Denied
+        | RequestStatus::Cancelled
+        | RequestStatus::Fallback
+        | RequestStatus::Expired => StatusCode::CONFLICT,
+    };
+    (status, Json(ApiEnvelope::new(request))).into_response()
+}
+
+fn coordinator_error(error: CoordinatorError) -> Response {
+    match error {
+        CoordinatorError::Busy => api_error(
             StatusCode::SERVICE_UNAVAILABLE,
-            "tv disconnected".to_string(),
+            "coordinator_busy",
+            error.to_string(),
+        ),
+        CoordinatorError::Closed => api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "coordinator_closed",
+            error.to_string(),
+        ),
+        CoordinatorError::Protocol(ProtocolError::Unavailable) => api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "not_ready",
+            error.to_string(),
+        ),
+        CoordinatorError::Protocol(ProtocolError::Busy { active_request_id }) => (
+            StatusCode::CONFLICT,
+            Json(ApiError {
+                protocol_version: PROTOCOL_VERSION,
+                code: "request_busy",
+                message: "another request is active".to_string(),
+                active_request_id: Some(active_request_id),
+            }),
+        )
+            .into_response(),
+        CoordinatorError::Protocol(ProtocolError::RequestNotFound) => api_error(
+            StatusCode::NOT_FOUND,
+            "request_not_found",
+            error.to_string(),
+        ),
+        CoordinatorError::Protocol(
+            ProtocolError::TargetNotReady
+            | ProtocolError::InvalidLease
+            | ProtocolError::StaleIdentity
+            | ProtocolError::RequestIdentityConflict
+            | ProtocolError::InputNotLocal,
+        ) => api_error(StatusCode::CONFLICT, "request_conflict", error.to_string()),
+        CoordinatorError::Protocol(ProtocolError::Invariant(_)) => api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "invariant_violation",
+            error.to_string(),
+        ),
+    }
+}
+
+fn authorize(headers: &HeaderMap, expected_token: &str) -> Result<(), Response> {
+    let presented = headers
+        .get(AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "));
+    if presented.is_some_and(|token| constant_time_eq(token.as_bytes(), expected_token.as_bytes()))
+    {
+        Ok(())
+    } else {
+        Err(api_error(
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+            "missing or invalid bearer token",
+        ))
+    }
+}
+
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    left.iter()
+        .zip(right)
+        .fold(0u8, |difference, (left, right)| difference | (left ^ right))
+        == 0
+}
+
+fn api_error(status: StatusCode, code: &'static str, message: impl Into<String>) -> Response {
+    (
+        status,
+        Json(ApiError {
+            protocol_version: PROTOCOL_VERSION,
+            code,
+            message: message.into(),
+            active_request_id: None,
+        }),
+    )
+        .into_response()
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateEnterRequest {
+    client_id: String,
+    request_id: String,
+    lease_id: String,
+    lease_epoch: u64,
+    peer_session_epoch: u64,
+    lease_ttl_ms: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct CommitRequest {
+    request_epoch: u64,
+    grant_epoch: u64,
+    lease_id: String,
+    lease_epoch: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct CancelRequest {
+    reason: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct RenewRequest {
+    lease_id: String,
+    lease_epoch: u64,
+    peer_session_epoch: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct ReadinessRequest {
+    online: bool,
+    keyboard_ready: bool,
+    pointer_ready: bool,
+    session_epoch: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct ApiEnvelope<T> {
+    protocol_version: u16,
+    data: T,
+}
+
+impl<T> ApiEnvelope<T> {
+    fn new(data: T) -> Self {
+        Self {
+            protocol_version: PROTOCOL_VERSION,
+            data,
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct ApiError {
+    protocol_version: u16,
+    code: &'static str,
+    message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    active_request_id: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct ReadyResponse {
+    ready: bool,
+    phase: crate::domain::ProtocolPhase,
+    fallback_required: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct RenewResponse {
+    renewed: bool,
+    phase: crate::domain::ProtocolPhase,
+}
+
+#[derive(Debug, Serialize)]
+struct ReadinessResponse {
+    host: Host,
+    readiness: PeerReadiness,
+}
+
+#[derive(Debug, Serialize)]
+struct MultiViewResponse {
+    enabled: bool,
+    phase: crate::domain::ProtocolPhase,
+    switch_epoch: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        coordinator,
+        domain::{ProtocolState, TvMode},
+        protocol::ProtocolTiming,
+    };
+    use axum::{
+        body::{to_bytes, Body},
+        http::Request,
+    };
+    use serde_json::{json, Value};
+    use std::collections::BTreeMap;
+    use tower::ServiceExt;
+
+    const TIMING: ProtocolTiming = ProtocolTiming {
+        command_ms: 100,
+        observation_ms: 100,
+        grant_ms: 100,
+        wake_ms: 500,
+        lease_ms: 300,
+        signal_poll_ms: 100,
+    };
+
+    fn authenticated(request: axum::http::request::Builder) -> axum::http::request::Builder {
+        request.header(AUTHORIZATION, "Bearer test-token")
+    }
+
+    async fn body_json(response: Response) -> Value {
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    async fn ready_app() -> (Router, CoordinatorHandle, coordinator::EffectReceivers) {
+        let (handle, effects, _) =
+            coordinator::spawn(ProtocolState::new(Host::Linux), TIMING, 8, 4);
+        handle
+            .apply_safety(Event::TransportSynchronized {
+                mode: TvMode::Fullscreen,
+                input: Some(Host::Linux),
+                signals: BTreeMap::from([
+                    (Host::Linux, true),
+                    (Host::Mac, false),
+                    (Host::Windows, false),
+                ]),
+            })
+            .await
+            .unwrap();
+        handle
+            .apply_safety(Event::PeerReadinessUpdated {
+                host: Host::Mac,
+                readiness: PeerReadiness {
+                    online: true,
+                    keyboard_ready: true,
+                    pointer_ready: true,
+                    session_epoch: 9,
+                    observed_at_ms: handle.now_ms(),
+                },
+            })
+            .await
+            .unwrap();
+        (
+            router(handle.clone(), "test-token".to_string(), 500),
+            handle,
+            effects,
+        )
+    }
+
+    #[tokio::test]
+    async fn get_enter_is_method_not_allowed() {
+        let (app, _, _) = ready_app().await;
+        let response = app
+            .oneshot(
+                authenticated(Request::builder().method("GET").uri("/enter/mac"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+    }
+
+    #[tokio::test]
+    async fn mutations_require_bearer_authentication() {
+        let (app, _, _) = ready_app().await;
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/enter/mac")
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn fenced_create_returns_pending_identity_and_emits_one_command() {
+        let (app, handle, mut effects) = ready_app().await;
+        let response = app
+            .oneshot(
+                authenticated(Request::builder().method("POST").uri("/enter/mac"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "client_id": "hub",
+                            "request_id": "request-1",
+                            "lease_id": "lease-1",
+                            "lease_epoch": 1,
+                            "peer_session_epoch": 9,
+                            "lease_ttl_ms": 300
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let body = body_json(response).await;
+        assert_eq!(body["data"]["request_id"], "request-1");
+        assert_eq!(body["data"]["status"], "switching");
+        assert_eq!(handle.snapshot().keyboard_owner, Host::Linux);
+        assert!(matches!(
+            effects.ordinary.recv().await,
+            Some(crate::protocol::Effect::SetInput {
+                target: Host::Mac,
+                fallback: false,
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn ready_and_status_are_typed_json() {
+        let (app, _, _) = ready_app().await;
+        let ready_response = app
+            .clone()
+            .oneshot(
+                authenticated(Request::builder().uri("/ready"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ready_response.status(), StatusCode::OK);
+        assert_eq!(body_json(ready_response).await["data"]["ready"], true);
+
+        let status_response = app
+            .oneshot(
+                authenticated(Request::builder().uri("/status"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(status_response.status(), StatusCode::OK);
+        assert_eq!(
+            body_json(status_response).await["data"]["keyboard_owner"],
+            "linux"
         );
     }
-
-    let exited = state.daemon.exit_multiview(Input::Linux); // default to linux
-    if !exited {
-        let mode = format!("{:?}", *state.daemon.tv_mode.lock().unwrap()).to_lowercase();
-        return (StatusCode::OK, mode);
-    }
-
-    info!(action = "off", "multiview");
-
-    if let Err(e) = state.tv_client.set_splitscreen(false).await {
-        error!(error = %e, "multiview_failed");
-        *state.daemon.last_error.lock().unwrap() = Some(e.clone());
-        *state.daemon.tv_mode.lock().unwrap() = TvMode::Multiview;
-        return (StatusCode::BAD_GATEWAY, format!("error: {}", e));
-    }
-
-    (StatusCode::OK, "fullscreen".to_string())
 }

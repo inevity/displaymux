@@ -32,19 +32,18 @@ src/
     codec.rs          SSAP request/response/subscription message types
     transport.rs      persistent WebSocket lifecycle
     key_store.rs      LG client-key loading with secret-safe errors
-  legacy_subprocess.rs temporary characterization adapter; deleted before completion
+  ssap/transport.rs   only production TV transport; no subprocess fallback
 ```
 
 Do not introduce an abstraction solely to match this tree. Combine files when ownership stays unambiguous and tests remain focused.
 
 ## D0: Characterization and Test Seams
 
-- Add route-level tests for `/health`, `/status`, legacy `/enter`, and MultiView routes.
+- Add route-level tests for `/health`, `/status`, the fenced enter API, and MultiView routes.
 - Introduce a fakeable TV control seam with a native async trait and generic concrete state, or a typed command handle. Do not use the `async-trait` crate.
 - Characterize subprocess success, non-zero exit, spawn failure, and hung-command timeout behavior.
 - Add a deterministic regression for the mode/pending lock-order cycle before fixing it. The test must use a bounded timeout and must not leave a blocked test worker behind.
-- Snapshot current JSON and plain-text response contracts for the temporary compatibility path.
-- Record which existing tests encode obsolete behavior, especially target no-op, immediate `switch_complete`, reconnect exit at 30, and Linux-specific fallback.
+- Record and then replace tests that encode obsolete behavior, especially target no-op, immediate `switch_complete`, reconnect exit at 30, and Linux-specific fallback. Obsolete contracts are not retained as passing compatibility tests.
 
 Verification: `cargo check`; `cargo test`; no endpoint or production default changes.
 
@@ -52,13 +51,13 @@ Commit boundary: tests and injection seams only.
 
 ## D1: Coherent Legacy State Refactor
 
-- Introduce a single aggregate legacy state value guarded by one synchronization boundary.
+- Introduce a single aggregate state value guarded by one synchronization boundary.
 - Move counters and last error into coherent snapshots; keep monotonic counters separate only when their atomic independence is intentional.
 - Make transition methods return typed decisions/effects rather than requiring handlers to re-read fields.
 - Parse target strings through `FromStr` with typed rejection instead of mapping unknown values into a valid `Input::Unknown` command target.
 - Add `ServerHost` and HDMI mapping to validated configuration while preserving current defaults.
 - Move all config constants out of `main.rs`; make Ansible values authoritative at deployment.
-- Keep legacy route behavior unchanged except for the separately committed deadlock/torn-state correction.
+- Remove old mutating GET routes instead of preserving their behavior.
 
 Verification: characterization tests remain green; one snapshot cannot contain fields from different transitions; lock-order regression passes.
 
@@ -162,7 +161,9 @@ Actor requirements:
 - perform at most one signal query in flight and coalesce duplicate poll requests;
 - apply an explicit timeout to connect, write, response, subscription, and close operations.
 
-Keep `legacy_subprocess.rs` only during shadow comparison. A subprocess success can never generate a verified observation event.
+Remove the subprocess transport when the SSAP actor is enabled. There is no
+production shadow or fallback path, and a subprocess success can never generate
+a verified observation event.
 
 Scripted transport tests:
 
@@ -209,7 +210,7 @@ HTTP rules:
 - missing request is `404`;
 - expired/stale grant or lease is a typed conflict, never success;
 - duplicate current create/commit is idempotent;
-- legacy GET mutation is staging-only and becomes `405` or `410` at cutover;
+- legacy GET mutation routes are never registered;
 - `/health` is process liveness; `/ready` is protocol readiness.
 
 Handlers parse, send one actor command, await one bounded response, and format it. They do not choose transitions, touch SSAP, or mutate counters.

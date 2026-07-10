@@ -1,28 +1,20 @@
-// tv-multiview: MultiView-aware HDMI input switch daemon.
-// Implements the TvDisplaySwitch TLA+ spec.
-//
-// Architecture:
-//   bscpylgtvcommand (subprocess) → WebOS SSAP → TV
-//   axum HTTP server → lan-mouse enter_hook + multiView toggle
-//   tokio background task → health polling + reconnect
-
-use std::collections::HashMap;
-use std::net::{Ipv4Addr, SocketAddr};
-use std::sync::Arc;
-
 use tokio::signal;
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
+mod config;
+mod coordinator;
+mod domain;
 mod http;
-mod state;
-mod tv;
+mod protocol;
+mod ssap;
 
-use state::TvDaemonState;
+use config::DaemonConfig;
+use domain::ProtocolState;
+use protocol::{Event, ProtocolTiming};
 
 #[tokio::main]
 async fn main() {
-    // Structured JSON logging
     tracing_subscriber::fmt()
         .json()
         .with_env_filter(
@@ -32,109 +24,91 @@ async fn main() {
         .with_current_span(false)
         .init();
 
-    // Configuration (hardcoded — templated by ansible at deploy time)
-    let tv_ip: Ipv4Addr = "192.0.2.20".parse().expect("invalid TV_IP");
-    let daemon_port: u16 = 8765;
-    let mut hdmi_map = HashMap::new();
-    hdmi_map.insert("linux".to_string(), "HDMI_4".to_string());
-    hdmi_map.insert("mac".to_string(), "HDMI_3".to_string());
-    hdmi_map.insert("windows".to_string(), "HDMI_2".to_string());
-
-    let daemon = Arc::new(TvDaemonState::default());
-    let tv_client = Arc::new(tv::TvClient::new(tv_ip));
-
-    // ---- Background: health polling + reconnect lifecycle ----
-    let poll_daemon = Arc::clone(&daemon);
-    let poll_client = Arc::clone(&tv_client);
-
-    tokio::spawn(async move {
-        maintain_connection(poll_daemon, poll_client, tv_ip).await;
-    });
-
-    // ---- HTTP server ----
-    let app = http::router(Arc::clone(&daemon), (*tv_client).clone(), hdmi_map);
-    let addr = SocketAddr::from(([0, 0, 0, 0], daemon_port));
-    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
-
-    info!(port = daemon_port, tv_ip = %tv_ip, "startup");
-
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await
-        .unwrap();
-
-    info!("shutdown");
-}
-
-async fn maintain_connection(
-    daemon: Arc<TvDaemonState>,
-    client: Arc<tv::TvClient>,
-    _tv_ip: Ipv4Addr,
-) {
-    // Initial state: dead (healthy=false from Default)
-    // ReconnectFails loop
-    loop {
-        info!(
-            event = "connect",
-            retry = daemon
-                .reconnect_count
-                .load(std::sync::atomic::Ordering::SeqCst)
-        );
-        if let Err(e) = client.get_sw_info().await {
-            error!(error = %e, "connect_failed");
-            if daemon.reconnect_failed() {
-                tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
-                continue;
-            } else {
-                // C3: cap reached, exit to let systemd restart
-                error!("reconnect_cap_reached, exiting");
-                std::process::exit(1);
-            }
-        }
-
-        // DaemonReconnects
-        daemon.mark_healthy();
-        info!(event = "connected");
-
-        // Heartbeat every 5s
-        loop {
-            tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
-
-            if let Err(e) = client.get_sw_info().await {
-                error!(error = %e, "heartbeat_failed");
-                break;
-            }
-        }
-
-        // DaemonDies
-        daemon.mark_dead();
-        daemon
-            .reconnect_count
-            .store(0, std::sync::atomic::Ordering::SeqCst);
-
-        // Reconnect delay
-        tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+    if let Err(run_error) = run().await {
+        error!(error = %run_error, "fatal daemon error");
+        std::process::exit(1);
     }
 }
 
+async fn run() -> Result<(), Box<dyn std::error::Error>> {
+    let config = DaemonConfig::load()?;
+    let timing = ProtocolTiming {
+        command_ms: config.timeouts.command_ms,
+        observation_ms: config.timeouts.observation_ms,
+        grant_ms: config.timeouts.grant_ms,
+        wake_ms: config.timeouts.wake_ms,
+        lease_ms: config.timeouts.lease_ms,
+        signal_poll_ms: config.timeouts.signal_poll_ms,
+    };
+    let (coordinator, effects, coordinator_task) = coordinator::spawn(
+        ProtocolState::new(config.server_host),
+        timing,
+        config.limits.command_queue,
+        config.limits.safety_queue,
+    );
+    let ssap_task = ssap::spawn(config.clone(), coordinator.clone(), effects);
+    spawn_state_dump(coordinator.clone());
+
+    let app = http::router(
+        coordinator.clone(),
+        config.controller_token.clone(),
+        config.timeouts.lease_ms,
+    );
+    let listener = tokio::net::TcpListener::bind(config.bind_address).await?;
+    info!(
+        event = "startup",
+        bind_address = %config.bind_address,
+        tv_ip = %config.tv_ip,
+        server_host = %config.server_host,
+        command_queue = config.limits.command_queue,
+        safety_queue = config.limits.safety_queue,
+    );
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
+
+    let _ = coordinator.apply_safety(Event::Shutdown).await;
+    ssap_task.abort();
+    coordinator_task.abort();
+    info!(event = "shutdown");
+    Ok(())
+}
+
+#[cfg(unix)]
+fn spawn_state_dump(coordinator: coordinator::CoordinatorHandle) {
+    tokio::spawn(async move {
+        let Ok(mut signal) = signal::unix::signal(signal::unix::SignalKind::user_defined1()) else {
+            return;
+        };
+        while signal.recv().await.is_some() {
+            let snapshot = coordinator.snapshot();
+            info!(event = "state_dump", state = ?snapshot);
+        }
+    });
+}
+
+#[cfg(not(unix))]
+fn spawn_state_dump(_coordinator: coordinator::CoordinatorHandle) {}
+
 async fn shutdown_signal() {
     let ctrl_c = async {
-        signal::ctrl_c().await.unwrap();
+        let _ = signal::ctrl_c().await;
     };
 
     #[cfg(unix)]
     let terminate = async {
-        signal::unix::signal(signal::unix::SignalKind::terminate())
-            .unwrap()
-            .recv()
-            .await;
+        if let Ok(mut signal) = signal::unix::signal(signal::unix::SignalKind::terminate()) {
+            signal.recv().await;
+        } else {
+            std::future::pending::<()>().await;
+        }
     };
 
     #[cfg(not(unix))]
     let terminate = std::future::pending::<()>();
 
     tokio::select! {
-        _ = ctrl_c => info!("SIGINT received"),
-        _ = terminate => info!("SIGTERM received"),
+        _ = ctrl_c => info!(event = "shutdown_signal", signal = "SIGINT"),
+        _ = terminate => info!(event = "shutdown_signal", signal = "SIGTERM"),
     }
 }
