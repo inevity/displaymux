@@ -1,25 +1,3 @@
-# Fullscreen / MultiView Switch Design for lan-mouse
-
-## Scope and Terminology
-
-**multiView** is the umbrella term used throughout this document. It covers
-all WebOS split-layout modes: side-by-side (two panes, left/right),
-picture-in-picture (PIP, small overlay), and any future multiView layout the
-TV firmware supports.
-
-The LG WebOS API exposes a single boolean:
-`multiViewStatus: "on" | "off"`. There is no API distinction between
-side-by-side and PIP — they are the same state as far as programmatic
-control is concerned. The TV remembers which layout the user last selected
-via the remote and uses it whenever `splitscreenEnable` is toggled on.
-
-Implication: the daemon's behavior is identical whether the user chose
-side-by-side or PIP. When `multiViewStatus == "on"`, input switching is
-suppressed regardless of layout geometry.
-
-## TLA+ State Model
-
-```
 ---- MODULE TvDisplaySwitch ----
 EXTENDS Naturals
 
@@ -71,11 +49,9 @@ ProtocolType == [
 
 \* --- CONSTANTS ---
 
-CONSTANTS SWITCH_TIMEOUT, WAKE_TIMEOUT, RECONNECT_CAP
-
-ASSUME /\ SWITCH_TIMEOUT \in Nat /\ SWITCH_TIMEOUT > 0
-       /\ WAKE_TIMEOUT \in Nat /\ WAKE_TIMEOUT > 0
-       /\ RECONNECT_CAP \in Nat /\ RECONNECT_CAP > 0
+SWITCH_TIMEOUT == 2     \* finite TLC instance only; production document remains 5
+WAKE_TIMEOUT == 2       \* finite TLC instance only; production document remains 60
+RECONNECT_CAP == 2      \* finite TLC instance only; production document remains 30
 
 HostCapture == [
     linux |-> "capturing_linux",
@@ -396,11 +372,8 @@ SSAPDisconnect ==
     /\ input_owner' = SERVER_HOST
     /\ cursor' = SERVER_HOST
     /\ capture' = "idle"
-    /\ wake_timer' = 0
-    /\ wake_pending' = "none"
     /\ protocol' = [protocol EXCEPT
                        !.phase = "fallback_deferred",
-                       !.request_target = "none",
                        !.reservation_target = "none",
                        !.reservation_epoch = 0,
                        !.grant_epoch = 0,
@@ -408,8 +381,9 @@ SSAPDisconnect ==
                        !.pointer_owner = SERVER_HOST,
                        !.fallback_required = TRUE,
                        !.tv_control_available = FALSE]
-    /\ UNCHANGED <<tv_mode, tv_input, reconnect_count, input_signal,
-                   remote_online, remote_input_ready>>
+    /\ UNCHANGED <<tv_mode, tv_input,
+                   reconnect_count, wake_timer, input_signal, remote_online,
+                   remote_input_ready, wake_pending>>
 
 \* =====================================================================
 \* SUBSCRIPTION CALLBACK (push updates from TV)
@@ -500,17 +474,9 @@ SubscriptionFires ==
                               !.keyboard_owner = SERVER_HOST,
                               !.pointer_owner = SERVER_HOST,
                               !.fallback_required = TRUE]
-    \* A callback that resolves or supersedes a wake request must cancel the
-    \* wake timer. Otherwise phase can leave "waking" while wake_pending stays
-    \* set forever, disabling WakeTimeout and violating EventuallyWakeSettles.
-    /\ IF protocol.phase = "waking" THEN
-          /\ wake_timer' = 0
-          /\ wake_pending' = "none"
-       ELSE
-          /\ UNCHANGED <<wake_timer, wake_pending>>
     /\ UNCHANGED <<ws_state, subscribe_active,
-                   daemon_healthy, reconnect_count, input_signal,
-                   remote_online, remote_input_ready>>
+                   daemon_healthy, reconnect_count, wake_timer, input_signal,
+                   remote_online, remote_input_ready, wake_pending>>
 
 \* =====================================================================
 \* SWITCH TRANSITIONS (EnterOtherHost → SwitchComplete | SwitchFailed | SwitchTimeout)
@@ -949,9 +915,8 @@ WakeTimerTick ==
                    reconnect_count, switch_timer, input_signal, remote_online,
                    remote_input_ready, wake_pending, protocol>>
 
-\* Host did not wake. Cancel the pending wake. Settle only when SERVER_HOST
-\* signal is still present; otherwise preserve honest degraded state and enter
-\* the same verified fallback transaction used by every other failure.
+\* Host did not wake. Cancel the pending wake and settle display/input on
+\* SERVER_HOST.
 WakeTimeout ==
     /\ wake_pending \in RemoteHosts
     /\ protocol.phase = "waking"
@@ -962,49 +927,17 @@ WakeTimeout ==
     /\ input_owner' = SERVER_HOST
     /\ cursor' = SERVER_HOST
     /\ capture' = "idle"
-    /\ IF input_signal[SERVER_HOST] THEN
-          /\ tv_mode' = "fullscreen"
-          /\ pending_switch' = "none"
-          /\ switch_timer' = 0
-          /\ protocol' = [protocol EXCEPT
-                             !.phase = "idle",
-                             !.request_target = "none",
-                             !.grant_epoch = 0,
-                             !.reservation_target = "none",
-                             !.reservation_epoch = 0,
-                             !.keyboard_owner = SERVER_HOST,
-                             !.pointer_owner = SERVER_HOST,
-                             !.fallback_required = FALSE]
-       ELSE IF daemon_healthy /\ ws_state = "connected"
-               /\ protocol.tv_control_available THEN
-          /\ tv_mode' = "transitioning"
-          /\ pending_switch' = SERVER_HOST
-          /\ switch_timer' = SWITCH_TIMEOUT
-          /\ protocol' = [protocol EXCEPT
-                             !.commanded_input = SERVER_HOST,
-                             !.phase = "fallback_command_pending",
-                             !.switch_epoch = protocol.switch_epoch + 1,
-                             !.request_target = "none",
-                             !.grant_epoch = 0,
-                             !.reservation_target = "none",
-                             !.reservation_epoch = 0,
-                             !.keyboard_owner = SERVER_HOST,
-                             !.pointer_owner = SERVER_HOST,
-                             !.fallback_required = TRUE]
-       ELSE
-          /\ tv_mode' = "fullscreen"
-          /\ pending_switch' = "none"
-          /\ switch_timer' = 0
-          /\ protocol' = [protocol EXCEPT
-                             !.phase = "fallback_deferred",
-                             !.request_target = "none",
-                             !.grant_epoch = 0,
-                             !.reservation_target = "none",
-                             !.reservation_epoch = 0,
-                             !.keyboard_owner = SERVER_HOST,
-                             !.pointer_owner = SERVER_HOST,
-                             !.fallback_required = TRUE]
-    /\ UNCHANGED tv_input
+    /\ pending_switch' = "none"
+    /\ switch_timer' = 0
+    /\ protocol' = [protocol EXCEPT
+                       !.phase = "idle",
+                       !.request_target = "none",
+                       !.grant_epoch = 0,
+                       !.reservation_target = "none",
+                       !.reservation_epoch = 0,
+                       !.keyboard_owner = SERVER_HOST,
+                       !.pointer_owner = SERVER_HOST]
+    /\ UNCHANGED <<tv_mode, tv_input>>
     /\ UNCHANGED <<ws_state, subscribe_active, daemon_healthy,
                    reconnect_count, input_signal, remote_online,
                    remote_input_ready>>
@@ -1358,11 +1291,8 @@ Spec == Init /\ [][Next]_vars
           /\ WF_vars(ServerHostSwitchComplete)
           /\ WF_vars(SignalLossRevert)
           /\ WF_vars(WakeTimerTick)
-          \* Readiness updates can alternately enable timeout and retry without
-          \* leaving either continuously enabled. These internal outcomes need
-          \* strong fairness so an oscillating environment cannot starve both.
-          /\ SF_vars(WakeTimeout)
-          /\ SF_vars(WakeRetryOutcome)
+          /\ WF_vars(WakeTimeout)
+          /\ WF_vars(WakeRetryOutcome)
 
 \* =====================================================================
 \* LIVENESS
@@ -1395,8 +1325,7 @@ EventuallyRevert ==
             /\ cursor = SERVER_HOST /\ capture = "idle"))
 
 \* A wake attempt must either complete with remote input readiness or cancel.
-\* This depends on weak fairness for ticking and strong fairness for timeout
-\* versus readiness-driven retry when readiness oscillates around the deadline.
+\* This depends on weak fairness for WakeTimerTick and WakeTimeout.
 EventuallyWakeSettles ==
     (wake_pending \in RemoteHosts)
         ~> (wake_pending = "none")
@@ -1404,17 +1333,6 @@ EventuallyWakeSettles ==
 EventuallyGrantSettles ==
     (protocol.phase = "grant_pending")
         ~> (protocol.phase # "grant_pending")
-
-\* Finite TLC state constraint. It is not part of Spec and does not change
-\* production semantics. The finite checker configuration uses reduced timer
-\* constants and this bound to cover one request plus a remote/fallback switch.
-TLCFiniteState ==
-    /\ reconnect_count <= 1
-    /\ protocol.request_epoch <= 1
-    /\ protocol.switch_epoch <= 2
-    /\ protocol.verified_epoch <= 2
-    /\ protocol.grant_epoch <= 1
-    /\ protocol.reservation_epoch <= 1
 
 \* =====================================================================
 \* DESIGN DECISIONS
@@ -1472,582 +1390,13 @@ TLCFiniteState ==
 \* C13 (single SSAP owner): one actor serializes writes, correlates responses,
 \*     and publishes state events. No state mutex is held across an await.
 
+\* Model-checking constraint only. The documented design remains unbounded.
+TLCFiniteState ==
+    /\ reconnect_count <= 1
+    /\ protocol.request_epoch <= 1
+    /\ protocol.switch_epoch <= 2
+    /\ protocol.verified_epoch <= 2
+    /\ protocol.grant_epoch <= 1
+    /\ protocol.reservation_epoch <= 1
+
 =================================================================================
-```
-
-### TLC Verification
-
-Executable artifacts live in `../tla/`:
-
-- `TvDisplaySwitch.tla`: canonical module extracted from the code block above.
-- `TvDisplaySwitch.cfg`: candidate production timer values; the unbounded epoch
-  state space is intentionally not claimed as exhaustively checked.
-- `TvDisplaySwitchFinite.cfg`: both remote hosts, timers reduced to 2, one
-  request epoch, and up to two switch epochs through `TLCFiniteState`.
-- `tlc-pre-fix/`: preserved parser, invariant, and liveness check inputs from
-  the review that found the defects corrected here.
-
-The finite configuration was checked with TLC 2.19 from
-`/home/example/.cache/nvim/tla.nvim/tla2tools.jar`. TLC completed with no error:
-36,259,841 states generated, 1,064,650 distinct states, depth 28, all twelve
-invariants and all four liveness properties checked. This is bounded validation,
-not a proof of the unbounded production specification.
-
-## Architecture Design
-
-### Actors
-
-```
-┌─────────────┐     enter_hook      ┌──────────────┐    persistent wss://      ┌──────┐
-│  lan-mouse  │ ──── curl ────────→ │ tv-multiview  │ ──── SSAP (WebSocket) ─→ │  TV  │
-│   (hub)     │                     │   daemon      │                          │ G4   │
-└─────────────┘                     │  (Rust)       │ ←── subscribe callback ── │      │
-                                    └──────────────┘                          └──────┘
-                                           │
-                                           │ HTTP API (axum)
-                                           ▼
-                                    ┌──────────────┐
-                                    │  External     │
-                                    │  triggers     │
-                                    │ (multiView   │
-                                    │  toggle)     │
-                                    └──────────────┘
-
-The Rust daemon holds one persistent wss:// connection to the TV for its
-entire lifetime. No subprocess-per-command. No repeated TLS handshakes.
-No repeated SSAP register. All SSAP operations (set_input,
-set_splitscreen, get_signal_status, subscribe) flow over the same
-long-lived WebSocket.
-
-The daemon uses the same .aiopylgtv.sqlite client-key file as LG_Buddy
-(at ~/.config/lg-buddy/), so one TV pairing works for both tools.
-
-One dedicated SSAP actor owns the socket, request IDs, response correlation,
-subscription callbacks, and a bounded command queue. HTTP handlers send
-messages to that actor and never read/write the WebSocket directly. No shared
-state lock may be held while awaiting SSAP I/O or lan-mouse commit.
-```
-
-### API Endpoints
-
-| Method | Path | Purpose | Returns |
-|---|---|---|---|
-| POST | `/enter/{target}` | Create one fenced enter request; reserve both input paths before issuing `set_input()`. | Typed JSON: request ID, epoch, state, deadline |
-| GET | `/enter/request/{id}` | Poll a waking or switching request without creating a second switch. | Typed JSON: pending, grant, denied, or fallback |
-| POST | `/enter/request/{id}/commit` | Acknowledge that lan-mouse atomically committed the matching keyboard+pointer grant. | Typed JSON commit result |
-| POST | `/multiview/on` | Enable multiView through the serialized SSAP actor. | Typed JSON command result |
-| POST | `/multiview/off` | Disable multiView, release input locally, then verify fullscreen `SERVER_HOST`. | Typed JSON command result |
-| GET | `/status` | Health, protocol phase, command/observation epochs, owners, lease, and signal status. | JSON |
-| GET | `/health` | Liveness probe (always 200 if process alive). | `"ok"` |
-| GET | `/ready` | Readiness probe; 200 only when SSAP is subscribed and no unresolved fallback exists. | Typed JSON readiness |
-
-### State Machine (Daemon Internal)
-
-```
-                         ┌──────────────────────────────────┐
-                         │          DISCONNECTED             │
-                         │  ws_state = disconnected          │
-                         │  daemon_healthy = false           │
-                         │  HTTP: 503                        │
-                         └──────┬──────────────┬────────────┘
-                                │ reconnect    │ disconnect
-                                ▼              ▼
-                   ┌─────────────────────────────────────────────────────┐
-                   │                   CONNECTED                          │
-                   │  ws_state = connected, subscribe_active = true       │
-                   │                                                     │
-                   │  ┌──────────┐   multiview     ┌──────────┐          │
-                   │  │FULLSCREEN│ ── on ────────→ │MULTIVIEW │          │
-                   │  │          │ ←── off ─────── │(SXS/PIP) │          │
-                   │  │          │                 │          │          │
-                   │  │ enter→   │                 │ enter→   │          │
-                   │  │ TRANS.   │                 │ capture  │          │
-                   │  │  ┌───────┼───┐             │ only     │          │
-                   │  │  │ SwitchComplete  │       └──────────┘          │
-                   │  │  │ SwitchFailed    │                              │
-                   │  │  │ SwitchTimeout   │                              │
-                   │  │  └───────┼───┘             ┌──────────┐          │
-                   │  │          │                 │ SIGNAL   │          │
-                   │  │  SignalLossRevert ───────→ │ LOSS     │          │
-                   │  │          │                 │ REVERT   │          │
-                   │  └──────────┘                 └──────────┘          │
-                   │                                                     │
-                   │  ┌──────────┐                                       │
-                   │  │ REMOTE   │  RemoteHostOffline ──→ server fallback│
-                   │  │ HOST     │                                       │
-                   │  │ OFFLINE  │                                       │
-                   │  └──────────┘                                       │
-                   └─────────────────────────────────────────────────────┘
-
-Pending switch gating: pending_switch != "none" blocks all new transitions
-that produce a TV command. A concurrent request receives an explicit `409
-busy` containing the active request ID; it never receives a success-shaped
-`200 current_mode` response.
-
-The diagram compresses four distinct protocol transitions: SSAP command
-acknowledgement, fresh active-input/signal observation, grant issuance, and
-lan-mouse commit. `SwitchComplete` issues a grant; only
-`LanMouseCommitGrant` changes data-plane ownership.
-
-Failure is always recoverable: SwitchFailed, SwitchTimeout, SignalLossRevert,
-WakeTimeout, RemoteInputNotReadyReject, RemoteHostOffline, and
-SSAPDisconnect plus SSAPSubscribe recovery all converge to freshly observed
-fullscreen `SERVER_HOST`, server HDMI signal present, keyboard and pointer
-owners both on `SERVER_HOST`, and idle capture. During a TV-control outage,
-input falls back immediately while display recovery remains explicitly
-`fallback_deferred`; it is never reported as completed from command intent.
-```
-
-### Reliability Design
-
-#### 0. lan-mouse Integration Contract
-
-The TV switch daemon cannot enforce the protocol by itself. The lan-mouse side
-must provide a request-correlated commit gate:
-
-1. Pointer crosses the screen edge.
-2. lan-mouse pauses remote capture and sends no keyboard, pointer-motion,
-   pointer-button, or scroll events to the target yet.
-3. lan-mouse creates one `/enter/{target}` request and stores its request ID,
-   epoch, and deadline. `409 busy` never means allow.
-4. If the request is waking, lan-mouse keeps both input paths local and polls
-   that request ID. The daemon cannot switch input later without client commit.
-5. Before the TV command, the lan-mouse hub reserves keyboard and pointer
-   capacity as one expiring bundle lease. Partial reservation is failure.
-6. The daemon issues `set_input`, receives its correlated acknowledgement,
-   then obtains a fresh active-input and signal observation tagged with the
-   current switch epoch.
-7. The daemon returns an expiring grant containing request epoch and lease ID.
-   lan-mouse revalidates both, atomically commits keyboard+pointer, and reports
-   commit. A stale or late grant is rejected.
-8. Any other result (`waking`, `multiview`, `not_ready`, `busy`, 4xx/5xx,
-   timeout, hook crash, lease loss) keeps keyboard and mouse on `SERVER_HOST`.
-
-This is a hard contract. An asynchronous best-effort `enter_hook` that starts
-after capture has already begun, or a daemon-side auto-retry with no matching
-client request, does not satisfy C10.
-
-Input ownership is atomic: keyboard, pointer motion, pointer buttons, and
-scroll events are switched together. The design must never allow a state where
-keyboard is sent to a remote host while the pointer remains on the server host,
-or where the pointer is captured remotely while keyboard remains local.
-The formal model therefore keeps `keyboard_owner` and `pointer_owner` separate
-and checks equality as an invariant instead of assuming one owner variable.
-
-#### 1. SSAP Lifecycle (persistent wss://)
-
-The daemon holds one persistent WebSocket connection to the TV.
-This eliminates the subprocess-spawn overhead of running a Python command per
-operation (previously `bscpylgtvcommand` every 5s). Earlier local observation
-showed about 28% CPU in that polling path; the implementation artifact must
-record the exact measurement command and workload before treating that number
-as a benchmark.
-
-**Connect flow:**
-1. TCP + TLS handshake to `wss://TV_IP:3001/` (TV self-signed cert, trusted).
-2. SSAP register: send client-key (from `~/.config/lg-buddy/.aiopylgtv.sqlite`).
-   On first ever connect, TV shows pairing prompt; subsequent connects use
-   the persisted client-key with no prompt.
-3. Subscribe to `multiViewStatus` push updates.
-4. Query signal status (`getExternalInputList` or equivalent) to resolve
-   any stale state from while disconnected.
-5. daemon_healthy = TRUE only after all of the above succeed.
-
-**Keepalive:** WebSocket-level ping/pong (tokio-tungstenite built-in).
-No separate heartbeat command is needed. The miss threshold and interval are
-configuration derived from measured healthy latency and the required fallback
-detection budget; three missed pongs is only an initial candidate.
-
-**Reconnect:** Exponential backoff (1s → 2s → 4s → ... → 60s cap).
-Transient connection failures retry indefinitely at the bounded backoff.
-`RECONNECT_CAP` is an observability alert threshold, not a process-exit gate.
-Only fatal local configuration, invalid credentials, or an unrecoverable
-protocol incompatibility exits for systemd restart. The counter resets only
-after registration, subscription, and initial state synchronization succeed.
-
-#### 2. Enter Hook Logic
-
-```
-POST /enter/{target}:                                 [both owners on SERVER_HOST]
-  1. daemon_healthy=false or fallback unresolved -> 503 unavailable
-  2. another request/command exists -> 409 busy + active request_id
-  3. mode=multiview -> use the multiView bundle-commit path; no TV input change
-  4. mode=fullscreen:
-     a. target offline:
-        -> allocate request_id/request_epoch, send WoL, state=waking
-        -> return 202 pending; lan-mouse polls this same request_id
-        -> timeout/cancel clears request; both owners remain SERVER_HOST
-     b. target online but either path unavailable:
-        -> 409 not_ready; no request, TV command, or ownership change
-     c. both paths available:
-        i.   reserve keyboard+pointer as one lease for request_epoch
-        ii.  always issue set_input(target) with switch_epoch
-        iii. await the correlated SSAP acknowledgement
-        iv.  obtain a fresh active-input and signal observation for switch_epoch
-        v.   revalidate the lease and issue an expiring grant
-        vi.  lan-mouse validates request_epoch + lease, atomically commits both
-             owners, and POSTs /enter/request/{id}/commit
-
-  Any command error, negative/freshness-mismatched observation, lease loss,
-  grant expiry, client timeout, or commit failure:
-        -> release both owners to SERVER_HOST immediately
-        -> enter the verified SERVER_HOST fallback transaction
-        -> do not report recovery until active input + signal are freshly seen
-```
-
-The key change from the previous design (C6): step 4 no longer checks
-`tv_input == target`. It always issues `set_input()`. `commanded_input` records
-intent; `tv_input` and `input_signal` are observations. Only observations tagged
-with the current `switch_epoch`, plus a valid input bundle lease, can authorize
-a grant.
-
-The second key change (C10): `SwitchComplete` issues a fenced grant but does not
-change ownership. `LanMouseCommitGrant` is the only remote ownership transition,
-and it changes `keyboard_owner` and `pointer_owner` together after validating
-the request epoch, grant epoch, and held bundle reservation. This closes the
-daemon-response delay race and makes split ownership representable in the
-model.
-
-The third key change (C11): if the target host is offline, the daemon sends
-Wake-on-LAN and preserves the original request ID/epoch. lan-mouse polls that
-request while keeping both owners local. Readiness advances the same request;
-the daemon cannot perform an uncorrelated auto-switch after returning `202`.
-Wake timeout or cancellation invalidates the request and every later response.
-
-#### 3. Failure Recovery Paths
-
-All failures converge to the same recovery state:
-freshly observed fullscreen `tv_input = SERVER_HOST`, server signal present,
-`input_owner = keyboard_owner = pointer_owner = SERVER_HOST`,
-`cursor = SERVER_HOST`, `capture = "idle"`, `pending_switch = none`, and
-`fallback_required = false`. Command intent alone never satisfies recovery.
-
-| Failure | Detection | Recovery Time | Transition |
-|---|---|---|---|
-| `set_input()` SSAP error | Correlated response | Input local immediately; display by fallback deadline | SwitchFailed → fallback command/verify |
-| Target active-input mismatch or no HDMI signal | Fresh epoch-tagged query | Input remains local; display by fallback deadline | SwitchTimeout → fallback command/verify |
-| Signal drops after stable connection | Single-flight periodic observation | Input local when detected; display by fallback deadline | SignalLossRevert → fallback command/verify |
-| Remote host input readiness missing before enter | lan-mouse hub readiness report | immediate | RemoteInputNotReadyReject |
-| Bundle reservation or readiness lost while pending/owned | Named-host hub update | input immediate | RemoteInputReadinessUpdate → verified fallback |
-| Grant is stale, expires, or is not committed | Request/lease epoch and deadline | input remains local | GrantTimeout → verified fallback |
-| Wake attempt never completes | Configured wake deadline | input remains local | WakeTimeout invalidates request epoch |
-| Remote host spoke disconnects | lan-mouse hub event | input immediate | RemoteHostOffline → active/deferred fallback |
-| Unexpected subscription callback | Target/phase mismatch | input immediate | SubscriptionFires → verified fallback |
-| WebSocket disconnects | Configured keepalive budget | input immediate; display after reconnect | SSAPDisconnect → fallback_deferred → resume |
-| TV reboot | disconnect/reconnect lifecycle | input immediate; display after verified resync | reconnect → subscribe → fallback command/verify |
-
-If TV control or the physical `SERVER_HOST` HDMI signal remains unavailable,
-the system stays degraded with input local and retries display recovery. It
-must not fabricate a successful fallback state that the user cannot see.
-
-#### 4. Signal Status Tracking
-
-The daemon periodically queries the TV for per-input signal presence
-(via SSAP `getExternalInputList` or equivalent endpoint). Each response is a
-time-bounded observation, not permanent truth. `commanded_input`, observed
-`tv_input`, observed `input_signal`, and `switch_epoch` are separate. A switch
-can complete only from an observation produced for its current epoch.
-
-Query immediately after every command acknowledgement, after reconnect, and
-after every fallback command. While a remote host owns input, run one
-single-flight poll on a monotonic schedule. The initial 10-second interval is
-a candidate to validate against measured TV load and the required detection
-budget. A bad poll arms recovery only when no deadline is active; repeated bad
-polls cannot postpone fallback. A good poll cancels an armed loss deadline.
-No steady poll is required on a freshly verified `SERVER_HOST` baseline.
-
-#### 5. Remote Host Health and Input Readiness Tracking
-
-The daemon monitors lan-mouse spoke connectivity to determine whether
-remote hosts are online. If a spoke disconnects while that host's input
-is selected, the daemon reverts to SERVER_HOST.
-
-Connectivity is not sufficient for control. Each remote host must also report
-that both input paths are ready:
-
-- keyboard injection/receive path
-- pointer motion/button/scroll injection/receive path
-
-`RemoteReadyForControl(host)` is true only when the spoke is online and both
-input capabilities are available. A host that is online but lacks pointer
-capacity, keyboard capacity, or permission for either path is not eligible for
-reservation. Before switching the TV, the hub atomically converts readiness
-into one expiring keyboard+pointer lease. Capacity cannot be consumed by a
-different request while that lease is held. Permission loss, spoke loss, or
-lease invalidation releases both owners and starts fallback.
-After commit, the reservation becomes the active session lease and is renewed
-by the same spoke-health channel; renewal expiry is handled as readiness loss.
-
-Readiness updates are per-host `EXCEPT` updates. A Windows readiness event
-cannot alter macOS readiness. `keyboard_owner` and `pointer_owner` remain
-separate modeled fields and must be equal in every externally visible state.
-An input-capture or emulation error such as `no capacity available` is a bundle
-reservation failure: log both capability states, deny/revoke the grant, and
-keep or return both owners to `SERVER_HOST`.
-
-This covers:
-- macOS powered off after being selected.
-- Windows crash/reboot while selected.
-- Network loss to the remote host.
-
-#### 6. Observability
-
-**Operational log availability invariant:** every host participating in the
-switch path must expose a persistent, known log source before the design can be
-considered debuggable. Runtime state seen over SSH is not enough; failure
-analysis must be able to reconstruct the previous switch attempt after the
-fact.
-
-- Current Linux SERVER_HOST lan-mouse:
-  `journalctl --user -u lan-mouse.service`.
-- Current Linux SERVER_HOST tv-multiview:
-  `journalctl --user -u tv-multiview.service`.
-- macOS lan-mouse: `~/Library/Logs/lan-mouse.log` and
-  `~/Library/Logs/lan-mouse.err.log`.
-- Windows lan-mouse: the scheduled task must redirect stdout and stderr to
-  fixed files under `%LOCALAPPDATA%\lan-mouse\`, for example
-  `%LOCALAPPDATA%\lan-mouse\lan-mouse.log` and
-  `%LOCALAPPDATA%\lan-mouse\lan-mouse.err.log`. The deploy must not rely on
-  transient console output or an unverified Event Log source.
-
-**Structured JSON logging (stdout, one object per line):**
-```json
-{"ts":"...","event":"ssap_connecting","tv_ip":"192.0.2.20"}
-{"ts":"...","event":"ssap_registered","client_key_present":true}
-{"ts":"...","event":"subscribed","topic":"multiViewStatus"}
-{"ts":"...","event":"enter","request_id":"...","request_epoch":41,"target":"mac","phase":"command_pending","commanded_input":"mac"}
-{"ts":"...","event":"switch_observed","request_epoch":41,"switch_epoch":87,"observed_input":"mac","signal":true,"observation_age_ms":0}
-{"ts":"...","event":"grant_issued","request_epoch":41,"grant_epoch":41,"lease_id":"...","target":"mac"}
-{"ts":"...","event":"input_commit","request_epoch":41,"keyboard_owner":"mac","pointer_owner":"mac"}
-{"ts":"...","event":"switch_timeout","request_epoch":41,"switch_epoch":87,"target":"mac","phase":"fallback_command_pending","action":"revert_to_server_host","server_host":"linux"}
-{"ts":"...","event":"switch_failed","target":"windows","error":"timeout","action":"revert_to_server_host","server_host":"linux"}
-{"ts":"...","event":"signal_loss","input":"mac","action":"revert_to_server_host","server_host":"linux"}
-{"ts":"...","event":"remote_offline","host":"mac","action":"revert_to_server_host","server_host":"linux"}
-{"ts":"...","event":"ssap_disconnect","reason":"ping_timeout"}
-```
-
-Every transition log includes request/switch epoch where applicable, previous
-and next phase, commanded and observed input, keyboard and pointer owners,
-reservation/grant identity, observation age, command latency, and fallback
-reason. The logging sink is bounded and non-blocking; rotation or a stalled
-file sink must not block the SSAP actor or input-release path.
-
-**`/status` response:**
-```json
-{
-  "mode": "fullscreen",
-  "observed_input": "linux",
-  "commanded_input": "linux",
-  "healthy": true,
-  "ready": true,
-  "ws_state": "connected",
-  "subscribe_active": true,
-  "protocol_phase": "idle",
-  "request_id": null,
-  "request_epoch": 41,
-  "switch_epoch": 88,
-  "verified_epoch": 88,
-  "pending_switch": null,
-  "switch_timer": 0,
-  "fallback_required": false,
-  "keyboard_owner": "linux",
-  "pointer_owner": "linux",
-  "reservation_target": null,
-  "grant_epoch": null,
-  "input_signal": {"linux": true, "mac": false, "windows": true},
-  "remote_online": {"mac": false, "windows": true},
-  "uptime_seconds": 3600,
-  "reconnect_total": 0,
-  "switch_count": {"linux": 12, "mac": 8, "windows": 5},
-  "last_error": null
-}
-```
-
-#### 7. systemd Integration
-
-```
-[Service]
-ExecStart=/home/example/.local/bin/tv-multiview
-Restart=on-failure
-RestartSec=5
-StartLimitIntervalSec=60
-StartLimitBurst=10
-```
-
-Signal handling: SIGTERM → graceful WebSocket close → shutdown.
-SIGUSR1 → dump full state to stderr (debugging).
-
-Transient TV/network failures are handled inside the daemon and do not cause
-process exit. `Restart=on-failure` is reserved for fatal local errors or an
-unexpected crash. Persistent logs require rotation on every platform.
-
-#### 8. Performance and Deadlock Constraints
-
-- One SSAP actor owns the socket and serializes commands. The queue is bounded;
-  duplicate signal polls are coalesced and a fallback command has priority over
-  ordinary mode requests.
-- HTTP handlers and subscription processing never hold a state mutex while
-  awaiting SSAP, lan-mouse, file I/O, or timers. State changes use short critical
-  sections or actor messages, excluding the lock/response circular wait.
-- There is at most one signal query in flight. Poll scheduling and transaction
-  deadlines use monotonic time; a callback cannot extend a deadline unless it
-  starts a new epoch.
-- A pending enter request owns one bundle lease and one TV command slot. New
-  requests receive `409 busy`; they do not allocate unbounded tasks or queue
-  duplicate TV commands.
-- Wake/request polling is implemented by native lan-mouse integration or one
-  bounded helper lifecycle. It must not spawn a new `curl` process on every
-  poll tick; process-spawn cost and cancellation are measured separately.
-- The 5-second switch, 60-second wake, 10-second poll, ping-miss, and reconnect
-  values are initial candidates, not correctness constants. Production values
-  require recorded p50/p95/p99 command, observation, wake, and disconnect data
-  plus a documented safety margin.
-- Persistent WebSocket latency numbers describe transport/request overhead only;
-  end-to-end switch latency also includes TV settle, fresh observation, lease
-  validation, and lan-mouse commit. No `<5ms` end-to-end claim is permitted
-  without measurement.
-
-## Architecture Decision Records
-
-### ADR-001: Separate daemon
-
-**Decision:** Run tv-multiview as a standalone HTTP daemon alongside lan-mouse.
-
-**Rationale:**
-- lan-mouse starts the request synchronously, then polls the same request ID
-  while capture remains paused; a daemon-side delayed switch is never implicit
-- TV subscription needs persistent WebSocket — lan-mouse is event-driven
-- HTTP API is universal: any OS, any enter_hook
-- Separate crash domain: daemon death doesn't crash lan-mouse
-
-### ADR-002: Shared LG_Buddy key file
-
-**Decision:** Read client-key from `~/.config/lg-buddy/.aiopylgtv.sqlite`
-(same file LG_Buddy uses). One TV pairing, one key file.
-
-**Rationale:**
-- LG_Buddy and our daemon speak the same SSAP protocol to the same TV
-- The client-key from the initial pairing prompt is stored in sqlite
-- Sharing the key file means the user pairs once, both tools work
-
-### ADR-003: MultiView toggle is standalone, not cursor-driven
-
-**Decision:** `/multiview/on` and `/multiview/off` are independent HTTP endpoints —
-NOT embedded in `enter_hook` parameters.
-
-**Rationale:**
-- `splitscreenEnable` only toggles mode on/off — cannot select which inputs
-  go into multiView
-- The user pre-configures the desired layout and input pair once via remote
-- Cursor movement should switch inputs in fullscreen, not trigger multiView
-
-### ADR-004: Persistent wss:// (no subprocess-per-command)
-
-**Decision:** The daemon holds one long-lived WebSocket connection to the TV.
-All SSAP commands flow over this connection. No Python subprocess, no
-per-command TLS handshake.
-
-**Rationale:**
-- Eliminates Python subprocess startup from the heartbeat path (previously
-  `bscpylgtvcommand` every 5s). The earlier ~28% CPU observation must be
-  tied to a recorded measurement command/workload before it is used as a
-  benchmark.
-- Removes repeated process/TLS/register overhead. Transport/request latency and
-  end-to-end switch latency are measured separately; no fixed `<5ms` claim is
-  accepted without a recorded workload and percentile data.
-- Connection health is immediate (socket error on next write) vs.
-  discovered via 5s heartbeat
-- Subscriptions (push updates from TV) require a persistent connection
-  anyway — can't subscribe over a one-shot subprocess
-
-### ADR-005: Approach 1 — always switch, never skip on stale state
-
-**Decision:** `/enter/{target}` always issues `set_input(target)`.
-There is no "already on target" no-op guard. `commanded_input` records intent;
-`tv_input` is the latest TV observation. Neither cached field can complete a
-request without a current `switch_epoch` observation.
-
-**Rationale:**
-- observed `tv_input` can become stale (user pressed remote, TV rebooted,
-  previous switch silently failed)
-- `set_input()` is idempotent — sending the same HDMI port when already
-  on it is harmless
-- Simpler state machine: one less invariant to maintain
-- Eliminates the bug where the daemon thinks it's on macOS but the display
-  shows something else
-
-### ADR-006: Always-availability — revert to lan-mouse server host on any failure
-
-**Decision:** If a remote host is selected but becomes unusable, the daemon
-automatically reverts display and input ownership to the host running the
-lan-mouse hub/server. In the current deployment `SERVER_HOST = "linux"`, but
-the invariant is `ServerHostAlwaysAvailable`, not Linux-specific.
-
-**Rationale:**
-- The user's desktop must always have a usable display
-- If macOS shows "No Signal" or is powered off, the user is stuck
-  (can't move cursor back because screen edge is unreachable)
-- Detect via: SSAP signal query (no HDMI signal), lan-mouse spoke
-  disconnect (host offline), SSAP command failure (set_input error)
-- All failure paths first release keyboard and pointer to the server host, then
-  converge through one fallback command/ack/observation transaction
-- Recovery is complete only after fullscreen server input and server HDMI signal
-  are freshly observed; unavailable TV control remains `fallback_deferred`
-
-### ADR-007: SSAP + daemon unified in one TLA+ spec
-
-**Decision:** The TLA+ spec models both the SSAP client lifecycle
-(`ws_state`, `subscribe_active`) and the daemon state machine
-(`tv_mode`, observed `tv_input`, `protocol`, owners, reservation, grant,
-`cursor`, `capture`) in one module.
-
-**Rationale:**
-- The daemon's state machine depends on SSAP events (disconnect → deferred
-  fallback, registration/subscription → healthy, callback → expected event or
-  manual override)
-- The `HealthDefinition` invariant ties them together: daemon_healthy
-  iff connected AND subscribed
-- Modeling them separately would miss race conditions between SSAP
-  events and daemon state transitions
-- In code, they are separated by a module boundary (`src/ssap/`) within
-  a single Rust crate, not a crate boundary — so the unified spec
-  matches the implementation structure
-
-### ADR-008: Fenced request, bundle reservation, and client commit
-
-**Decision:** Every enter attempt has a request epoch. The lan-mouse hub reserves
-keyboard and pointer capacity as one lease before any TV command. After a fresh
-switch-epoch observation, the daemon issues an expiring grant; lan-mouse validates
-the request, grant, and lease epochs and commits both owners atomically.
-
-**Rationale:**
-- A readiness snapshot does not reserve capacity and is vulnerable to TOCTOU
-- An HTTP response can be delayed past timeout, cancellation, or remote failure
-- Separate keyboard/pointer owners let the model detect the observed split-input
-  failure instead of assuming it away
-- A stale grant is harmless because its epoch or lease cannot commit
-
-### ADR-009: One SSAP actor with bounded work
-
-**Decision:** One actor exclusively owns the WebSocket and a bounded command
-queue. It correlates IDs, coalesces duplicate polls, and prioritizes fallback.
-No state lock is held across asynchronous I/O.
-
-**Rationale:**
-- Multiple HTTP handlers must not interleave writes or consume each other's replies
-- Holding shared state while waiting for the reader task creates a lock/response
-  circular wait
-- Bounded single-flight polling prevents task growth and timer starvation
-
-### ADR-010: Retry transient failures; never fabricate availability
-
-**Decision:** Transient SSAP failures retry indefinitely with bounded backoff.
-The reconnect threshold raises an alert but does not exit. Fatal local
-configuration/authentication errors may exit. Server fallback retries until a
-fresh server-input and HDMI-signal observation succeeds.
-
-**Rationale:**
-- Restarting after a transient retry count resets backoff without improving reachability
-- A command acknowledgement proves acceptance, not visible display state
-- Keeping input local with `fallback_required=true` is honest degraded service;
-  declaring an unverified server display would violate the availability contract
