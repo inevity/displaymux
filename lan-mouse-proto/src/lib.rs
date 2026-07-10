@@ -70,8 +70,16 @@ pub enum ProtoEvent {
     /// `commit` is the 8-byte ASCII short commit hash from
     /// `shadow_rs`'s `SHORT_COMMIT`. Old peers that don't
     /// recognize the event type silently skip it per the
-    /// forward-compat handling in the receive loop.
+    /// unknown-event handling in the receive loop.
     Hello { commit: [u8; 8] },
+    /// Atomic input-path readiness for this process instance.
+    /// A peer is controllable only when both capability bits are true and the
+    /// session epoch still matches the lease reserved by the sender.
+    Readiness {
+        keyboard_ready: bool,
+        pointer_ready: bool,
+        session_epoch: u64,
+    },
 }
 
 impl Display for ProtoEvent {
@@ -93,6 +101,14 @@ impl Display for ProtoEvent {
                 let s = std::str::from_utf8(commit).unwrap_or("????????");
                 write!(f, "Hello({s})")
             }
+            ProtoEvent::Readiness {
+                keyboard_ready,
+                pointer_ready,
+                session_epoch,
+            } => write!(
+                f,
+                "Readiness(keyboard={keyboard_ready}, pointer={pointer_ready}, session={session_epoch})"
+            ),
         }
     }
 }
@@ -112,6 +128,7 @@ pub enum EventType {
     Leave,
     Ack,
     Hello,
+    Readiness,
 }
 
 impl ProtoEvent {
@@ -135,6 +152,7 @@ impl ProtoEvent {
             ProtoEvent::Leave(_) => EventType::Leave,
             ProtoEvent::Ack(_) => EventType::Ack,
             ProtoEvent::Hello { .. } => EventType::Hello,
+            ProtoEvent::Readiness { .. } => EventType::Readiness,
         }
     }
 }
@@ -196,6 +214,11 @@ impl TryFrom<[u8; MAX_EVENT_SIZE]> for ProtoEvent {
                 }
                 Ok(Self::Hello { commit })
             }
+            EventType::Readiness => Ok(Self::Readiness {
+                keyboard_ready: decode_u8(&mut buf)? != 0,
+                pointer_ready: decode_u8(&mut buf)? != 0,
+                session_epoch: decode_u64(&mut buf)?,
+            }),
         }
     }
 }
@@ -265,6 +288,15 @@ impl From<ProtoEvent> for ([u8; MAX_EVENT_SIZE], usize) {
                         encode_u8(buf, len, *b);
                     }
                 }
+                ProtoEvent::Readiness {
+                    keyboard_ready,
+                    pointer_ready,
+                    session_epoch,
+                } => {
+                    encode_u8(buf, len, keyboard_ready as u8);
+                    encode_u8(buf, len, pointer_ready as u8);
+                    encode_u64(buf, len, session_epoch);
+                }
             }
         }
         (buf, len)
@@ -285,6 +317,7 @@ macro_rules! decode_impl {
 
 decode_impl!(u8);
 decode_impl!(u32);
+decode_impl!(u64);
 decode_impl!(i32);
 decode_impl!(f64);
 
@@ -305,5 +338,46 @@ macro_rules! encode_impl {
 
 encode_impl!(u8);
 encode_impl!(u32);
+encode_impl!(u64);
 encode_impl!(i32);
 encode_impl!(f64);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn readiness_round_trips_both_capabilities_and_session_epoch() {
+        let event = ProtoEvent::Readiness {
+            keyboard_ready: true,
+            pointer_ready: false,
+            session_epoch: 0x0102_0304_0506_0708,
+        };
+        let (encoded, length): ([u8; MAX_EVENT_SIZE], usize) = event.into();
+        assert_eq!(encoded[0], EventType::Readiness as u8);
+        assert_eq!(length, 11);
+        match ProtoEvent::try_from(encoded).unwrap() {
+            ProtoEvent::Readiness {
+                keyboard_ready,
+                pointer_ready,
+                session_epoch,
+            } => {
+                assert!(keyboard_ready);
+                assert!(!pointer_ready);
+                assert_eq!(session_epoch, 0x0102_0304_0506_0708);
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn readiness_appends_without_renumbering_existing_events() {
+        assert_eq!(EventType::Ping as u8, 6);
+        assert_eq!(EventType::Pong as u8, 7);
+        assert_eq!(EventType::Enter as u8, 8);
+        assert_eq!(EventType::Leave as u8, 9);
+        assert_eq!(EventType::Ack as u8, 10);
+        assert_eq!(EventType::Hello as u8, 11);
+        assert_eq!(EventType::Readiness as u8, 12);
+    }
+}
