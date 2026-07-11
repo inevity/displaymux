@@ -481,23 +481,44 @@ pub fn apply(
             }
         }
         Event::Cancel { request_id, reason } => {
-            let request = next
-                .active_request
-                .as_ref()
-                .ok_or(ProtocolError::RequestNotFound)?;
-            if request.request_id != request_id {
-                return Err(ProtocolError::RequestNotFound);
+            if next.last_request.as_ref().is_some_and(|request| {
+                request.request_id == request_id && request.status == RequestStatus::Cancelled
+            }) {
+                return validated(next, effects, now_ms);
             }
-            let tv_may_have_changed = request.switch_epoch.is_some();
-            let mut request = next.active_request.take().expect("checked request");
-            request.status = RequestStatus::Cancelled;
-            request.reason = Some(reason.clone());
-            next.last_request = Some(request);
-            if tv_may_have_changed {
+            if next
+                .active_session
+                .as_ref()
+                .is_some_and(|session| session.request_id == request_id)
+            {
+                let mut request = next
+                    .last_request
+                    .take()
+                    .filter(|request| request.request_id == request_id)
+                    .ok_or(ProtocolError::RequestNotFound)?;
+                request.status = RequestStatus::Cancelled;
+                request.reason = Some(reason.clone());
+                next.last_request = Some(request);
                 begin_fallback(&mut next, &mut effects, now_ms, timing, &reason);
             } else {
-                next.phase = ProtocolPhase::Idle;
-                next.phase_deadline_ms = None;
+                let request = next
+                    .active_request
+                    .as_ref()
+                    .ok_or(ProtocolError::RequestNotFound)?;
+                if request.request_id != request_id {
+                    return Err(ProtocolError::RequestNotFound);
+                }
+                let tv_may_have_changed = request.switch_epoch.is_some();
+                let mut request = next.active_request.take().expect("checked request");
+                request.status = RequestStatus::Cancelled;
+                request.reason = Some(reason.clone());
+                next.last_request = Some(request);
+                if tv_may_have_changed {
+                    begin_fallback(&mut next, &mut effects, now_ms, timing, &reason);
+                } else {
+                    next.phase = ProtocolPhase::Idle;
+                    next.phase_deadline_ms = None;
+                }
             }
         }
         Event::Renew {
@@ -1112,6 +1133,80 @@ mod tests {
         assert_eq!(committed.pointer_owner, Host::Mac);
         assert_eq!(committed.phase, ProtocolPhase::RemoteOwned);
         committed.validate(30).unwrap();
+    }
+
+    #[test]
+    fn cancelling_committed_session_releases_input_and_is_idempotent() {
+        let state = ready_peer(&synchronized(), Host::Mac, 11);
+        let transition = create_mac(&state).unwrap();
+        let epoch = transition.next.switch_epoch;
+        let granted = apply(
+            &transition.next,
+            Event::Observation {
+                switch_epoch: epoch,
+                mode: TvMode::Fullscreen,
+                input: Some(Host::Mac),
+                signals: signals(Host::Mac),
+            },
+            20,
+            TIMING,
+        )
+        .unwrap()
+        .next;
+        let request = granted.active_request.as_ref().unwrap();
+        let committed = apply(
+            &granted,
+            Event::Commit {
+                request_id: request.request_id.clone(),
+                request_epoch: request.request_epoch,
+                grant_epoch: request.grant.as_ref().unwrap().grant_epoch,
+                lease_id: request.lease.lease_id.clone(),
+                lease_epoch: request.lease.lease_epoch,
+            },
+            30,
+            TIMING,
+        )
+        .unwrap()
+        .next;
+
+        let cancelled = apply(
+            &committed,
+            Event::Cancel {
+                request_id: "request-1".to_string(),
+                reason: "capture_released".to_string(),
+            },
+            31,
+            TIMING,
+        )
+        .unwrap();
+        assert_eq!(cancelled.next.keyboard_owner, Host::Linux);
+        assert_eq!(cancelled.next.pointer_owner, Host::Linux);
+        assert!(cancelled.next.active_session.is_none());
+        assert_eq!(
+            cancelled.next.last_request.as_ref().unwrap().status,
+            RequestStatus::Cancelled
+        );
+        assert!(matches!(
+            cancelled.effects.as_slice(),
+            [Effect::SetInput {
+                target: Host::Linux,
+                fallback: true,
+                ..
+            }]
+        ));
+
+        let repeated = apply(
+            &cancelled.next,
+            Event::Cancel {
+                request_id: "request-1".to_string(),
+                reason: "capture_released".to_string(),
+            },
+            32,
+            TIMING,
+        )
+        .unwrap();
+        assert!(repeated.effects.is_empty());
+        assert_eq!(repeated.next, cancelled.next);
     }
 
     #[test]
