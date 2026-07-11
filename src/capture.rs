@@ -336,6 +336,11 @@ impl CaptureTask {
                                 .send(ICaptureEvent::PeerReadiness(handle))
                                 .expect("channel closed");
                         }
+                        ProtoEvent::Hello { .. } => {
+                            self.event_tx
+                                .send(ICaptureEvent::PeerReadiness(handle))
+                                .expect("channel closed");
+                        }
                         ProtoEvent::ReleaseRequest { release_epoch } => {
                             log::info!(
                                 "releasing capture for peer request epoch {release_epoch}"

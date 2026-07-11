@@ -9,7 +9,11 @@ use slab::Slab;
 
 use lan_mouse_ipc::{ClientConfig, ClientHandle, ClientState, Position};
 
-use crate::config::ConfigClient;
+use crate::config::{ConfigClient, local_commit};
+
+fn peer_protocol_compatible(state: &ClientState) -> bool {
+    state.peer_commit == Some(local_commit())
+}
 
 #[derive(Clone, Default)]
 pub struct ClientManager {
@@ -284,10 +288,16 @@ impl ClientManager {
         }
     }
 
-    pub(crate) fn set_peer_commit(&self, handle: ClientHandle, commit: Option<[u8; 8]>) {
-        if let Some((_, s)) = self.clients.borrow_mut().get_mut(handle as usize) {
-            s.peer_commit = commit;
+    pub(crate) fn set_peer_commit(&self, handle: ClientHandle, commit: Option<[u8; 8]>) -> bool {
+        let mut clients = self.clients.borrow_mut();
+        let Some((_, state)) = clients.get_mut(handle as usize) else {
+            return false;
+        };
+        if state.peer_commit == commit {
+            return false;
         }
+        state.peer_commit = commit;
+        true
     }
 
     pub(crate) fn set_peer_readiness(
@@ -330,7 +340,10 @@ impl ClientManager {
             .get(handle as usize)
             .map(|(_, state)| {
                 (
-                    state.alive && state.keyboard_ready && state.pointer_ready,
+                    state.alive
+                        && peer_protocol_compatible(state)
+                        && state.keyboard_ready
+                        && state.pointer_ready,
                     state.peer_session_epoch,
                 )
             })
@@ -344,13 +357,21 @@ impl ClientManager {
             .borrow()
             .get(handle as usize)
             .map(|(_, state)| {
+                let compatible = peer_protocol_compatible(state);
                 (
                     state.alive,
-                    state.keyboard_ready,
-                    state.pointer_ready,
+                    compatible && state.keyboard_ready,
+                    compatible && state.pointer_ready,
                     state.peer_session_epoch,
                 )
             })
+    }
+
+    pub(crate) fn peer_protocol_compatible(&self, handle: ClientHandle) -> bool {
+        self.clients
+            .borrow()
+            .get(handle as usize)
+            .is_some_and(|(_, state)| peer_protocol_compatible(state))
     }
 
     pub(crate) fn active_addr(&self, handle: ClientHandle) -> Option<SocketAddr> {
@@ -391,6 +412,7 @@ mod tests {
     fn bundle_readiness_requires_connection_and_both_capabilities() {
         let clients = ClientManager::default();
         let handle = clients.add_client();
+        clients.set_peer_commit(handle, Some(local_commit()));
 
         assert_eq!(clients.peer_bundle_ready(handle), Some((false, 0)));
 
@@ -406,6 +428,7 @@ mod tests {
     fn stale_readiness_cannot_revive_newer_session() {
         let clients = ClientManager::default();
         let handle = clients.add_client();
+        clients.set_peer_commit(handle, Some(local_commit()));
         clients.set_alive(handle, true);
 
         assert!(clients.set_peer_readiness(handle, false, false, 12));
@@ -417,6 +440,7 @@ mod tests {
     fn disconnect_reset_accepts_new_process_epoch() {
         let clients = ClientManager::default();
         let handle = clients.add_client();
+        clients.set_peer_commit(handle, Some(local_commit()));
         clients.set_alive(handle, true);
         assert!(clients.set_peer_readiness(handle, true, true, 100));
 
@@ -432,9 +456,35 @@ mod tests {
     fn zero_epoch_can_never_report_ready() {
         let clients = ClientManager::default();
         let handle = clients.add_client();
+        clients.set_peer_commit(handle, Some(local_commit()));
         clients.set_alive(handle, true);
 
         assert!(!clients.set_peer_readiness(handle, true, true, 0));
         assert_eq!(clients.peer_bundle_ready(handle), Some((false, 0)));
+    }
+
+    #[test]
+    fn unknown_or_mismatched_commit_masks_control_readiness() {
+        let clients = ClientManager::default();
+        let handle = clients.add_client();
+        clients.set_alive(handle, true);
+        assert!(clients.set_peer_readiness(handle, true, true, 10));
+
+        assert_eq!(
+            clients.peer_input_readiness(handle),
+            Some((true, false, false, 10))
+        );
+
+        let mut mismatch = local_commit();
+        mismatch[0] ^= 0xff;
+        assert!(clients.set_peer_commit(handle, Some(mismatch)));
+        assert_eq!(clients.peer_bundle_ready(handle), Some((false, 10)));
+
+        assert!(clients.set_peer_commit(handle, Some(local_commit())));
+        assert_eq!(clients.peer_bundle_ready(handle), Some((true, 10)));
+        assert_eq!(
+            clients.peer_input_readiness(handle),
+            Some((true, true, true, 10))
+        );
     }
 }

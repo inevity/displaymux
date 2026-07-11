@@ -287,7 +287,10 @@ async fn receive_loop(
                         ping_response.borrow_mut().insert(addr);
                     }
                     ProtoEvent::Hello { commit } => {
-                        client_manager.set_peer_commit(handle, Some(commit));
+                        if client_manager.set_peer_commit(handle, Some(commit)) {
+                            tx.send((handle, ProtoEvent::Hello { commit }))
+                                .expect("channel closed");
+                        }
                     }
                     ProtoEvent::Readiness {
                         keyboard_ready,

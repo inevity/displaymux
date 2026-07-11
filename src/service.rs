@@ -441,8 +441,15 @@ impl Service {
                 // only setup) — there's nowhere to display the version
                 // in that case anyway.
                 if let Some(handle) = self.client_manager.get_client(addr) {
-                    self.client_manager.set_peer_commit(handle, Some(commit));
-                    self.broadcast_client(handle);
+                    if self.client_manager.set_peer_commit(handle, Some(commit)) {
+                        if !self.client_manager.peer_protocol_compatible(handle) {
+                            log::warn!(
+                                "peer {addr} build does not match; input bundle remains local"
+                            );
+                        }
+                        self.broadcast_client(handle);
+                        self.handle_peer_readiness_change(handle);
+                    }
                 }
             }
             EmulationEvent::PeerReadiness {
