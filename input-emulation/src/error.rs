@@ -33,6 +33,9 @@ pub enum EmulationError {
     Ashpd(#[from] ashpd::Error),
     #[error("io error: `{0}`")]
     Io(#[from] io::Error),
+    #[cfg(windows)]
+    #[error("Windows SendInput submitted no event: `{0}`")]
+    WindowsSendInput(io::Error),
 }
 
 #[derive(Debug, Error)]

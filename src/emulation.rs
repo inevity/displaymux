@@ -495,6 +495,9 @@ impl EmulationTask {
     ) -> Result<(), InputEmulationError> {
         loop {
             tokio::select! {
+                error = std::future::poll_fn(|cx| emulation.poll_error(cx)) => {
+                    return Err(error.into());
+                }
                 e = self.request_rx.recv() => match e.expect("channel closed") {
                     ProxyRequest::Input(event, addr) => {
                         let handle = match self.handles.get(&addr) {

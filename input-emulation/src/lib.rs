@@ -2,6 +2,7 @@ use async_trait::async_trait;
 use std::{
     collections::{HashMap, HashSet},
     fmt::Display,
+    task::{Context, Poll},
 };
 
 use input_event::{Event, KeyboardEvent};
@@ -153,6 +154,10 @@ impl InputEmulation {
         }
     }
 
+    pub fn poll_error(&mut self, cx: &mut Context<'_>) -> Poll<EmulationError> {
+        self.emulation.poll_error(cx)
+    }
+
     pub async fn create(&mut self, handle: EmulationHandle) -> bool {
         if self.handles.insert(handle) {
             self.pressed_keys.insert(handle, HashSet::new());
@@ -237,4 +242,8 @@ trait Emulation: Send {
     async fn create(&mut self, handle: EmulationHandle);
     async fn destroy(&mut self, handle: EmulationHandle);
     async fn terminate(&mut self);
+
+    fn poll_error(&mut self, _cx: &mut Context<'_>) -> Poll<EmulationError> {
+        Poll::Pending
+    }
 }
