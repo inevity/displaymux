@@ -292,6 +292,10 @@ impl Service {
                 }
             }
             EmulationEvent::Disconnected { addr } => {
+                if let Some(handle) = self.client_manager.get_client(addr) {
+                    self.client_manager.clear_peer_readiness(handle);
+                    self.broadcast_client(handle);
+                }
                 if let Some(addr) = self.remove_incoming(addr) {
                     self.notify_frontend(FrontendEvent::IncomingDisconnected(addr));
                 }
@@ -304,11 +308,11 @@ impl Service {
                 Err(e) => self
                     .notify_frontend(FrontendEvent::PortChanged(self.port, Some(format!("{e}")))),
             },
-            EmulationEvent::EmulationDisabled => {
+            EmulationEvent::EmulationDisabled { .. } => {
                 self.emulation_status = Status::Disabled;
                 self.notify_frontend(FrontendEvent::EmulationStatus(self.emulation_status));
             }
-            EmulationEvent::EmulationEnabled => {
+            EmulationEvent::EmulationEnabled { .. } => {
                 self.emulation_status = Status::Enabled;
                 self.notify_frontend(FrontendEvent::EmulationStatus(self.emulation_status));
             }
@@ -325,6 +329,23 @@ impl Service {
                 if let Some(handle) = self.client_manager.get_client(addr) {
                     self.client_manager.set_peer_commit(handle, Some(commit));
                     self.broadcast_client(handle);
+                }
+            }
+            EmulationEvent::PeerReadiness {
+                addr,
+                keyboard_ready,
+                pointer_ready,
+                session_epoch,
+            } => {
+                if let Some(handle) = self.client_manager.get_client(addr) {
+                    if self.client_manager.set_peer_readiness(
+                        handle,
+                        keyboard_ready,
+                        pointer_ready,
+                        session_epoch,
+                    ) {
+                        self.broadcast_client(handle);
+                    }
                 }
             }
         }
@@ -351,6 +372,7 @@ impl Service {
                 log::info!("entering client {handle} ...");
                 self.spawn_hook_command(handle);
             }
+            ICaptureEvent::PeerReadiness(handle) => self.broadcast_client(handle),
         }
     }
 

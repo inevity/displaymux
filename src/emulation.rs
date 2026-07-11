@@ -48,9 +48,13 @@ pub(crate) enum EmulationEvent {
     /// the port of the listener has changed
     PortChanged(Result<u16, ListenerCreationError>),
     /// emulation was disabled
-    EmulationDisabled,
+    EmulationDisabled {
+        session_epoch: u64,
+    },
     /// emulation was enabled
-    EmulationEnabled,
+    EmulationEnabled {
+        session_epoch: u64,
+    },
     /// capture should be released
     ReleaseNotify,
     /// peer sent us a Hello with its build commit hash. Used to
@@ -63,6 +67,12 @@ pub(crate) enum EmulationEvent {
     PeerHello {
         addr: SocketAddr,
         commit: [u8; 8],
+    },
+    PeerReadiness {
+        addr: SocketAddr,
+        keyboard_ready: bool,
+        pointer_ready: bool,
+        session_epoch: u64,
     },
 }
 
@@ -161,7 +171,10 @@ impl ListenTask {
                                 self.listener.reply(addr, ProtoEvent::Ack(0)).await;
                             }
                             ProtoEvent::Input(event) => self.emulation_proxy.consume(event, addr),
-                            ProtoEvent::Ping => self.listener.reply(addr, ProtoEvent::Pong(self.emulation_proxy.emulation_active.get())).await,
+                            ProtoEvent::Ping => {
+                                self.listener.reply(addr, ProtoEvent::Pong(self.emulation_proxy.emulation_active.get())).await;
+                                self.listener.reply(addr, self.emulation_proxy.readiness()).await;
+                            }
                             // Peer's version handshake. Echo our own
                             // commit back so the peer's connect-side
                             // receive_loop populates its `peer_commit`,
@@ -175,7 +188,20 @@ impl ListenTask {
                             // the peer is in fact happily talking to us.
                             ProtoEvent::Hello { commit } => {
                                 self.listener.reply(addr, ProtoEvent::Hello { commit: local_commit() }).await;
+                                self.listener.reply(addr, self.emulation_proxy.readiness()).await;
                                 self.event_tx.send(EmulationEvent::PeerHello { addr, commit }).expect("channel closed");
+                            }
+                            ProtoEvent::Readiness {
+                                keyboard_ready,
+                                pointer_ready,
+                                session_epoch,
+                            } => {
+                                self.event_tx.send(EmulationEvent::PeerReadiness {
+                                    addr,
+                                    keyboard_ready,
+                                    pointer_ready,
+                                    session_epoch,
+                                }).expect("channel closed");
                             }
                             _ => {}
                         }
@@ -192,6 +218,9 @@ impl ListenTask {
                     None => break
                 }}
                 event = self.emulation_proxy.event() => {
+                    if matches!(&event, EmulationEvent::EmulationEnabled { .. } | EmulationEvent::EmulationDisabled { .. }) {
+                        self.listener.broadcast(self.emulation_proxy.readiness()).await;
+                    }
                     self.event_tx.send(event).expect("channel closed");
                 }
                 request = self.request_rx.recv() => match request.expect("channel closed") {
@@ -229,6 +258,7 @@ impl ListenTask {
 /// discarding events when it is disabled
 pub(crate) struct EmulationProxy {
     emulation_active: Rc<Cell<bool>>,
+    session_epoch: Rc<Cell<u64>>,
     exit_requested: Rc<Cell<bool>>,
     request_tx: Sender<ProxyRequest>,
     event_rx: Receiver<EmulationEvent>,
@@ -247,6 +277,7 @@ impl EmulationProxy {
         let (request_tx, request_rx) = channel();
         let (event_tx, event_rx) = channel();
         let emulation_active = Rc::new(Cell::new(false));
+        let session_epoch = Rc::new(Cell::new(0));
         let exit_requested = Rc::new(Cell::new(false));
         let emulation_task = EmulationTask {
             backend,
@@ -255,10 +286,12 @@ impl EmulationProxy {
             event_tx,
             handles: Default::default(),
             next_id: 0,
+            next_session_epoch: (rand::random::<u64>() >> 1).max(1),
         };
         let task = spawn_local(emulation_task.run());
         Self {
             emulation_active,
+            session_epoch,
             exit_requested,
             request_tx,
             task,
@@ -268,13 +301,26 @@ impl EmulationProxy {
 
     async fn event(&mut self) -> EmulationEvent {
         let event = self.event_rx.recv().await.expect("channel closed");
-        if let EmulationEvent::EmulationEnabled = event {
-            self.emulation_active.replace(true);
-        }
-        if let EmulationEvent::EmulationDisabled = event {
-            self.emulation_active.replace(false);
+        match &event {
+            EmulationEvent::EmulationEnabled { session_epoch } => {
+                self.session_epoch.set(*session_epoch);
+                self.emulation_active.set(true);
+            }
+            EmulationEvent::EmulationDisabled { session_epoch } => {
+                self.session_epoch.set(*session_epoch);
+                self.emulation_active.set(false);
+            }
+            _ => {}
         }
         event
+    }
+
+    fn readiness(&self) -> ProtoEvent {
+        ProtoEvent::Readiness {
+            keyboard_ready: self.emulation_active.get(),
+            pointer_ready: self.emulation_active.get(),
+            session_epoch: self.session_epoch.get(),
+        }
     }
 
     fn consume(&self, event: Event, addr: SocketAddr) {
@@ -314,6 +360,7 @@ struct EmulationTask {
     event_tx: Sender<EmulationEvent>,
     handles: HashMap<SocketAddr, EmulationHandle>,
     next_id: EmulationHandle,
+    next_session_epoch: u64,
 }
 
 impl EmulationTask {
@@ -345,11 +392,23 @@ impl EmulationTask {
             _ = wait_for_termination(&mut self.request_rx) => return Ok(()),
         };
 
+        let enabled_epoch = self.next_session_epoch;
+        let disabled_epoch = enabled_epoch
+            .checked_add(1)
+            .expect("emulation session epoch exhausted");
+        self.next_session_epoch = disabled_epoch
+            .checked_add(1)
+            .expect("emulation session epoch exhausted");
+
         // used to send enabled and disabled events
         let _emulation_guard = DropGuard::new(
             self.event_tx.clone(),
-            EmulationEvent::EmulationEnabled,
-            EmulationEvent::EmulationDisabled,
+            EmulationEvent::EmulationEnabled {
+                session_epoch: enabled_epoch,
+            },
+            EmulationEvent::EmulationDisabled {
+                session_epoch: disabled_epoch,
+            },
         );
 
         // create active handles

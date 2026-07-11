@@ -37,6 +37,8 @@ pub(crate) enum ICaptureEvent {
     /// either the remote client leaving its device region,
     /// a new device entering the screen or the release bind.
     ClientEntered(u64),
+    /// A peer readiness/session update was received on the outgoing connection.
+    PeerReadiness(u64),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -290,6 +292,11 @@ impl CaptureTask {
                             log::info!("releasing capture: left remote client device region");
                             self.release_capture(capture).await?;
                         },
+                        ProtoEvent::Readiness { .. } => {
+                            self.event_tx
+                                .send(ICaptureEvent::PeerReadiness(handle))
+                                .expect("channel closed");
+                        }
                         _ => {}
                     }
                 },

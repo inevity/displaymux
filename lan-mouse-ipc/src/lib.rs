@@ -166,6 +166,12 @@ pub struct ClientState {
     pub active_addr: Option<SocketAddr>,
     /// tracks whether or not the client is available for emulation
     pub alive: bool,
+    /// peer keyboard injection path is initialized
+    pub keyboard_ready: bool,
+    /// peer pointer motion/button/scroll path is initialized
+    pub pointer_ready: bool,
+    /// changes whenever the peer recreates its emulation backend
+    pub peer_session_epoch: u64,
     /// ips from dns
     pub dns_ips: Vec<IpAddr>,
     /// all ip addresses associated with a particular client

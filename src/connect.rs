@@ -140,7 +140,7 @@ impl LanMouseConnection {
                     Ok(_) => {}
                     Err(e) => {
                         log::warn!("client {handle} failed to send: {e}");
-                        disconnect(&self.client_manager, handle, addr, &self.conns).await;
+                        disconnect(&self.client_manager, handle, addr, &conn, &self.conns).await;
                     }
                 }
                 log::trace!("{event} >->->->->- {addr}");
@@ -269,6 +269,14 @@ async fn receive_loop(
 ) {
     let mut buf = [0u8; MAX_EVENT_SIZE];
     while conn.recv(&mut buf).await.is_ok() {
+        let current = conns
+            .lock()
+            .await
+            .get(&addr)
+            .is_some_and(|active| Arc::ptr_eq(active, &conn));
+        if !current {
+            break;
+        }
         match buf.try_into() {
             Ok(event) => {
                 log::trace!("{addr} <==<==<== {event}");
@@ -281,6 +289,19 @@ async fn receive_loop(
                     ProtoEvent::Hello { commit } => {
                         client_manager.set_peer_commit(handle, Some(commit));
                     }
+                    ProtoEvent::Readiness {
+                        keyboard_ready,
+                        pointer_ready,
+                        session_epoch,
+                    } => {
+                        client_manager.set_peer_readiness(
+                            handle,
+                            keyboard_ready,
+                            pointer_ready,
+                            session_epoch,
+                        );
+                        tx.send((handle, event)).expect("channel closed");
+                    }
                     event => tx.send((handle, event)).expect("channel closed"),
                 }
             }
@@ -292,19 +313,41 @@ async fn receive_loop(
         }
     }
     log::warn!("recv error");
-    disconnect(&client_manager, handle, addr, &conns).await;
+    if disconnect(&client_manager, handle, addr, &conn, &conns).await {
+        tx.send((
+            handle,
+            ProtoEvent::Readiness {
+                keyboard_ready: false,
+                pointer_ready: false,
+                session_epoch: 0,
+            },
+        ))
+        .expect("channel closed");
+    }
 }
 
 async fn disconnect(
     client_manager: &ClientManager,
     handle: ClientHandle,
     addr: SocketAddr,
+    expected_conn: &Arc<dyn Conn + Send + Sync>,
     conns: &Mutex<HashMap<SocketAddr, Arc<dyn Conn + Send + Sync>>>,
-) {
+) -> bool {
     log::warn!("client ({handle}) @ {addr} connection closed");
-    conns.lock().await.remove(&addr);
+    let mut conns_guard = conns.lock().await;
+    let current = conns_guard
+        .get(&addr)
+        .is_some_and(|active| Arc::ptr_eq(active, expected_conn));
+    if !current {
+        return false;
+    }
+    conns_guard.remove(&addr);
+    let active: Vec<SocketAddr> = conns_guard.keys().copied().collect();
+    drop(conns_guard);
     client_manager.set_active_addr(handle, None);
+    client_manager.set_alive(handle, false);
     client_manager.set_peer_commit(handle, None);
-    let active: Vec<SocketAddr> = conns.lock().await.keys().copied().collect();
+    client_manager.clear_peer_readiness(handle);
     log::info!("active connections: {active:?}");
+    true
 }

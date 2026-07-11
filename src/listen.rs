@@ -206,11 +206,29 @@ impl LanMouseListener {
     pub(crate) async fn reply(&self, addr: SocketAddr, event: ProtoEvent) {
         log::trace!("reply {event} >=>=>=>=>=> {addr}");
         let (buf, len): ([u8; MAX_EVENT_SIZE], usize) = event.into();
-        let conns = self.conns.lock().await;
-        for (a, conn) in conns.iter() {
-            if *a == addr {
-                let _ = conn.send(&buf[..len]).await;
-            }
+        let conn = self
+            .conns
+            .lock()
+            .await
+            .iter()
+            .find(|(candidate, _)| *candidate == addr)
+            .map(|(_, conn)| conn.clone());
+        if let Some(conn) = conn {
+            let _ = conn.send(&buf[..len]).await;
+        }
+    }
+
+    pub(crate) async fn broadcast(&self, event: ProtoEvent) {
+        let (buf, len): ([u8; MAX_EVENT_SIZE], usize) = event.into();
+        let conns = self
+            .conns
+            .lock()
+            .await
+            .iter()
+            .map(|(_, conn)| conn.clone())
+            .collect::<Vec<_>>();
+        for conn in conns {
+            let _ = conn.send(&buf[..len]).await;
         }
     }
 

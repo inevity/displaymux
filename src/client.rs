@@ -288,6 +288,51 @@ impl ClientManager {
         }
     }
 
+    pub(crate) fn set_peer_readiness(
+        &self,
+        handle: ClientHandle,
+        keyboard_ready: bool,
+        pointer_ready: bool,
+        session_epoch: u64,
+    ) -> bool {
+        let mut clients = self.clients.borrow_mut();
+        let Some((_, state)) = clients.get_mut(handle as usize) else {
+            return false;
+        };
+
+        if session_epoch == 0 && (keyboard_ready || pointer_ready) {
+            return false;
+        }
+        if state.peer_session_epoch != 0 && session_epoch < state.peer_session_epoch {
+            return false;
+        }
+
+        state.keyboard_ready = keyboard_ready;
+        state.pointer_ready = pointer_ready;
+        state.peer_session_epoch = session_epoch;
+        true
+    }
+
+    pub(crate) fn clear_peer_readiness(&self, handle: ClientHandle) {
+        if let Some((_, state)) = self.clients.borrow_mut().get_mut(handle as usize) {
+            state.keyboard_ready = false;
+            state.pointer_ready = false;
+            state.peer_session_epoch = 0;
+        }
+    }
+
+    pub(crate) fn peer_bundle_ready(&self, handle: ClientHandle) -> Option<(bool, u64)> {
+        self.clients
+            .borrow()
+            .get(handle as usize)
+            .map(|(_, state)| {
+                (
+                    state.alive && state.keyboard_ready && state.pointer_ready,
+                    state.peer_session_epoch,
+                )
+            })
+    }
+
     pub(crate) fn active_addr(&self, handle: ClientHandle) -> Option<SocketAddr> {
         self.clients
             .borrow()
@@ -315,5 +360,61 @@ impl ClientManager {
             .borrow()
             .get(handle as usize)
             .map(|(_, s)| s.ips.clone())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bundle_readiness_requires_connection_and_both_capabilities() {
+        let clients = ClientManager::default();
+        let handle = clients.add_client();
+
+        assert_eq!(clients.peer_bundle_ready(handle), Some((false, 0)));
+
+        clients.set_alive(handle, true);
+        assert!(clients.set_peer_readiness(handle, true, false, 10));
+        assert_eq!(clients.peer_bundle_ready(handle), Some((false, 10)));
+
+        assert!(clients.set_peer_readiness(handle, true, true, 10));
+        assert_eq!(clients.peer_bundle_ready(handle), Some((true, 10)));
+    }
+
+    #[test]
+    fn stale_readiness_cannot_revive_newer_session() {
+        let clients = ClientManager::default();
+        let handle = clients.add_client();
+        clients.set_alive(handle, true);
+
+        assert!(clients.set_peer_readiness(handle, false, false, 12));
+        assert!(!clients.set_peer_readiness(handle, true, true, 11));
+        assert_eq!(clients.peer_bundle_ready(handle), Some((false, 12)));
+    }
+
+    #[test]
+    fn disconnect_reset_accepts_new_process_epoch() {
+        let clients = ClientManager::default();
+        let handle = clients.add_client();
+        clients.set_alive(handle, true);
+        assert!(clients.set_peer_readiness(handle, true, true, 100));
+
+        clients.set_alive(handle, false);
+        clients.clear_peer_readiness(handle);
+        clients.set_alive(handle, true);
+        assert!(clients.set_peer_readiness(handle, true, true, 3));
+
+        assert_eq!(clients.peer_bundle_ready(handle), Some((true, 3)));
+    }
+
+    #[test]
+    fn zero_epoch_can_never_report_ready() {
+        let clients = ClientManager::default();
+        let handle = clients.add_client();
+        clients.set_alive(handle, true);
+
+        assert!(!clients.set_peer_readiness(handle, true, true, 0));
+        assert_eq!(clients.peer_bundle_ready(handle), Some((false, 0)));
     }
 }
