@@ -1,0 +1,32 @@
+bind_address = "{{ hostvars[groups['linux_desktop'][0]].ansible_host }}:{{ daemon_port }}"
+tv_ip = "{{ tv_ip }}"
+server_host = "{{ lan_mouse_server_host }}"
+controller_token = "{{ lookup('ansible.builtin.file', lan_mouse_controller_token_file) | trim }}"
+client_key_path = "{{ tv_multiview_client_key_path }}"
+
+[inputs]
+linux = "{{ tv_inputs.linux }}"
+mac = "{{ tv_inputs.mac }}"
+windows = "{{ tv_inputs.windows }}"
+
+[wake_on_lan]
+mac = "{{ mac_mac_address }}"
+windows = "{{ windows_mac_address }}"
+
+[timeouts]
+command_ms = {{ tv_multiview_command_timeout_ms }}
+observation_ms = {{ tv_multiview_observation_timeout_ms }}
+grant_ms = {{ tv_multiview_grant_timeout_ms }}
+wake_ms = {{ tv_multiview_wake_timeout_ms }}
+lease_ms = {{ lan_mouse_controller_lease_ttl_ms }}
+signal_poll_ms = {{ tv_multiview_signal_poll_ms }}
+reconnect_initial_ms = 1000
+reconnect_max_ms = 60000
+keepalive_ms = 10000
+keepalive_timeout_ms = 30000
+
+[limits]
+command_queue = 64
+safety_queue = 16
+retained_requests = 32
+reconnect_alert_after = {{ tv_multiview_reconnect_alert_after }}

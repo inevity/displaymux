@@ -1,11 +1,20 @@
 # Managed by Ansible — edits here will be overwritten on next playbook run.
-# This machine never owns input, only receives it. enter_hook fires when
-# the cursor returns to Linux, and has to reach the daemon over the same
-# network lan-mouse uses for peer-to-peer communication. The TV connection
-# lives on {{ groups['linux_desktop'][0] }}, not here.
+# This spoke receives input. Return-to-server is an epoch-correlated
+# lan-mouse release handshake; it does not create a competing TV request.
 
 # optional port (defaults to 4242, explicit here for clarity)
 port = {{ lan_mouse_port }}
+
+[switch_controller]
+url = "http://{{ hostvars[groups['linux_desktop'][0]].ansible_host }}:{{ daemon_port }}"
+token = "{{ lookup('ansible.builtin.file', lan_mouse_controller_token_file) | trim }}"
+local_host = "{{ spoke_host }}"
+server_host = "{{ lan_mouse_server_host }}"
+http_timeout_ms = {{ lan_mouse_controller_http_timeout_ms }}
+request_timeout_ms = {{ lan_mouse_controller_request_timeout_ms }}
+poll_interval_ms = {{ lan_mouse_controller_poll_interval_ms }}
+lease_ttl_ms = {{ lan_mouse_controller_lease_ttl_ms }}
+renew_interval_ms = {{ lan_mouse_controller_renew_interval_ms }}
 
 # authorize the hub's certificate for incoming connections
 [authorized_fingerprints]
@@ -17,4 +26,4 @@ ips = [ "{{ hostvars[groups['linux_desktop'][0]].ansible_host }}" ]
 port = {{ lan_mouse_port }}
 position = "{{ spoke_position }}"
 activate_on_startup = true
-enter_hook = "curl -s http://{{ hostvars[groups['linux_desktop'][0]].ansible_host }}:{{ daemon_port }}/enter/linux"
+switch_target = "{{ lan_mouse_server_host }}"

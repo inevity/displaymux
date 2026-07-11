@@ -1,13 +1,22 @@
 # Managed by Ansible — edits here will be overwritten on next playbook run.
-# This is the hub: Linux always owns the physical mouse/keyboard.
-# enter_hook calls the tv-multiview daemon on localhost, which only touches
-# the TV's input if it isn't currently in side-by-side mode.
+# This host is the lan-mouse server and the fail-local input owner.
 
 # configure release bind
 release_bind = [ "KeyA", "KeyS", "KeyD", "KeyF" ]
 
 # optional port (defaults to 4242)
 port = {{ lan_mouse_port }}
+
+[switch_controller]
+url = "http://{{ hostvars[groups['linux_desktop'][0]].ansible_host }}:{{ daemon_port }}"
+token = "{{ lookup('ansible.builtin.file', lan_mouse_controller_token_file) | trim }}"
+local_host = "{{ lan_mouse_server_host }}"
+server_host = "{{ lan_mouse_server_host }}"
+http_timeout_ms = {{ lan_mouse_controller_http_timeout_ms }}
+request_timeout_ms = {{ lan_mouse_controller_request_timeout_ms }}
+poll_interval_ms = {{ lan_mouse_controller_poll_interval_ms }}
+lease_ttl_ms = {{ lan_mouse_controller_lease_ttl_ms }}
+renew_interval_ms = {{ lan_mouse_controller_renew_interval_ms }}
 
 # list of authorized tls certificate fingerprints that
 # are accepted for incoming traffic
@@ -22,7 +31,7 @@ ips = [ "{{ hostvars[groups['mac_desktop'][0]].ansible_host }}" ]
 port = {{ lan_mouse_port }}
 position = "right"
 activate_on_startup = true
-enter_hook = "curl -s http://localhost:{{ daemon_port }}/enter/mac"
+switch_target = "mac"
 
 [[clients]]
 hostname = "{{ groups['windows_desktop'][0] }}"
@@ -30,4 +39,4 @@ ips = [ "{{ hostvars[groups['windows_desktop'][0]].ansible_host }}" ]
 port = {{ lan_mouse_port }}
 position = "left"
 activate_on_startup = true
-enter_hook = "curl -s http://localhost:{{ daemon_port }}/enter/windows"
+switch_target = "windows"

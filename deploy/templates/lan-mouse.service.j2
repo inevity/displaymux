@@ -6,8 +6,10 @@ After=graphical-session.target
 BindsTo=graphical-session.target
 
 [Service]
+Environment=RUST_LOG=lan_mouse=info
 ExecStart={{ lan_mouse_binary }} daemon
 Restart=on-failure
+RestartSec=2
 
 [Install]
 WantedBy=graphical-session.target

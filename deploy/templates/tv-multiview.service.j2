@@ -2,14 +2,15 @@
 Description=TV multiview-aware HDMI input switch daemon
 After=network-online.target
 Wants=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=10
 
 [Service]
 Environment=RUST_LOG=tv_multiview={{ tv_multiview_log_level }}
+Environment=TV_MULTIVIEW_CONFIG={{ tv_multiview_config_path }}
 ExecStart={{ tv_multiview_binary }}
 Restart=on-failure
 RestartSec=5
-StartLimitIntervalSec=60
-StartLimitBurst=10
 
 [Install]
 WantedBy=default.target

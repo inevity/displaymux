@@ -1,41 +1,43 @@
 # Maintainer: CupricReki
 # Maintainer: feschber
-# Managed by Ansible — GTK stripped, pinned to {{ lan_mouse_release_tag }}.
+# Managed by Ansible - GTK stripped, pinned to {{ lan_mouse_revision }}.
 
 pkgname=lan-mouse-git
 _pkgname=lan-mouse
-pkgver={{ lan_mouse_release_tag | regex_replace('^main-', '') }}
+pkgver=0.11.0.r{{ lan_mouse_revision[:12] }}
 pkgrel=1
 pkgdesc="Software KVM Switch / mouse & keyboard sharing software for Local Area Networks"
-url="https://github.com/feschber/lan-mouse"
+url="{{ lan_mouse_repo_url }}"
 license=("GPL-3.0-only")
-arch=(any)
+arch=(x86_64)
 provides=("$_pkgname=${pkgver/\.r*/}")
 conflicts=("$_pkgname")
-source=("$_pkgname"::"git+https://github.com/feschber/$_pkgname.git#tag={{ lan_mouse_release_tag }}")
+source=("$_pkgname"::"git+file://{{ lan_mouse_linux_source_dir }}#commit={{ lan_mouse_revision }}")
 sha256sums=('SKIP')
 depends=(libx11 libxtst glibc gcc-libs)
 makedepends=(git cargo rust cmake pkgconf)
-options=('!lto')
+options=('!lto' '!debug')
 
 prepare() {
   cd "$_pkgname"
-  cargo fetch --locked --target "$CARCH-unknown-linux-gnu"
+  export CARGO_HOME="{{ lan_mouse_linux_cargo_home }}"
+  /usr/bin/cargo fetch --locked --target "$CARCH-unknown-linux-gnu"
 }
 
 build() {
   cd "$_pkgname"
-  export RUSTUP_TOOLCHAIN=stable
   export CARGO_TARGET_DIR=target
-  cargo build --frozen --release --bin lan-mouse \
+  export CARGO_HOME="{{ lan_mouse_linux_cargo_home }}"
+  /usr/bin/cargo build --frozen --release --bin lan-mouse \
     --no-default-features \
     -F layer_shell_capture,libei_capture,x11_capture,wlroots_emulation,libei_emulation,x11_emulation,rdp_emulation
 }
 
 check() {
   cd "$_pkgname"
-  export RUSTUP_TOOLCHAIN=stable
-  cargo test --frozen --no-default-features -F layer_shell_capture,libei_capture,x11_capture,wlroots_emulation,libei_emulation,x11_emulation,rdp_emulation
+  export CARGO_HOME="{{ lan_mouse_linux_cargo_home }}"
+  /usr/bin/cargo test --frozen --workspace --exclude lan-mouse-gtk \
+    --no-default-features -F {{ lan_mouse_linux_features }}
 }
 
 package() {
