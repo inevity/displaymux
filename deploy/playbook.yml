@@ -473,6 +473,24 @@
       until: daemon_health.status == 200
       changed_when: false
 
+    - name: Require synchronized daemon readiness before spoke deployment
+      ansible.builtin.uri:
+        url: "http://{{ hostvars[groups['linux_desktop'][0]].ansible_host }}:{{ daemon_port }}/ready"
+        headers:
+          Authorization: "Bearer {{ lookup('ansible.builtin.file', lan_mouse_controller_token_file) | trim }}"
+        status_code: 200
+        return_content: true
+      register: daemon_ready
+      retries: "{{ tv_multiview_deploy_ready_retries }}"
+      delay: "{{ tv_multiview_deploy_ready_delay_seconds }}"
+      until: >-
+        (daemon_ready.status | default(0) == 200)
+        and (daemon_ready.json is defined)
+        and (daemon_ready.json.data.ready | default(false) | bool)
+        and not (daemon_ready.json.data.fallback_required | default(true) | bool)
+      changed_when: false
+      no_log: true
+
     # Firewall policy remains externally owned. The Linux host must admit UDP
     # {{ lan_mouse_port }} and authenticated TCP {{ daemon_port }} from this LAN.
 
