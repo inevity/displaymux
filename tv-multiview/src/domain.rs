@@ -210,6 +210,7 @@ pub struct ProtocolState {
     pub fallback_required: bool,
     pub fallback_reason: Option<String>,
     pub reconnect_total: u64,
+    pub switch_count: BTreeMap<Host, u64>,
     pub last_error: Option<String>,
     pub dropped_logs: u64,
 }
@@ -228,6 +229,7 @@ impl ProtocolState {
             .into_iter()
             .map(|host| (host, PeerReadiness::default()))
             .collect();
+        let switch_count = Host::ALL.into_iter().map(|host| (host, 0)).collect();
         Self {
             server_host,
             ws_state: WsState::Disconnected,
@@ -256,6 +258,7 @@ impl ProtocolState {
             fallback_required: true,
             fallback_reason: Some("startup_unsynchronized".to_string()),
             reconnect_total: 0,
+            switch_count,
             last_error: None,
             dropped_logs: 0,
         }

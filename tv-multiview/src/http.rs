@@ -1,6 +1,9 @@
 use crate::{
     coordinator::{CoordinatorError, CoordinatorHandle, CoordinatorQueueSnapshot},
-    domain::{Host, LeaseIdentity, PeerReadiness, ProtocolPhase, ProtocolState, RequestStatus},
+    domain::{
+        Host, LeaseIdentity, PeerReadiness, ProtocolPhase, ProtocolState, RequestStatus,
+        SignalObservation, TvMode, WsState,
+    },
     observability::{RuntimeMetrics, RuntimeSnapshot},
     protocol::{Event, ProtocolError},
 };
@@ -13,7 +16,7 @@ use axum::{
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
-use std::{str::FromStr, sync::Arc};
+use std::{collections::BTreeMap, str::FromStr, sync::Arc};
 use tokio::sync::watch;
 
 const PROTOCOL_VERSION: u16 = 1;
@@ -111,9 +114,8 @@ async fn status(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Respo
         return response;
     }
     let now_ms = state.coordinator.now_ms();
-    let mut protocol = (*state.snapshot_rx.borrow()).as_ref().clone();
+    let protocol = (*state.snapshot_rx.borrow()).as_ref().clone();
     let runtime = state.runtime_metrics.snapshot();
-    protocol.dropped_logs = runtime.dropped_logs;
     let observation_age_ms = protocol.observed_input.and_then(|host| {
         protocol
             .input_signal
@@ -125,11 +127,75 @@ async fn status(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Respo
         .next_deadline_ms()
         .map(|deadline| deadline.saturating_sub(now_ms));
     let in_flight_operation = in_flight_operation(&protocol);
+    let request = protocol.active_request.as_ref().or_else(|| {
+        protocol.active_session.as_ref().and_then(|session| {
+            protocol
+                .request_history
+                .iter()
+                .rev()
+                .find(|request| request.request_id == session.request_id)
+        })
+    });
+    let request_id = protocol
+        .active_request
+        .as_ref()
+        .map(|request| request.request_id.clone())
+        .or_else(|| {
+            protocol
+                .active_session
+                .as_ref()
+                .map(|session| session.request_id.clone())
+        });
+    let pending_switch = protocol
+        .active_request
+        .as_ref()
+        .map(|request| request.target);
+    let input_signal = protocol
+        .input_signal
+        .iter()
+        .map(|(host, observation)| (*host, observation.present))
+        .collect();
+    let remote_online = protocol
+        .peers
+        .iter()
+        .filter(|(host, _)| **host != protocol.server_host)
+        .map(|(host, readiness)| (*host, readiness.online))
+        .collect();
     Json(ApiEnvelope::new(
         now_ms,
         StatusResponse {
-            protocol,
-            uptime_ms: now_ms,
+            mode: protocol.tv_mode,
+            observed_input: protocol.observed_input,
+            commanded_input: protocol.commanded_input,
+            healthy: protocol.daemon_healthy(),
+            ready: protocol.ready(),
+            ws_state: protocol.ws_state,
+            subscribe_active: protocol.subscribe_active,
+            protocol_phase: protocol.phase,
+            request_id,
+            request_epoch: protocol.request_epoch,
+            switch_epoch: protocol.switch_epoch,
+            verified_epoch: protocol.verified_epoch,
+            pending_switch,
+            switch_timer: deadline_remaining_ms.unwrap_or(0),
+            fallback_required: protocol.fallback_required,
+            keyboard_owner: protocol.keyboard_owner,
+            pointer_owner: protocol.pointer_owner,
+            reservation_target: pending_switch,
+            grant_epoch: request
+                .and_then(|request| request.grant.as_ref())
+                .map(|grant| grant.grant_epoch),
+            input_signal,
+            signal_observations: protocol.input_signal.clone(),
+            remote_online,
+            peer_readiness: protocol.peers.clone(),
+            uptime_seconds: now_ms / 1_000,
+            reconnect_total: protocol.reconnect_total,
+            switch_count: protocol.switch_count.clone(),
+            last_error: protocol.last_error.clone(),
+            dropped_logs: runtime.dropped_logs,
+            request_history_len: protocol.request_history.len(),
+            retained_request_limit: protocol.retained_request_limit,
             queues: state.coordinator.queue_snapshot(),
             runtime,
             observation_age_ms,
@@ -550,9 +616,36 @@ struct ReadyResponse {
 
 #[derive(Debug, Serialize)]
 struct StatusResponse {
-    #[serde(flatten)]
-    protocol: ProtocolState,
-    uptime_ms: u64,
+    mode: TvMode,
+    observed_input: Option<Host>,
+    commanded_input: Option<Host>,
+    healthy: bool,
+    ready: bool,
+    ws_state: WsState,
+    subscribe_active: bool,
+    protocol_phase: ProtocolPhase,
+    request_id: Option<String>,
+    request_epoch: u64,
+    switch_epoch: u64,
+    verified_epoch: Option<u64>,
+    pending_switch: Option<Host>,
+    switch_timer: u64,
+    fallback_required: bool,
+    keyboard_owner: Host,
+    pointer_owner: Host,
+    reservation_target: Option<Host>,
+    grant_epoch: Option<u64>,
+    input_signal: BTreeMap<Host, bool>,
+    signal_observations: BTreeMap<Host, SignalObservation>,
+    remote_online: BTreeMap<Host, bool>,
+    peer_readiness: BTreeMap<Host, PeerReadiness>,
+    uptime_seconds: u64,
+    reconnect_total: u64,
+    switch_count: BTreeMap<Host, u64>,
+    last_error: Option<String>,
+    dropped_logs: u64,
+    request_history_len: usize,
+    retained_request_limit: usize,
     queues: CoordinatorQueueSnapshot,
     runtime: RuntimeSnapshot,
     observation_age_ms: Option<u64>,
@@ -847,9 +940,15 @@ mod tests {
         assert_eq!(status_response.status(), StatusCode::OK);
         let body = body_json(status_response).await;
         assert_eq!(body["data"]["keyboard_owner"], "linux");
+        assert_eq!(body["data"]["mode"], "fullscreen");
+        assert_eq!(body["data"]["protocol_phase"], "idle");
+        assert_eq!(body["data"]["healthy"], true);
+        assert_eq!(body["data"]["ready"], true);
+        assert_eq!(body["data"]["input_signal"]["linux"], true);
         assert_eq!(body["data"]["queues"]["ordinary_commands"]["depth"], 0);
         assert_eq!(body["data"]["runtime"]["dropped_logs"], 0);
         assert_eq!(body["data"]["runtime"]["retry_alert"], false);
-        assert!(body["data"]["uptime_ms"].is_number());
+        assert!(body["data"]["uptime_seconds"].is_number());
+        assert!(body["data"].get("active_request").is_none());
     }
 }

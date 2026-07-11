@@ -766,6 +766,7 @@ fn request_observation(
 fn issue_grant(state: &mut ProtocolState, now_ms: u64, timing: ProtocolTiming) {
     state.grant_epoch = state.grant_epoch.saturating_add(1);
     let request = state.active_request.as_mut().expect("active request");
+    let target = request.target;
     let switch_epoch = request.switch_epoch.expect("switch epoch");
     let expires_at_ms = now_ms
         .saturating_add(timing.grant_ms)
@@ -780,6 +781,7 @@ fn issue_grant(state: &mut ProtocolState, now_ms: u64, timing: ProtocolTiming) {
     state.verified_epoch = Some(switch_epoch);
     state.phase = ProtocolPhase::GrantPending;
     state.phase_deadline_ms = Some(expires_at_ms);
+    record_verified_switch(state, target);
 }
 
 fn begin_fallback(
@@ -835,6 +837,18 @@ fn finish_fallback(state: &mut ProtocolState) {
     state.observation_in_flight = None;
     state.next_signal_poll_ms = None;
     state.verified_epoch = Some(state.switch_epoch);
+    record_verified_switch(state, state.server_host);
+}
+
+fn record_verified_switch(state: &mut ProtocolState, target: Host) {
+    if state.switch_epoch == 0 {
+        return;
+    }
+    let count = state
+        .switch_count
+        .get_mut(&target)
+        .expect("all host counters initialized");
+    *count = count.saturating_add(1);
 }
 
 fn release_to_server(state: &mut ProtocolState) {
@@ -1251,6 +1265,7 @@ mod tests {
         .next;
         let grant = observed.active_request.as_ref().unwrap().grant.clone();
         let grant_epoch = observed.grant_epoch;
+        assert_eq!(observed.switch_count[&Host::Mac], 1);
 
         let duplicate = apply(
             &observed,
@@ -1267,6 +1282,7 @@ mod tests {
         assert!(duplicate.effects.is_empty());
         assert_eq!(duplicate.next.grant_epoch, grant_epoch);
         assert_eq!(duplicate.next.active_request.as_ref().unwrap().grant, grant);
+        assert_eq!(duplicate.next.switch_count[&Host::Mac], 1);
     }
 
     #[test]
