@@ -80,6 +80,11 @@ pub enum ProtoEvent {
         pointer_ready: bool,
         session_epoch: u64,
     },
+    /// Ask the current capture owner to release its backend. The receiver
+    /// acknowledges this epoch only after backend release completes.
+    ReleaseRequest { release_epoch: u64 },
+    /// Confirms that the matching release request completed.
+    ReleaseAck { release_epoch: u64 },
 }
 
 impl Display for ProtoEvent {
@@ -109,6 +114,12 @@ impl Display for ProtoEvent {
                 f,
                 "Readiness(keyboard={keyboard_ready}, pointer={pointer_ready}, session={session_epoch})"
             ),
+            ProtoEvent::ReleaseRequest { release_epoch } => {
+                write!(f, "ReleaseRequest({release_epoch})")
+            }
+            ProtoEvent::ReleaseAck { release_epoch } => {
+                write!(f, "ReleaseAck({release_epoch})")
+            }
         }
     }
 }
@@ -129,6 +140,8 @@ pub enum EventType {
     Ack,
     Hello,
     Readiness,
+    ReleaseRequest,
+    ReleaseAck,
 }
 
 impl ProtoEvent {
@@ -153,6 +166,8 @@ impl ProtoEvent {
             ProtoEvent::Ack(_) => EventType::Ack,
             ProtoEvent::Hello { .. } => EventType::Hello,
             ProtoEvent::Readiness { .. } => EventType::Readiness,
+            ProtoEvent::ReleaseRequest { .. } => EventType::ReleaseRequest,
+            ProtoEvent::ReleaseAck { .. } => EventType::ReleaseAck,
         }
     }
 }
@@ -218,6 +233,12 @@ impl TryFrom<[u8; MAX_EVENT_SIZE]> for ProtoEvent {
                 keyboard_ready: decode_u8(&mut buf)? != 0,
                 pointer_ready: decode_u8(&mut buf)? != 0,
                 session_epoch: decode_u64(&mut buf)?,
+            }),
+            EventType::ReleaseRequest => Ok(Self::ReleaseRequest {
+                release_epoch: decode_u64(&mut buf)?,
+            }),
+            EventType::ReleaseAck => Ok(Self::ReleaseAck {
+                release_epoch: decode_u64(&mut buf)?,
             }),
         }
     }
@@ -296,6 +317,10 @@ impl From<ProtoEvent> for ([u8; MAX_EVENT_SIZE], usize) {
                     encode_u8(buf, len, keyboard_ready as u8);
                     encode_u8(buf, len, pointer_ready as u8);
                     encode_u64(buf, len, session_epoch);
+                }
+                ProtoEvent::ReleaseRequest { release_epoch }
+                | ProtoEvent::ReleaseAck { release_epoch } => {
+                    encode_u64(buf, len, release_epoch);
                 }
             }
         }
@@ -379,5 +404,34 @@ mod tests {
         assert_eq!(EventType::Ack as u8, 10);
         assert_eq!(EventType::Hello as u8, 11);
         assert_eq!(EventType::Readiness as u8, 12);
+        assert_eq!(EventType::ReleaseRequest as u8, 13);
+        assert_eq!(EventType::ReleaseAck as u8, 14);
+    }
+
+    #[test]
+    fn release_handshake_round_trips_epoch() {
+        for event in [
+            ProtoEvent::ReleaseRequest {
+                release_epoch: 0x0102_0304_0506_0708,
+            },
+            ProtoEvent::ReleaseAck {
+                release_epoch: 0x1112_1314_1516_1718,
+            },
+        ] {
+            let expected = match event {
+                ProtoEvent::ReleaseRequest { release_epoch }
+                | ProtoEvent::ReleaseAck { release_epoch } => release_epoch,
+                _ => unreachable!(),
+            };
+            let (encoded, length): ([u8; MAX_EVENT_SIZE], usize) = event.into();
+            assert_eq!(length, 9);
+            match ProtoEvent::try_from(encoded).unwrap() {
+                ProtoEvent::ReleaseRequest { release_epoch }
+                | ProtoEvent::ReleaseAck { release_epoch } => {
+                    assert_eq!(release_epoch, expected);
+                }
+                other => panic!("unexpected event: {other:?}"),
+            }
+        }
     }
 }
