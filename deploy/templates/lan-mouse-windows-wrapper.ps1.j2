@@ -1,0 +1,113 @@
+$ErrorActionPreference = "Stop"
+
+$logDirectory = Join-Path $env:LOCALAPPDATA "lan-mouse\logs"
+$stdoutLog = Join-Path $logDirectory "lan-mouse.log"
+$stderrLog = Join-Path $logDirectory "lan-mouse.err.log"
+$maxBytes = {{ lan_mouse_log_max_bytes }}
+$backupCount = {{ lan_mouse_log_backups }}
+
+New-Item -ItemType Directory -Path $logDirectory -Force | Out-Null
+$utf8 = [System.Text.UTF8Encoding]::new($false)
+$newLineBytes = $utf8.GetByteCount([Environment]::NewLine)
+
+function Open-LogState([string]$Path) {
+    $sharing = [System.IO.FileShare]::ReadWrite -bor [System.IO.FileShare]::Delete
+    $stream = [System.IO.FileStream]::new(
+        $Path,
+        [System.IO.FileMode]::OpenOrCreate,
+        [System.IO.FileAccess]::Write,
+        $sharing
+    )
+    $null = $stream.Seek(0, [System.IO.SeekOrigin]::End)
+    $writer = [System.IO.StreamWriter]::new($stream, $utf8)
+    $writer.AutoFlush = $true
+    return @{
+        Path = $Path
+        Size = $stream.Length
+        Writer = $writer
+    }
+}
+
+function Rotate-LogState([hashtable]$State) {
+    $Path = $State.Path
+    $State.Writer.Dispose()
+    if (Test-Path "$Path.$backupCount") {
+        Remove-Item "$Path.$backupCount" -Force -ErrorAction SilentlyContinue
+    }
+    for ($index = $backupCount - 1; $index -ge 1; $index--) {
+        if (Test-Path "$Path.$index") {
+            Move-Item "$Path.$index" "$Path.$($index + 1)" -Force
+        }
+    }
+    if (Test-Path $Path) {
+        Move-Item $Path "$Path.1" -Force
+    }
+    $newState = Open-LogState $Path
+    $State.Size = $newState.Size
+    $State.Writer = $newState.Writer
+}
+
+function Write-BoundedLog([hashtable]$State, [string]$Line) {
+    $lineBytes = $utf8.GetByteCount($Line) + $newLineBytes
+    if ($State.Size -gt 0 -and $State.Size + $lineBytes -gt $maxBytes) {
+        Rotate-LogState $State
+    }
+    $State.Writer.WriteLine($Line)
+    $State.Size += $lineBytes
+}
+
+$stdoutState = Open-LogState $stdoutLog
+$stderrState = Open-LogState $stderrLog
+
+$env:RUST_LOG = "lan_mouse=info"
+$startInfo = [System.Diagnostics.ProcessStartInfo]::new()
+$startInfo.FileName = "{{ lan_mouse_windows_binary }}"
+$startInfo.ArgumentList.Add("daemon")
+$startInfo.UseShellExecute = $false
+$startInfo.RedirectStandardOutput = $true
+$startInfo.RedirectStandardError = $true
+
+$process = [System.Diagnostics.Process]::new()
+$process.StartInfo = $startInfo
+$null = $process.Start()
+
+$stdoutTask = $process.StandardOutput.ReadLineAsync()
+$stderrTask = $process.StandardError.ReadLineAsync()
+
+try {
+    while ($null -ne $stdoutTask -or $null -ne $stderrTask) {
+        $pending = @($stdoutTask, $stderrTask) | Where-Object { $null -ne $_ }
+        $completed = [System.Threading.Tasks.Task]::WhenAny(
+            [System.Threading.Tasks.Task[]]$pending
+        ).GetAwaiter().GetResult()
+
+        if ($null -ne $stdoutTask -and $completed -eq $stdoutTask) {
+            $line = $stdoutTask.GetAwaiter().GetResult()
+            if ($null -eq $line) {
+                $stdoutTask = $null
+            } else {
+                Write-BoundedLog $stdoutState $line
+                $stdoutTask = $process.StandardOutput.ReadLineAsync()
+            }
+        }
+
+        if ($null -ne $stderrTask -and $completed -eq $stderrTask) {
+            $line = $stderrTask.GetAwaiter().GetResult()
+            if ($null -eq $line) {
+                $stderrTask = $null
+            } else {
+                Write-BoundedLog $stderrState $line
+                $stderrTask = $process.StandardError.ReadLineAsync()
+            }
+        }
+    }
+    $process.WaitForExit()
+    exit $process.ExitCode
+} finally {
+    $stdoutState.Writer.Dispose()
+    $stderrState.Writer.Dispose()
+    if (-not $process.HasExited) {
+        $process.Kill($true)
+    }
+    $process.Dispose()
+}
