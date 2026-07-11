@@ -31,6 +31,8 @@ pub enum CaptureError {
     EndOfStream,
     #[error("io error: `{0}`")]
     Io(#[from] std::io::Error),
+    #[error("critical input event queue overflowed; capture was released")]
+    CriticalQueueOverflow,
     #[cfg(libei)]
     #[error("libei error: `{0}`")]
     Reis(#[from] reis::Error),

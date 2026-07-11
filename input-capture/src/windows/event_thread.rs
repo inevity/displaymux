@@ -6,8 +6,6 @@ use std::default::Default;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
-use tokio::sync::mpsc::Sender;
-use tokio::sync::mpsc::error::TrySendError;
 use windows::Win32::Foundation::{FALSE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     DEVMODEW, DISPLAY_DEVICE_ATTACHED_TO_DESKTOP, DISPLAY_DEVICEW, ENUM_CURRENT_SETTINGS,
@@ -32,18 +30,21 @@ use input_event::{
 };
 
 use super::{CaptureEvent, Position, display_util};
+use crate::event_queue::{EventQueue, PushOutcome};
 
 pub(crate) struct EventThread {
+    event_queue: Arc<EventQueue>,
     request_buffer: Arc<Mutex<Vec<ClientUpdate>>>,
     thread: Option<thread::JoinHandle<()>>,
     thread_id: u32,
 }
 
 impl EventThread {
-    pub(crate) fn new(event_tx: Sender<(Position, CaptureEvent)>) -> Self {
+    pub(crate) fn new(event_queue: Arc<EventQueue>) -> Self {
         let request_buffer = Default::default();
-        let (thread, thread_id) = start(event_tx, Arc::clone(&request_buffer));
+        let (thread, thread_id) = start(event_queue.clone(), Arc::clone(&request_buffer));
         Self {
+            event_queue,
             request_buffer,
             thread: Some(thread),
             thread_id,
@@ -84,6 +85,7 @@ impl Drop for EventThread {
     fn drop(&mut self) {
         self.exit();
         let _ = self.thread.take().expect("thread").join();
+        self.event_queue.close();
     }
 }
 
@@ -98,15 +100,8 @@ enum ClientUpdate {
     Destroy(Position),
 }
 
-fn blocking_send_event(pos: Position, event: CaptureEvent) {
-    EVENT_TX.with_borrow_mut(|tx| tx.as_mut().unwrap().blocking_send((pos, event)).unwrap())
-}
-
-fn try_send_event(
-    pos: Position,
-    event: CaptureEvent,
-) -> Result<(), TrySendError<(Position, CaptureEvent)>> {
-    EVENT_TX.with_borrow_mut(|tx| tx.as_mut().unwrap().try_send((pos, event)))
+fn send_event(pos: Position, event: CaptureEvent) -> PushOutcome {
+    EVENT_QUEUE.with_borrow(|queue| queue.as_ref().unwrap().push(pos, event))
 }
 
 thread_local! {
@@ -114,8 +109,8 @@ thread_local! {
     static CLIENTS: RefCell<HashSet<Position>> = RefCell::new(HashSet::new());
     /// currently active client
     static ACTIVE_CLIENT: Cell<Option<Position>> = const { Cell::new(None) };
-    /// input event channel
-    static EVENT_TX: RefCell<Option<Sender<(Position, CaptureEvent)>>> = const { RefCell::new(None) };
+    /// input event queue
+    static EVENT_QUEUE: RefCell<Option<Arc<EventQueue>>> = const { RefCell::new(None) };
     /// position of barrier entry
     static ENTRY_POINT: Cell<(i32, i32)> = const { Cell::new((0, 0)) };
     /// previous mouse position
@@ -137,14 +132,14 @@ fn get_msg() -> Option<MSG> {
 }
 
 fn start(
-    event_tx: Sender<(Position, CaptureEvent)>,
+    event_queue: Arc<EventQueue>,
     request_buffer: Arc<Mutex<Vec<ClientUpdate>>>,
 ) -> (thread::JoinHandle<()>, u32) {
     /* condition variable to wait for thead id */
     let thread_id = Arc::new((Condvar::new(), Mutex::new(None)));
     let thread_id_ = Arc::clone(&thread_id);
 
-    let msg_thread = thread::spawn(|| start_routine(thread_id_, event_tx, request_buffer));
+    let msg_thread = thread::spawn(|| start_routine(thread_id_, event_queue, request_buffer));
 
     /* wait for thread to set its id */
     let (cond, thread_id) = &*thread_id;
@@ -157,10 +152,10 @@ fn start(
 
 fn start_routine(
     ready: Arc<(Condvar, Mutex<Option<u32>>)>,
-    event_tx: Sender<(Position, CaptureEvent)>,
+    event_queue: Arc<EventQueue>,
     request_buffer: Arc<Mutex<Vec<ClientUpdate>>>,
 ) {
-    EVENT_TX.replace(Some(event_tx));
+    EVENT_QUEUE.replace(Some(event_queue));
     /* communicate thread id */
     {
         let (cnd, mtx) = &*ready;
@@ -299,7 +294,10 @@ fn check_client_activation(wparam: WPARAM, lparam: LPARAM) -> bool {
     /* notify main thread */
     log::debug!("ENTERED @ {prev_pos:?} -> {curr_pos:?}");
     let active = ACTIVE_CLIENT.get().expect("active client");
-    blocking_send_event(active, CaptureEvent::Begin);
+    if send_event(active, CaptureEvent::Begin) == PushOutcome::Overflow {
+        log::error!("critical input queue overflowed while entering capture; staying local");
+        ACTIVE_CLIENT.take();
+    }
 
     ret
 }
@@ -322,9 +320,11 @@ unsafe extern "system" fn mouse_proc(ncode: i32, wparam: WPARAM, lparam: LPARAM)
         return LRESULT(1);
     };
 
-    /* notify mainthread (drop events if sending too fast) */
-    if let Err(e) = try_send_event(pos, CaptureEvent::Input(Event::Pointer(pointer_event))) {
-        log::warn!("e: {e}");
+    if send_event(pos, CaptureEvent::Input(Event::Pointer(pointer_event))) == PushOutcome::Overflow
+    {
+        log::error!("critical input queue overflowed; releasing pointer capture");
+        ACTIVE_CLIENT.take();
+        return CallNextHookEx(None, ncode, wparam, lparam);
     }
 
     /* don't pass event to applications */
@@ -342,8 +342,11 @@ unsafe extern "system" fn kybrd_proc(ncode: i32, wparam: WPARAM, lparam: LPARAM)
         return LRESULT(1);
     };
 
-    if let Err(e) = try_send_event(client, CaptureEvent::Input(Event::Keyboard(key_event))) {
-        log::warn!("e: {e}");
+    if send_event(client, CaptureEvent::Input(Event::Keyboard(key_event))) == PushOutcome::Overflow
+    {
+        log::error!("critical input queue overflowed; releasing keyboard capture");
+        ACTIVE_CLIENT.take();
+        return CallNextHookEx(None, ncode, wparam, lparam);
     }
 
     /* don't pass event to applications */

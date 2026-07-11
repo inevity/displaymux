@@ -2,18 +2,18 @@ use async_trait::async_trait;
 use core::task::{Context, Poll};
 use event_thread::EventThread;
 use futures::Stream;
-use std::pin::Pin;
+use std::{pin::Pin, sync::Arc};
 
-use std::task::ready;
-use tokio::sync::mpsc::{Receiver, channel};
-
-use super::{Capture, CaptureError, CaptureEvent, Position};
+use super::{
+    Capture, CaptureError, CaptureEvent, Position,
+    event_queue::{EventQueue, QueuePoll},
+};
 
 mod display_util;
 mod event_thread;
 
 pub struct WindowsInputCapture {
-    event_rx: Receiver<(Position, CaptureEvent)>,
+    event_queue: Arc<EventQueue>,
     event_thread: EventThread,
 }
 
@@ -41,21 +41,25 @@ impl Capture for WindowsInputCapture {
 
 impl WindowsInputCapture {
     pub(crate) fn new() -> Self {
-        let (event_tx, event_rx) = channel(10);
-        let event_thread = EventThread::new(event_tx);
+        let event_queue = Arc::new(EventQueue::new());
+        let event_thread = EventThread::new(event_queue.clone());
         Self {
             event_thread,
-            event_rx,
+            event_queue,
         }
     }
 }
 
 impl Stream for WindowsInputCapture {
     type Item = Result<(Position, CaptureEvent), CaptureError>;
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        match ready!(self.event_rx.poll_recv(cx)) {
-            None => Poll::Ready(None),
-            Some(e) => Poll::Ready(Some(Ok(e))),
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        match self.event_queue.poll(cx) {
+            Poll::Ready(QueuePoll::Event(event)) => Poll::Ready(Some(Ok(event))),
+            Poll::Ready(QueuePoll::Overflow) => {
+                Poll::Ready(Some(Err(CaptureError::CriticalQueueOverflow)))
+            }
+            Poll::Ready(QueuePoll::Closed) => Poll::Ready(None),
+            Poll::Pending => Poll::Pending,
         }
     }
 }

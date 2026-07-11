@@ -15,6 +15,9 @@ pub use error::{CaptureCreationError, CaptureError, InputCaptureError};
 
 pub mod error;
 
+#[cfg(any(windows, test))]
+mod event_queue;
+
 #[cfg(libei)]
 mod libei;
 
