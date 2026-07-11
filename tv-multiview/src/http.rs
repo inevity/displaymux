@@ -616,7 +616,7 @@ mod tests {
 
     async fn ready_app() -> (Router, CoordinatorHandle, coordinator::EffectReceivers) {
         let (handle, effects, _) =
-            coordinator::spawn(ProtocolState::new(Host::Linux), TIMING, 8, 4);
+            coordinator::spawn(ProtocolState::new(Host::Linux, 32), TIMING, 8, 4);
         handle
             .apply_safety(Event::TransportSynchronized {
                 mode: TvMode::Fullscreen,

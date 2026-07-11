@@ -432,7 +432,7 @@ pub fn apply(
             lease_id,
             lease_epoch,
         } => {
-            if let Some(committed) = next.last_request.as_ref().filter(|request| {
+            if let Some(committed) = next.request_history.iter().rev().find(|request| {
                 request.request_id == request_id && request.status == RequestStatus::Committed
             }) {
                 if committed.request_epoch == request_epoch
@@ -502,11 +502,11 @@ pub fn apply(
                     next.phase = ProtocolPhase::RemoteOwned;
                     next.next_signal_poll_ms = Some(now_ms.saturating_add(timing.signal_poll_ms));
                 }
-                next.last_request = Some(request);
+                next.archive_request(request);
             }
         }
         Event::Cancel { request_id, reason } => {
-            if next.last_request.as_ref().is_some_and(|request| {
+            if next.request_history.iter().rev().any(|request| {
                 request.request_id == request_id && request.status == RequestStatus::Cancelled
             }) {
                 return validated(next, effects, now_ms);
@@ -516,14 +516,11 @@ pub fn apply(
                 .as_ref()
                 .is_some_and(|session| session.request_id == request_id)
             {
-                let mut request = next
-                    .last_request
-                    .take()
-                    .filter(|request| request.request_id == request_id)
+                let request = next
+                    .archived_request_mut(&request_id)
                     .ok_or(ProtocolError::RequestNotFound)?;
                 request.status = RequestStatus::Cancelled;
                 request.reason = Some(reason.clone());
-                next.last_request = Some(request);
                 begin_fallback(&mut next, &mut effects, now_ms, timing, &reason);
             } else {
                 let request = next
@@ -537,7 +534,7 @@ pub fn apply(
                 let mut request = next.active_request.take().expect("checked request");
                 request.status = RequestStatus::Cancelled;
                 request.reason = Some(reason.clone());
-                next.last_request = Some(request);
+                next.archive_request(request);
                 if tv_may_have_changed {
                     begin_fallback(&mut next, &mut effects, now_ms, timing, &reason);
                 } else {
@@ -648,7 +645,7 @@ pub fn apply(
                     let mut request = next.active_request.take().expect("active request");
                     request.status = RequestStatus::Expired;
                     request.reason = Some("request_deadline".to_string());
-                    next.last_request = Some(request);
+                    next.archive_request(request);
                     if waking {
                         next.phase = ProtocolPhase::Idle;
                         next.phase_deadline_ms = None;
@@ -798,7 +795,7 @@ fn begin_fallback(
     if let Some(mut request) = state.active_request.take() {
         request.status = RequestStatus::Fallback;
         request.reason = Some(reason.to_string());
-        state.last_request = Some(request);
+        state.archive_request(request);
     }
     if state.daemon_healthy() {
         issue_fallback_command(state, effects, now_ms, timing);
@@ -949,7 +946,11 @@ mod tests {
     }
 
     fn synchronized() -> ProtocolState {
-        let state = ProtocolState::new(Host::Linux);
+        synchronized_with_limit(32)
+    }
+
+    fn synchronized_with_limit(retained_request_limit: usize) -> ProtocolState {
+        let state = ProtocolState::new(Host::Linux, retained_request_limit);
         apply(
             &state,
             Event::TransportSynchronized {
@@ -962,6 +963,26 @@ mod tests {
         )
         .unwrap()
         .next
+    }
+
+    fn archived_request(request_id: &str, request_epoch: u64) -> EnterRequest {
+        EnterRequest {
+            request_id: request_id.to_string(),
+            client_id: "hub".to_string(),
+            target: Host::Mac,
+            request_epoch,
+            lease: LeaseIdentity {
+                lease_id: format!("lease-{request_id}"),
+                lease_epoch: request_epoch,
+                peer_session_epoch: 11,
+                expires_at_ms: 1_000,
+            },
+            status: RequestStatus::Cancelled,
+            switch_epoch: None,
+            grant: None,
+            deadline_ms: 100,
+            reason: Some("test".to_string()),
+        }
     }
 
     fn ready_peer(state: &ProtocolState, host: Host, session_epoch: u64) -> ProtocolState {
@@ -1009,7 +1030,7 @@ mod tests {
 
     #[test]
     fn startup_is_local_and_not_ready_until_server_is_observed() {
-        let state = ProtocolState::new(Host::Linux);
+        let state = ProtocolState::new(Host::Linux, 32);
         assert_eq!(state.keyboard_owner, Host::Linux);
         assert_eq!(state.pointer_owner, Host::Linux);
         assert!(state.fallback_required);
@@ -1017,8 +1038,60 @@ mod tests {
     }
 
     #[test]
+    fn retained_request_id_remains_idempotent_after_newer_request() {
+        let mut state = synchronized_with_limit(2);
+        let first = archived_request("request-old", 1);
+        state.archive_request(first.clone());
+        state.archive_request(archived_request("request-new", 2));
+
+        let duplicate = apply(
+            &state,
+            Event::CreateEnter {
+                request_id: first.request_id.clone(),
+                client_id: first.client_id.clone(),
+                target: first.target,
+                lease: first.lease.clone(),
+            },
+            10,
+            TIMING,
+        )
+        .unwrap();
+        assert_eq!(duplicate.next, state);
+        assert!(duplicate.effects.is_empty());
+
+        let conflict = apply(
+            &state,
+            Event::CreateEnter {
+                request_id: first.request_id,
+                client_id: "different-client".to_string(),
+                target: first.target,
+                lease: first.lease,
+            },
+            10,
+            TIMING,
+        );
+        assert!(matches!(
+            conflict,
+            Err(ProtocolError::RequestIdentityConflict)
+        ));
+    }
+
+    #[test]
+    fn request_history_evicts_oldest_at_configured_bound() {
+        let mut state = synchronized_with_limit(2);
+        state.archive_request(archived_request("request-1", 1));
+        state.archive_request(archived_request("request-2", 2));
+        state.archive_request(archived_request("request-3", 3));
+
+        assert!(state.request("request-1").is_none());
+        assert!(state.request("request-2").is_some());
+        assert!(state.request("request-3").is_some());
+        assert_eq!(state.request_history.len(), 2);
+    }
+
+    #[test]
     fn synchronized_wrong_input_commands_server_without_fabricating_observation() {
-        let state = ProtocolState::new(Host::Linux);
+        let state = ProtocolState::new(Host::Linux, 32);
         let transition = apply(
             &state,
             Event::TransportSynchronized {
@@ -1208,7 +1281,7 @@ mod tests {
         assert_eq!(cancelled.next.pointer_owner, Host::Linux);
         assert!(cancelled.next.active_session.is_none());
         assert_eq!(
-            cancelled.next.last_request.as_ref().unwrap().status,
+            cancelled.next.request_history.back().unwrap().status,
             RequestStatus::Cancelled
         );
         assert!(matches!(

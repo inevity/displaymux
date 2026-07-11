@@ -358,7 +358,7 @@ fn log_transition(
     let request = state
         .active_request
         .as_ref()
-        .or(state.last_request.as_ref());
+        .or(state.request_history.back());
     let lease = request
         .map(|request| &request.lease)
         .or_else(|| state.active_session.as_ref().map(|session| &session.lease));
@@ -483,7 +483,7 @@ mod tests {
 
     #[tokio::test]
     async fn publishes_coherent_snapshot_after_transition() {
-        let (handle, _, task) = spawn(ProtocolState::new(Host::Linux), TIMING, 4, 2);
+        let (handle, _, task) = spawn(ProtocolState::new(Host::Linux, 32), TIMING, 4, 2);
         let snapshot = handle.apply_safety(synchronized_event()).await.unwrap();
         assert!(snapshot.ready());
         assert_eq!(snapshot.keyboard_owner, snapshot.pointer_owner);
@@ -493,7 +493,7 @@ mod tests {
 
     #[tokio::test]
     async fn effect_channel_is_bounded_and_observable() {
-        let (handle, mut effects, task) = spawn(ProtocolState::new(Host::Linux), TIMING, 1, 1);
+        let (handle, mut effects, task) = spawn(ProtocolState::new(Host::Linux, 32), TIMING, 1, 1);
         handle.apply_safety(synchronized_event()).await.unwrap();
         handle
             .apply_safety(Event::PeerReadinessUpdated {

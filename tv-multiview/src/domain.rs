@@ -1,5 +1,9 @@
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeMap, fmt, str::FromStr};
+use std::{
+    collections::{BTreeMap, VecDeque},
+    fmt,
+    str::FromStr,
+};
 use thiserror::Error;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -196,7 +200,8 @@ pub struct ProtocolState {
     pub keyboard_owner: Host,
     pub pointer_owner: Host,
     pub active_request: Option<EnterRequest>,
-    pub last_request: Option<EnterRequest>,
+    pub request_history: VecDeque<EnterRequest>,
+    pub retained_request_limit: usize,
     pub active_session: Option<ActiveSession>,
     pub pending_multiview: Option<bool>,
     pub observation_in_flight: Option<u64>,
@@ -210,7 +215,11 @@ pub struct ProtocolState {
 }
 
 impl ProtocolState {
-    pub fn new(server_host: Host) -> Self {
+    pub fn new(server_host: Host, retained_request_limit: usize) -> Self {
+        assert!(
+            retained_request_limit > 0,
+            "request history must be bounded"
+        );
         let input_signal = Host::ALL
             .into_iter()
             .map(|host| (host, SignalObservation::default()))
@@ -237,7 +246,8 @@ impl ProtocolState {
             keyboard_owner: server_host,
             pointer_owner: server_host,
             active_request: None,
-            last_request: None,
+            request_history: VecDeque::with_capacity(retained_request_limit),
+            retained_request_limit,
             active_session: None,
             pending_multiview: None,
             observation_in_flight: None,
@@ -266,10 +276,32 @@ impl ProtocolState {
             .as_ref()
             .filter(|request| request.request_id == request_id)
             .or_else(|| {
-                self.last_request
-                    .as_ref()
-                    .filter(|request| request.request_id == request_id)
+                self.request_history
+                    .iter()
+                    .rev()
+                    .find(|request| request.request_id == request_id)
             })
+    }
+
+    pub(crate) fn archived_request_mut(&mut self, request_id: &str) -> Option<&mut EnterRequest> {
+        self.request_history
+            .iter_mut()
+            .rev()
+            .find(|request| request.request_id == request_id)
+    }
+
+    pub(crate) fn archive_request(&mut self, request: EnterRequest) {
+        if let Some(position) = self
+            .request_history
+            .iter()
+            .position(|existing| existing.request_id == request.request_id)
+        {
+            self.request_history.remove(position);
+        }
+        while self.request_history.len() >= self.retained_request_limit {
+            self.request_history.pop_front();
+        }
+        self.request_history.push_back(request);
     }
 
     pub fn next_deadline_ms(&self) -> Option<u64> {
