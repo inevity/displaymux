@@ -2,7 +2,14 @@ use crate::{
     domain::ProtocolState,
     protocol::{self, Effect, Event, ProtocolError, ProtocolTiming},
 };
-use std::{sync::Arc, time::Duration};
+use serde::Serialize;
+use std::{
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
 use thiserror::Error;
 use tokio::{
     sync::{mpsc, oneshot, watch},
@@ -21,6 +28,8 @@ pub struct CoordinatorHandle {
     ordinary_tx: mpsc::Sender<Request>,
     safety_tx: mpsc::Sender<Request>,
     snapshot_rx: watch::Receiver<Arc<ProtocolState>>,
+    ordinary_effect_queue: QueueGauge,
+    safety_effect_queue: QueueGauge,
     started: Instant,
 }
 
@@ -75,6 +84,100 @@ impl CoordinatorHandle {
     pub fn now_ms(&self) -> u64 {
         monotonic_ms(self.started)
     }
+
+    pub fn queue_snapshot(&self) -> CoordinatorQueueSnapshot {
+        CoordinatorQueueSnapshot {
+            ordinary_commands: sender_queue_snapshot(&self.ordinary_tx),
+            safety_commands: sender_queue_snapshot(&self.safety_tx),
+            ordinary_effects: self.ordinary_effect_queue.snapshot(),
+            safety_effects: self.safety_effect_queue.snapshot(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct QueueSnapshot {
+    pub depth: usize,
+    pub capacity: usize,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct CoordinatorQueueSnapshot {
+    pub ordinary_commands: QueueSnapshot,
+    pub safety_commands: QueueSnapshot,
+    pub ordinary_effects: QueueSnapshot,
+    pub safety_effects: QueueSnapshot,
+}
+
+#[derive(Clone)]
+struct QueueGauge {
+    depth: Arc<AtomicUsize>,
+    capacity: usize,
+}
+
+#[derive(Clone)]
+struct TrackedEffectSender {
+    sender: mpsc::Sender<Effect>,
+    queue: QueueGauge,
+}
+
+impl TrackedEffectSender {
+    fn try_send(&self, effect: Effect) -> Result<(), mpsc::error::TrySendError<Effect>> {
+        self.queue.begin_send();
+        if let Err(error) = self.sender.try_send(effect) {
+            self.queue.cancel_send();
+            return Err(error);
+        }
+        Ok(())
+    }
+}
+
+struct EffectSenders {
+    ordinary: TrackedEffectSender,
+    safety: TrackedEffectSender,
+}
+
+struct CoordinatorRuntime {
+    ordinary_rx: mpsc::Receiver<Request>,
+    safety_rx: mpsc::Receiver<Request>,
+    effects: EffectSenders,
+    snapshot_tx: watch::Sender<Arc<ProtocolState>>,
+    started: Instant,
+}
+
+impl QueueGauge {
+    fn new(capacity: usize) -> Self {
+        Self {
+            depth: Arc::new(AtomicUsize::new(0)),
+            capacity,
+        }
+    }
+
+    fn begin_send(&self) {
+        self.depth.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn cancel_send(&self) {
+        self.depth.fetch_sub(1, Ordering::Relaxed);
+    }
+
+    fn received(&self) {
+        self.depth.fetch_sub(1, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> QueueSnapshot {
+        QueueSnapshot {
+            depth: self.depth.load(Ordering::Relaxed),
+            capacity: self.capacity,
+        }
+    }
+}
+
+fn sender_queue_snapshot<T>(sender: &mpsc::Sender<T>) -> QueueSnapshot {
+    QueueSnapshot {
+        depth: sender.max_capacity().saturating_sub(sender.capacity()),
+        capacity: sender.max_capacity(),
+    }
 }
 
 #[derive(Debug, Error)]
@@ -88,8 +191,30 @@ pub enum CoordinatorError {
 }
 
 pub struct EffectReceivers {
-    pub ordinary: mpsc::Receiver<Effect>,
-    pub safety: mpsc::Receiver<Effect>,
+    pub(crate) ordinary: TrackedEffectReceiver,
+    pub(crate) safety: TrackedEffectReceiver,
+}
+
+pub(crate) struct TrackedEffectReceiver {
+    receiver: mpsc::Receiver<Effect>,
+    queue: QueueGauge,
+}
+
+impl TrackedEffectReceiver {
+    pub async fn recv(&mut self) -> Option<Effect> {
+        let effect = self.receiver.recv().await;
+        if effect.is_some() {
+            self.queue.received();
+        }
+        effect
+    }
+
+    #[cfg(test)]
+    fn try_recv(&mut self) -> Result<Effect, mpsc::error::TryRecvError> {
+        let effect = self.receiver.try_recv()?;
+        self.queue.received();
+        Ok(effect)
+    }
 }
 
 pub fn spawn(
@@ -102,6 +227,8 @@ pub fn spawn(
     let (safety_tx, safety_rx) = mpsc::channel(safety_capacity);
     let (ordinary_effect_tx, ordinary_effect_rx) = mpsc::channel(command_capacity);
     let (safety_effect_tx, safety_effect_rx) = mpsc::channel(safety_capacity);
+    let ordinary_effect_queue = QueueGauge::new(command_capacity);
+    let safety_effect_queue = QueueGauge::new(safety_capacity);
     let initial = Arc::new(initial);
     let (snapshot_tx, snapshot_rx) = watch::channel(initial.clone());
     let started = Instant::now();
@@ -109,53 +236,65 @@ pub fn spawn(
         ordinary_tx,
         safety_tx,
         snapshot_rx,
+        ordinary_effect_queue: ordinary_effect_queue.clone(),
+        safety_effect_queue: safety_effect_queue.clone(),
         started,
     };
     let task = tokio::spawn(run(
         (*initial).clone(),
         timing,
-        ordinary_rx,
-        safety_rx,
-        ordinary_effect_tx,
-        safety_effect_tx,
-        snapshot_tx,
-        started,
+        CoordinatorRuntime {
+            ordinary_rx,
+            safety_rx,
+            effects: EffectSenders {
+                ordinary: TrackedEffectSender {
+                    sender: ordinary_effect_tx,
+                    queue: ordinary_effect_queue.clone(),
+                },
+                safety: TrackedEffectSender {
+                    sender: safety_effect_tx,
+                    queue: safety_effect_queue.clone(),
+                },
+            },
+            snapshot_tx,
+            started,
+        },
     ));
     (
         handle,
         EffectReceivers {
-            ordinary: ordinary_effect_rx,
-            safety: safety_effect_rx,
+            ordinary: TrackedEffectReceiver {
+                receiver: ordinary_effect_rx,
+                queue: ordinary_effect_queue,
+            },
+            safety: TrackedEffectReceiver {
+                receiver: safety_effect_rx,
+                queue: safety_effect_queue,
+            },
         },
         task,
     )
 }
 
-async fn run(
-    mut state: ProtocolState,
-    timing: ProtocolTiming,
-    mut ordinary_rx: mpsc::Receiver<Request>,
-    mut safety_rx: mpsc::Receiver<Request>,
-    ordinary_effect_tx: mpsc::Sender<Effect>,
-    safety_effect_tx: mpsc::Sender<Effect>,
-    snapshot_tx: watch::Sender<Arc<ProtocolState>>,
-    started: Instant,
-) {
+async fn run(mut state: ProtocolState, timing: ProtocolTiming, mut runtime: CoordinatorRuntime) {
     loop {
-        let timer = deadline_sleep(&state, started);
+        let timer = deadline_sleep(&state, runtime.started);
         tokio::pin!(timer);
         let request = tokio::select! {
             biased;
-            request = safety_rx.recv() => request,
-            request = ordinary_rx.recv() => request,
+            request = runtime.safety_rx.recv() => request,
+            request = runtime.ordinary_rx.recv() => request,
             _ = &mut timer => Some(Request { event: Event::Tick, response: None }),
         };
         let Some(request) = request else {
             break;
         };
-        let now_ms = monotonic_ms(started);
+        let now_ms = monotonic_ms(runtime.started);
+        let event = request.event;
+        let event_name = event.name();
+        let latency_ms = event_latency_ms(&state, &event, now_ms, timing);
         let previous_phase = state.phase;
-        let result = protocol::apply(&state, request.event, now_ms, timing);
+        let result = protocol::apply(&state, event, now_ms, timing);
         match result {
             Ok(transition) => {
                 state = transition.next;
@@ -164,32 +303,26 @@ async fn run(
                     transition.effects,
                     now_ms,
                     timing,
-                    &ordinary_effect_tx,
-                    &safety_effect_tx,
+                    &runtime.effects,
                 );
-                if previous_phase != state.phase {
-                    info!(
-                        event = "protocol_transition",
-                        from = ?previous_phase,
-                        to = ?state.phase,
-                        request_epoch = state.request_epoch,
-                        switch_epoch = state.switch_epoch,
-                        keyboard_owner = %state.keyboard_owner,
-                        pointer_owner = %state.pointer_owner,
-                        fallback_required = state.fallback_required,
-                    );
-                }
+                log_transition(event_name, previous_phase, &state, now_ms, latency_ms);
                 let snapshot = Arc::new(state.clone());
-                snapshot_tx.send_replace(snapshot.clone());
+                runtime.snapshot_tx.send_replace(snapshot.clone());
                 if let Some(response) = request.response {
                     let _ = response.send(Ok(snapshot));
                 }
             }
             Err(protocol_error) => {
+                warn!(
+                    event = "protocol_event_rejected",
+                    trigger = event_name,
+                    phase = ?state.phase,
+                    request_epoch = state.request_epoch,
+                    switch_epoch = state.switch_epoch,
+                    error = %protocol_error,
+                );
                 if let Some(response) = request.response {
                     let _ = response.send(Err(protocol_error));
-                } else {
-                    warn!(error = %protocol_error, "coordinator event rejected");
                 }
             }
         }
@@ -197,18 +330,87 @@ async fn run(
     info!(event = "coordinator_stopped");
 }
 
+fn event_latency_ms(
+    state: &ProtocolState,
+    event: &Event,
+    now_ms: u64,
+    timing: ProtocolTiming,
+) -> Option<u64> {
+    let expected_duration = match event {
+        Event::CommandAcknowledged { .. }
+        | Event::CommandFailed { .. }
+        | Event::MultiViewAcknowledged { .. } => timing.command_ms,
+        Event::Observation { .. } => timing.observation_ms,
+        _ => return None,
+    };
+    state
+        .phase_deadline_ms
+        .map(|deadline| now_ms.saturating_sub(deadline.saturating_sub(expected_duration)))
+}
+
+fn log_transition(
+    trigger: &'static str,
+    previous_phase: crate::domain::ProtocolPhase,
+    state: &ProtocolState,
+    now_ms: u64,
+    latency_ms: Option<u64>,
+) {
+    let request = state
+        .active_request
+        .as_ref()
+        .or(state.last_request.as_ref());
+    let lease = request
+        .map(|request| &request.lease)
+        .or_else(|| state.active_session.as_ref().map(|session| &session.lease));
+    let grant = request.and_then(|request| request.grant.as_ref());
+    let observation_age_ms = state.observed_input.and_then(|host| {
+        state
+            .input_signal
+            .get(&host)
+            .filter(|observation| observation.observed_at_ms > 0)
+            .map(|observation| now_ms.saturating_sub(observation.observed_at_ms))
+    });
+    let deadline_remaining_ms = state
+        .next_deadline_ms()
+        .map(|deadline| deadline.saturating_sub(now_ms));
+    info!(
+        event = "protocol_transition",
+        trigger,
+        previous_phase = ?previous_phase,
+        next_phase = ?state.phase,
+        request_id = request.map(|request| request.request_id.as_str()).unwrap_or(""),
+        request_epoch = state.request_epoch,
+        switch_epoch = state.switch_epoch,
+        commanded_input = state.commanded_input.map(|host| host.as_str()).unwrap_or("unknown"),
+        observed_input = state.observed_input.map(|host| host.as_str()).unwrap_or("unknown"),
+        keyboard_owner = %state.keyboard_owner,
+        pointer_owner = %state.pointer_owner,
+        lease_id = lease.map(|lease| lease.lease_id.as_str()).unwrap_or(""),
+        lease_epoch = lease.map(|lease| lease.lease_epoch).unwrap_or(0),
+        grant_epoch = grant.map(|grant| grant.grant_epoch).unwrap_or(0),
+        observation_age_ms = observation_age_ms.unwrap_or(0),
+        latency_ms = latency_ms.unwrap_or(0),
+        deadline_remaining_ms = deadline_remaining_ms.unwrap_or(0),
+        fallback_required = state.fallback_required,
+        fallback_reason = state.fallback_reason.as_deref().unwrap_or(""),
+    );
+}
+
 fn dispatch_effects(
     state: &mut ProtocolState,
     effects: Vec<Effect>,
     now_ms: u64,
     timing: ProtocolTiming,
-    ordinary_tx: &mpsc::Sender<Effect>,
-    safety_tx: &mpsc::Sender<Effect>,
+    senders: &EffectSenders,
 ) {
     let mut pending = effects;
     while let Some(effect) = pending.pop() {
         let safety = matches!(effect, Effect::SetInput { fallback: true, .. });
-        let sender = if safety { safety_tx } else { ordinary_tx };
+        let sender = if safety {
+            &senders.safety
+        } else {
+            &senders.ordinary
+        };
         if let Err(send_error) = sender.try_send(effect.clone()) {
             if safety {
                 warn!(effect = ?effect, "safety effect queue full; deadline scheduler will retry");
@@ -246,24 +448,7 @@ fn monotonic_ms(started: Instant) -> u64 {
 }
 
 fn deadline_sleep(state: &ProtocolState, started: Instant) -> tokio::time::Sleep {
-    let mut deadlines = [
-        state.phase_deadline_ms,
-        state.next_signal_poll_ms,
-        state
-            .active_request
-            .as_ref()
-            .map(|request| request.deadline_ms),
-        state
-            .active_session
-            .as_ref()
-            .map(|session| session.renewed_until_ms.min(session.lease.expires_at_ms)),
-    ]
-    .into_iter()
-    .flatten();
-    match deadlines
-        .next()
-        .map(|first| deadlines.fold(first, u64::min))
-    {
+    match state.next_deadline_ms() {
         Some(deadline_ms) => tokio::time::sleep_until(started + Duration::from_millis(deadline_ms)),
         None => tokio::time::sleep(Duration::from_secs(24 * 60 * 60)),
     }
@@ -272,7 +457,7 @@ fn deadline_sleep(state: &ProtocolState, started: Instant) -> tokio::time::Sleep
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::{Host, TvMode};
+    use crate::domain::{Host, LeaseIdentity, PeerReadiness, TvMode};
     use std::collections::BTreeMap;
 
     const TIMING: ProtocolTiming = ProtocolTiming {
@@ -310,9 +495,38 @@ mod tests {
     async fn effect_channel_is_bounded_and_observable() {
         let (handle, mut effects, task) = spawn(ProtocolState::new(Host::Linux), TIMING, 1, 1);
         handle.apply_safety(synchronized_event()).await.unwrap();
-        let snapshot = handle.snapshot();
-        assert!(snapshot.ready());
-        assert!(effects.ordinary.try_recv().is_err());
+        handle
+            .apply_safety(Event::PeerReadinessUpdated {
+                host: Host::Mac,
+                readiness: PeerReadiness {
+                    online: true,
+                    keyboard_ready: true,
+                    pointer_ready: true,
+                    session_epoch: 7,
+                    observed_at_ms: handle.now_ms(),
+                },
+            })
+            .await
+            .unwrap();
+        let now_ms = handle.now_ms();
+        handle
+            .apply(Event::CreateEnter {
+                request_id: "request-1".to_string(),
+                client_id: "client-1".to_string(),
+                target: Host::Mac,
+                lease: LeaseIdentity {
+                    lease_id: "lease-1".to_string(),
+                    lease_epoch: 1,
+                    peer_session_epoch: 7,
+                    expires_at_ms: now_ms + 1_000,
+                },
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(handle.queue_snapshot().ordinary_effects.depth, 1);
+        assert!(effects.ordinary.try_recv().is_ok());
+        assert_eq!(handle.queue_snapshot().ordinary_effects.depth, 0);
         task.abort();
     }
 }

@@ -1,6 +1,7 @@
 use crate::{
-    coordinator::{CoordinatorError, CoordinatorHandle},
-    domain::{Host, LeaseIdentity, PeerReadiness, ProtocolState, RequestStatus},
+    coordinator::{CoordinatorError, CoordinatorHandle, CoordinatorQueueSnapshot},
+    domain::{Host, LeaseIdentity, PeerReadiness, ProtocolPhase, ProtocolState, RequestStatus},
+    observability::{RuntimeMetrics, RuntimeSnapshot},
     protocol::{Event, ProtocolError},
 };
 use axum::{
@@ -24,12 +25,14 @@ struct AppState {
     snapshot_rx: watch::Receiver<Arc<ProtocolState>>,
     controller_token: Arc<str>,
     max_lease_ms: u64,
+    runtime_metrics: RuntimeMetrics,
 }
 
 pub fn router(
     coordinator: CoordinatorHandle,
     controller_token: String,
     max_lease_ms: u64,
+    runtime_metrics: RuntimeMetrics,
 ) -> Router {
     let snapshot_rx = coordinator.subscribe();
     let state = Arc::new(AppState {
@@ -37,6 +40,7 @@ pub fn router(
         snapshot_rx,
         controller_token: controller_token.into(),
         max_lease_ms,
+        runtime_metrics,
     });
     let protected = Router::new()
         .route("/ready", get(ready))
@@ -106,11 +110,51 @@ async fn status(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Respo
     if let Err(response) = authorize(&headers, &state.controller_token) {
         return response;
     }
+    let now_ms = state.coordinator.now_ms();
+    let mut protocol = (*state.snapshot_rx.borrow()).as_ref().clone();
+    let runtime = state.runtime_metrics.snapshot();
+    protocol.dropped_logs = runtime.dropped_logs;
+    let observation_age_ms = protocol.observed_input.and_then(|host| {
+        protocol
+            .input_signal
+            .get(&host)
+            .filter(|observation| observation.observed_at_ms > 0)
+            .map(|observation| now_ms.saturating_sub(observation.observed_at_ms))
+    });
+    let deadline_remaining_ms = protocol
+        .next_deadline_ms()
+        .map(|deadline| deadline.saturating_sub(now_ms));
+    let in_flight_operation = in_flight_operation(&protocol);
     Json(ApiEnvelope::new(
-        state.coordinator.now_ms(),
-        (*state.snapshot_rx.borrow()).as_ref().clone(),
+        now_ms,
+        StatusResponse {
+            protocol,
+            uptime_ms: now_ms,
+            queues: state.coordinator.queue_snapshot(),
+            runtime,
+            observation_age_ms,
+            deadline_remaining_ms,
+            in_flight_operation,
+        },
     ))
     .into_response()
+}
+
+fn in_flight_operation(state: &ProtocolState) -> Option<&'static str> {
+    if state.observation_in_flight.is_some() {
+        return Some("observe");
+    }
+    match state.phase {
+        ProtocolPhase::Waking => Some("wake"),
+        ProtocolPhase::Switching | ProtocolPhase::FallbackCommandPending => Some("set_input"),
+        ProtocolPhase::FallbackVerifying => Some("verify_fallback"),
+        ProtocolPhase::MultiviewChanging => Some("set_multiview"),
+        ProtocolPhase::Starting
+        | ProtocolPhase::Idle
+        | ProtocolPhase::GrantPending
+        | ProtocolPhase::RemoteOwned
+        | ProtocolPhase::FallbackDeferred => None,
+    }
 }
 
 async fn create_enter(
@@ -505,6 +549,18 @@ struct ReadyResponse {
 }
 
 #[derive(Debug, Serialize)]
+struct StatusResponse {
+    #[serde(flatten)]
+    protocol: ProtocolState,
+    uptime_ms: u64,
+    queues: CoordinatorQueueSnapshot,
+    runtime: RuntimeSnapshot,
+    observation_age_ms: Option<u64>,
+    deadline_remaining_ms: Option<u64>,
+    in_flight_operation: Option<&'static str>,
+}
+
+#[derive(Debug, Serialize)]
 struct RenewResponse {
     renewed: bool,
     renewed_until_ms: Option<u64>,
@@ -587,7 +643,12 @@ mod tests {
             .await
             .unwrap();
         (
-            router(handle.clone(), "test-token".to_string(), 500),
+            router(
+                handle.clone(),
+                "test-token".to_string(),
+                500,
+                RuntimeMetrics::default(),
+            ),
             handle,
             effects,
         )
@@ -784,9 +845,11 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(status_response.status(), StatusCode::OK);
-        assert_eq!(
-            body_json(status_response).await["data"]["keyboard_owner"],
-            "linux"
-        );
+        let body = body_json(status_response).await;
+        assert_eq!(body["data"]["keyboard_owner"], "linux");
+        assert_eq!(body["data"]["queues"]["ordinary_commands"]["depth"], 0);
+        assert_eq!(body["data"]["runtime"]["dropped_logs"], 0);
+        assert_eq!(body["data"]["runtime"]["retry_alert"], false);
+        assert!(body["data"]["uptime_ms"].is_number());
     }
 }

@@ -3,6 +3,7 @@ use crate::{
     config::DaemonConfig,
     coordinator::{CoordinatorHandle, EffectReceivers},
     domain::{Host, TvMode},
+    observability::RuntimeMetrics,
     protocol::{Effect, Event},
 };
 use futures_util::{SinkExt, StreamExt};
@@ -23,15 +24,52 @@ use tracing::{debug, error, info, warn};
 
 type TvSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
+#[derive(Debug)]
+struct ReconnectBackoff {
+    initial_ms: u64,
+    max_ms: u64,
+    next_ms: u64,
+    consecutive_failures: u64,
+}
+
+impl ReconnectBackoff {
+    fn new(initial_ms: u64, max_ms: u64) -> Self {
+        Self {
+            initial_ms,
+            max_ms,
+            next_ms: initial_ms,
+            consecutive_failures: 0,
+        }
+    }
+
+    fn failed(&mut self) -> (u64, u64) {
+        let delay_ms = self.next_ms;
+        self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+        self.next_ms = self.next_ms.saturating_mul(2).min(self.max_ms);
+        (delay_ms, self.consecutive_failures)
+    }
+
+    fn synchronized(&mut self) {
+        self.next_ms = self.initial_ms;
+        self.consecutive_failures = 0;
+    }
+}
+
 pub fn spawn(
     config: DaemonConfig,
     coordinator: CoordinatorHandle,
     effects: EffectReceivers,
+    runtime_metrics: RuntimeMetrics,
 ) -> JoinHandle<()> {
-    tokio::spawn(run(config, coordinator, effects))
+    tokio::spawn(run(config, coordinator, effects, runtime_metrics))
 }
 
-async fn run(config: DaemonConfig, coordinator: CoordinatorHandle, mut effects: EffectReceivers) {
+async fn run(
+    config: DaemonConfig,
+    coordinator: CoordinatorHandle,
+    mut effects: EffectReceivers,
+    runtime_metrics: RuntimeMetrics,
+) {
     let client_key = match key_store::load_client_key(&config.client_key_path, config.tv_ip) {
         Ok(client_key) => client_key,
         Err(key_error) => {
@@ -45,22 +83,46 @@ async fn run(config: DaemonConfig, coordinator: CoordinatorHandle, mut effects: 
         }
     };
 
-    let mut backoff_ms = config.timeouts.reconnect_initial_ms;
+    let mut backoff = ReconnectBackoff::new(
+        config.timeouts.reconnect_initial_ms,
+        config.timeouts.reconnect_max_ms,
+    );
     loop {
         let _ = coordinator.notify_safety(Event::TransportConnecting).await;
-        match connect_and_run(&config, &client_key, &coordinator, &mut effects).await {
+        match connect_and_run(
+            &config,
+            &client_key,
+            &coordinator,
+            &mut effects,
+            &mut backoff,
+            &runtime_metrics,
+        )
+        .await
+        {
             Ok(()) => return,
             Err(session_error) => {
-                warn!(error = %session_error, retry_ms = backoff_ms, "SSAP session ended");
+                let (retry_ms, consecutive_failures) = backoff.failed();
+                let retry_alert =
+                    consecutive_failures >= config.limits.reconnect_alert_after as u64;
+                runtime_metrics.record_reconnect_failure(
+                    consecutive_failures,
+                    retry_ms,
+                    config.limits.reconnect_alert_after as u64,
+                );
+                warn!(
+                    event = "ssap_disconnected",
+                    error = %session_error,
+                    retry_ms,
+                    consecutive_failures,
+                    retry_alert,
+                    "SSAP session ended"
+                );
                 let _ = coordinator
                     .notify_safety(Event::TransportDisconnected {
                         reason: session_error.public_reason().to_string(),
                     })
                     .await;
-                tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
-                backoff_ms = backoff_ms
-                    .saturating_mul(2)
-                    .min(config.timeouts.reconnect_max_ms);
+                tokio::time::sleep(Duration::from_millis(retry_ms)).await;
             }
         }
     }
@@ -71,6 +133,8 @@ async fn connect_and_run(
     client_key: &str,
     coordinator: &CoordinatorHandle,
     effects: &mut EffectReceivers,
+    backoff: &mut ReconnectBackoff,
+    runtime_metrics: &RuntimeMetrics,
 ) -> Result<(), SsapError> {
     let tls = native_tls::TlsConnector::builder()
         .danger_accept_invalid_certs(true)
@@ -117,6 +181,8 @@ async fn connect_and_run(
         })
         .await
         .map_err(|_| SsapError::CoordinatorClosed)?;
+    backoff.synchronized();
+    runtime_metrics.record_synchronized();
     info!(event = "ssap_synchronized", switch_epoch);
 
     let mut keepalive = tokio::time::interval(Duration::from_millis(config.timeouts.keepalive_ms));
@@ -493,5 +559,14 @@ mod tests {
             parse_mac("01:23:45"),
             Err(SsapError::InvalidMacAddress)
         ));
+    }
+
+    #[test]
+    fn reconnect_backoff_resets_after_a_synchronized_session() {
+        let mut backoff = ReconnectBackoff::new(1_000, 60_000);
+        assert_eq!(backoff.failed(), (1_000, 1));
+        assert_eq!(backoff.failed(), (2_000, 2));
+        backoff.synchronized();
+        assert_eq!(backoff.failed(), (1_000, 1));
     }
 }

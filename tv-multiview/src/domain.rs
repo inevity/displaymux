@@ -272,6 +272,22 @@ impl ProtocolState {
             })
     }
 
+    pub fn next_deadline_ms(&self) -> Option<u64> {
+        [
+            self.phase_deadline_ms,
+            self.next_signal_poll_ms,
+            self.active_request
+                .as_ref()
+                .map(|request| request.deadline_ms),
+            self.active_session
+                .as_ref()
+                .map(|session| session.renewed_until_ms.min(session.lease.expires_at_ms)),
+        ]
+        .into_iter()
+        .flatten()
+        .min()
+    }
+
     pub fn validate(&self, now_ms: u64) -> Result<(), InvariantViolation> {
         if self.keyboard_owner != self.pointer_owner {
             return Err(InvariantViolation::SplitInputOwnership);

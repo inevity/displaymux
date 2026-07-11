@@ -65,6 +65,7 @@ pub struct Limits {
     pub command_queue: usize,
     pub safety_queue: usize,
     pub retained_requests: usize,
+    pub reconnect_alert_after: usize,
 }
 
 impl Default for Limits {
@@ -73,6 +74,7 @@ impl Default for Limits {
             command_queue: 64,
             safety_queue: 16,
             retained_requests: 32,
+            reconnect_alert_after: 10,
         }
     }
 }
@@ -135,6 +137,7 @@ impl DaemonConfig {
             ("command_queue", self.limits.command_queue),
             ("safety_queue", self.limits.safety_queue),
             ("retained_requests", self.limits.retained_requests),
+            ("reconnect_alert_after", self.limits.reconnect_alert_after),
         ] {
             if value == 0 {
                 return Err(ConfigError::ZeroLimit(name));
@@ -213,6 +216,16 @@ windows = "HDMI_2"
         assert!(matches!(
             config.validate(),
             Err(ConfigError::ZeroTimeout("grant_ms"))
+        ));
+    }
+
+    #[test]
+    fn rejects_zero_reconnect_alert_threshold() {
+        let mut config: DaemonConfig = toml::from_str(VALID).unwrap();
+        config.limits.reconnect_alert_after = 0;
+        assert!(matches!(
+            config.validate(),
+            Err(ConfigError::ZeroLimit("reconnect_alert_after"))
         ));
     }
 }

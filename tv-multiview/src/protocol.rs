@@ -84,6 +84,31 @@ pub enum Event {
     Shutdown,
 }
 
+impl Event {
+    pub const fn name(&self) -> &'static str {
+        match self {
+            Self::TransportConnecting => "transport_connecting",
+            Self::TransportRegistering => "transport_registering",
+            Self::TransportSubscribed => "transport_subscribed",
+            Self::TransportSynchronized { .. } => "transport_synchronized",
+            Self::TransportDisconnected { .. } => "transport_disconnected",
+            Self::PeerReadinessUpdated { .. } => "peer_readiness_updated",
+            Self::CreateEnter { .. } => "create_enter",
+            Self::CommandAcknowledged { .. } => "command_acknowledged",
+            Self::CommandFailed { .. } => "command_failed",
+            Self::Observation { .. } => "observation",
+            Self::Commit { .. } => "commit",
+            Self::Cancel { .. } => "cancel",
+            Self::Renew { .. } => "renew",
+            Self::MultiViewRequested { .. } => "multiview_requested",
+            Self::MultiViewAcknowledged { .. } => "multiview_acknowledged",
+            Self::SubscriptionObserved { .. } => "subscription_observed",
+            Self::Tick => "tick",
+            Self::Shutdown => "shutdown",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Effect {
     SetInput {
