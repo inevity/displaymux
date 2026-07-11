@@ -19,6 +19,8 @@ use std::{
 use thiserror::Error;
 use tokio::task::LocalSet;
 
+mod logging;
+
 #[derive(Debug, Error)]
 enum LanMouseError {
     #[error(transparent)]
@@ -43,7 +45,7 @@ enum LanMouseError {
 fn main() {
     // init logging
     let env = Env::default().filter_or("LAN_MOUSE_LOG_LEVEL", "info");
-    env_logger::init_from_env(env);
+    logging::init(env);
 
     if let Err(e) = run() {
         log::error!("{e}");
