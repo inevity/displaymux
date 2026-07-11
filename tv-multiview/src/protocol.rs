@@ -334,7 +334,8 @@ pub fn apply(
             if matches!(
                 next.phase,
                 ProtocolPhase::Switching | ProtocolPhase::FallbackCommandPending
-            ) {
+            ) && next.observation_in_flight.is_none()
+            {
                 next.phase = if next.fallback_required {
                     ProtocolPhase::FallbackVerifying
                 } else {
@@ -376,6 +377,9 @@ pub fn apply(
                 }
                 let target = request.target;
                 if target_display_verified(&next, target, switch_epoch) {
+                    if request.status == RequestStatus::Grant {
+                        return validated(next, effects, now_ms);
+                    }
                     if target != next.server_host {
                         let ready = next.peers.get(&target).is_some_and(|peer| {
                             peer.bundle_ready(request.lease.peer_session_epoch)
@@ -1192,6 +1196,77 @@ mod tests {
             observed.active_request.as_ref().unwrap().status,
             RequestStatus::Grant
         );
+    }
+
+    #[test]
+    fn duplicate_command_ack_does_not_queue_second_observation() {
+        let state = ready_peer(&synchronized(), Host::Mac, 11);
+        let switching = create_mac(&state).unwrap().next;
+        let switch_epoch = switching.switch_epoch;
+        let acknowledged = apply(
+            &switching,
+            Event::CommandAcknowledged {
+                switch_epoch,
+                target: Host::Mac,
+            },
+            11,
+            TIMING,
+        )
+        .unwrap();
+        assert_eq!(acknowledged.effects, vec![Effect::Observe { switch_epoch }]);
+        let deadline = acknowledged.next.phase_deadline_ms;
+
+        let duplicate = apply(
+            &acknowledged.next,
+            Event::CommandAcknowledged {
+                switch_epoch,
+                target: Host::Mac,
+            },
+            12,
+            TIMING,
+        )
+        .unwrap();
+        assert!(duplicate.effects.is_empty());
+        assert_eq!(duplicate.next.phase_deadline_ms, deadline);
+        assert_eq!(duplicate.next.observation_in_flight, Some(switch_epoch));
+    }
+
+    #[test]
+    fn duplicate_valid_observation_does_not_regenerate_grant() {
+        let state = ready_peer(&synchronized(), Host::Mac, 11);
+        let switching = create_mac(&state).unwrap().next;
+        let switch_epoch = switching.switch_epoch;
+        let observed = apply(
+            &switching,
+            Event::Observation {
+                switch_epoch,
+                mode: TvMode::Fullscreen,
+                input: Some(Host::Mac),
+                signals: signals(Host::Mac),
+            },
+            20,
+            TIMING,
+        )
+        .unwrap()
+        .next;
+        let grant = observed.active_request.as_ref().unwrap().grant.clone();
+        let grant_epoch = observed.grant_epoch;
+
+        let duplicate = apply(
+            &observed,
+            Event::Observation {
+                switch_epoch,
+                mode: TvMode::Fullscreen,
+                input: Some(Host::Mac),
+                signals: signals(Host::Mac),
+            },
+            21,
+            TIMING,
+        )
+        .unwrap();
+        assert!(duplicate.effects.is_empty());
+        assert_eq!(duplicate.next.grant_epoch, grant_epoch);
+        assert_eq!(duplicate.next.active_request.as_ref().unwrap().grant, grant);
     }
 
     #[test]
