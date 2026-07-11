@@ -211,8 +211,9 @@ impl Service {
                 self.remove_authorized_key(key);
                 self.save_config();
             }
-            FrontendRequest::UpdateEnterHook(handle, enter_hook) => {
-                self.update_enter_hook(handle, enter_hook)
+            FrontendRequest::UpdateSwitchTarget(handle, switch_target) => {
+                self.update_switch_target(handle, switch_target);
+                self.save_config();
             }
             FrontendRequest::SaveConfiguration => self.save_config(),
         }
@@ -228,7 +229,7 @@ impl Service {
                 port: c.port,
                 pos: c.pos,
                 active: s.active,
-                enter_hook: c.cmd,
+                switch_target: c.switch_target,
             })
             .collect();
         self.config.set_clients(clients);
@@ -596,8 +597,12 @@ impl Service {
         self.broadcast_client(handle);
     }
 
-    fn update_enter_hook(&mut self, handle: ClientHandle, enter_hook: Option<String>) {
-        self.client_manager.set_enter_hook(handle, enter_hook);
+    fn update_switch_target(
+        &mut self,
+        handle: ClientHandle,
+        switch_target: Option<lan_mouse_ipc::SwitchHost>,
+    ) {
+        self.client_manager.set_switch_target(handle, switch_target);
         self.broadcast_client(handle);
     }
 

@@ -26,13 +26,13 @@ impl ClientManager {
             .collect::<Vec<_>>()
     }
 
-    pub fn add_with_config(&self, config_client: ConfigClient) -> ClientHandle {
+    pub(crate) fn add_with_config(&self, config_client: ConfigClient) -> ClientHandle {
         let config = ClientConfig {
             hostname: config_client.hostname,
             fix_ips: config_client.ips.into_iter().collect(),
             port: config_client.port,
             pos: config_client.pos,
-            cmd: config_client.enter_hook,
+            switch_target: config_client.switch_target,
         };
         let state = ClientState {
             active: config_client.active,
@@ -229,10 +229,13 @@ impl ClientManager {
         }
     }
 
-    /// update the enter hook command of the client
-    pub(crate) fn set_enter_hook(&self, handle: ClientHandle, enter_hook: Option<String>) {
+    pub(crate) fn set_switch_target(
+        &self,
+        handle: ClientHandle,
+        switch_target: Option<lan_mouse_ipc::SwitchHost>,
+    ) {
         if let Some((c, _s)) = self.clients.borrow_mut().get_mut(handle as usize) {
-            c.cmd = enter_hook;
+            c.switch_target = switch_target;
         }
     }
 
@@ -243,12 +246,11 @@ impl ClientManager {
         }
     }
 
-    /// get the enter hook command
-    pub(crate) fn get_enter_cmd(&self, handle: ClientHandle) -> Option<String> {
+    pub(crate) fn switch_target(&self, handle: ClientHandle) -> Option<lan_mouse_ipc::SwitchHost> {
         self.clients
             .borrow()
             .get(handle as usize)
-            .and_then(|(c, _)| c.cmd.clone())
+            .and_then(|(c, _)| c.switch_target)
     }
 
     /// returns all clients that are currently registered

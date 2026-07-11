@@ -5,7 +5,7 @@ use std::{net::IpAddr, time::Duration};
 use thiserror::Error;
 
 use lan_mouse_ipc::{
-    ClientHandle, ConnectionError, FrontendEvent, FrontendRequest, IpcError, Position,
+    ClientHandle, ConnectionError, FrontendEvent, FrontendRequest, IpcError, Position, SwitchHost,
     connect_async,
 };
 
@@ -34,7 +34,7 @@ struct Client {
     #[arg(long)]
     ips: Option<Vec<IpAddr>>,
     #[arg(long)]
-    enter_hook: Option<String>,
+    switch_target: Option<SwitchHost>,
 }
 
 #[derive(Clone, Subcommand, Debug, PartialEq, Eq)]
@@ -60,6 +60,11 @@ enum CliSubcommand {
     SetPosition { id: ClientHandle, pos: Position },
     /// set ips
     SetIps { id: ClientHandle, ips: Vec<IpAddr> },
+    /// set the display/input host selected for this client
+    SetSwitchTarget {
+        id: ClientHandle,
+        target: Option<SwitchHost>,
+    },
     /// re-enable capture
     EnableCapture,
     /// re-enable emulation
@@ -87,7 +92,7 @@ async fn execute(cmd: CliSubcommand) -> Result<(), CliError> {
             hostname,
             port,
             ips,
-            enter_hook,
+            switch_target,
         }) => {
             tx.request(FrontendRequest::Create).await?;
             while let Some(e) = rx.next().await {
@@ -104,8 +109,8 @@ async fn execute(cmd: CliSubcommand) -> Result<(), CliError> {
                         tx.request(FrontendRequest::UpdateFixIps(handle, ips))
                             .await?;
                     }
-                    if let Some(enter_hook) = enter_hook {
-                        tx.request(FrontendRequest::UpdateEnterHook(handle, Some(enter_hook)))
+                    if let Some(target) = switch_target {
+                        tx.request(FrontendRequest::UpdateSwitchTarget(handle, Some(target)))
                             .await?;
                     }
                     break;
@@ -147,6 +152,10 @@ async fn execute(cmd: CliSubcommand) -> Result<(), CliError> {
         }
         CliSubcommand::SetIps { id, ips } => {
             tx.request(FrontendRequest::UpdateFixIps(id, ips)).await?
+        }
+        CliSubcommand::SetSwitchTarget { id, target } => {
+            tx.request(FrontendRequest::UpdateSwitchTarget(id, target))
+                .await?
         }
         CliSubcommand::EnableCapture => tx.request(FrontendRequest::EnableCapture).await?,
         CliSubcommand::EnableEmulation => tx.request(FrontendRequest::EnableEmulation).await?,

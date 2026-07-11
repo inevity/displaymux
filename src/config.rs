@@ -17,7 +17,7 @@ use toml;
 use toml_edit::{self, DocumentMut};
 
 use lan_mouse_cli::CliArgs;
-use lan_mouse_ipc::{DEFAULT_PORT, Position};
+use lan_mouse_ipc::{DEFAULT_PORT, Position, SwitchHost};
 
 use input_event::scancode::{
     self,
@@ -79,7 +79,7 @@ struct TomlClient {
     port: Option<u16>,
     position: Option<Position>,
     activate_on_startup: Option<bool>,
-    enter_hook: Option<String>,
+    switch_target: Option<SwitchHost>,
 }
 
 impl ConfigToml {
@@ -268,19 +268,19 @@ pub struct Config {
     watch_rx: tokio::sync::mpsc::Receiver<Result<notify::Event, notify::Error>>,
 }
 
-pub struct ConfigClient {
+pub(crate) struct ConfigClient {
     pub ips: HashSet<IpAddr>,
     pub hostname: Option<String>,
     pub port: u16,
     pub pos: Position,
     pub active: bool,
-    pub enter_hook: Option<String>,
+    pub switch_target: Option<SwitchHost>,
 }
 
 impl From<TomlClient> for ConfigClient {
     fn from(toml: TomlClient) -> Self {
         let active = toml.activate_on_startup.unwrap_or(false);
-        let enter_hook = toml.enter_hook;
+        let switch_target = toml.switch_target;
         let hostname = toml.hostname;
         let ips = HashSet::from_iter(toml.ips.into_iter().flatten());
         let port = toml.port.unwrap_or(DEFAULT_PORT);
@@ -291,7 +291,7 @@ impl From<TomlClient> for ConfigClient {
             port,
             pos,
             active,
-            enter_hook,
+            switch_target,
         }
     }
 }
@@ -310,7 +310,7 @@ impl From<ConfigClient> for TomlClient {
         };
         let position = Some(client.pos);
         let activate_on_startup = if client.active { Some(true) } else { None };
-        let enter_hook = client.enter_hook;
+        let switch_target = client.switch_target;
         Self {
             hostname,
             host_name,
@@ -318,7 +318,7 @@ impl From<ConfigClient> for TomlClient {
             port,
             position,
             activate_on_startup,
-            enter_hook,
+            switch_target,
         }
     }
 }
@@ -475,7 +475,7 @@ impl Config {
     }
 
     /// list of configured clients
-    pub fn clients(&self) -> Vec<ConfigClient> {
+    pub(crate) fn clients(&self) -> Vec<ConfigClient> {
         self.config_toml
             .as_ref()
             .map(|c| c.clients.clone())
@@ -495,7 +495,7 @@ impl Config {
     }
 
     /// set configured clients
-    pub fn set_clients(&mut self, clients: Vec<ConfigClient>) {
+    pub(crate) fn set_clients(&mut self, clients: Vec<ConfigClient>) {
         if clients.is_empty() {
             return;
         }

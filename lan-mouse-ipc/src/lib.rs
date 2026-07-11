@@ -128,6 +128,37 @@ impl TryFrom<&str> for Position {
     }
 }
 
+#[derive(Debug, Eq, PartialEq, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SwitchHost {
+    Linux,
+    Mac,
+    Windows,
+}
+
+impl std::fmt::Display for SwitchHost {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Linux => "linux",
+            Self::Mac => "mac",
+            Self::Windows => "windows",
+        })
+    }
+}
+
+impl std::str::FromStr for SwitchHost {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "linux" => Ok(Self::Linux),
+            "mac" => Ok(Self::Mac),
+            "windows" => Ok(Self::Windows),
+            _ => Err(format!("unknown switch host: {value}")),
+        }
+    }
+}
+
 #[derive(Debug, Eq, PartialEq, Clone, Serialize, Deserialize)]
 pub struct ClientConfig {
     /// hostname of this client
@@ -138,8 +169,8 @@ pub struct ClientConfig {
     pub port: u16,
     /// position of a client on screen
     pub pos: Position,
-    /// enter hook
-    pub cmd: Option<String>,
+    /// display/input host selected when this client is entered
+    pub switch_target: Option<SwitchHost>,
 }
 
 impl Default for ClientConfig {
@@ -149,7 +180,7 @@ impl Default for ClientConfig {
             hostname: Default::default(),
             fix_ips: Default::default(),
             pos: Default::default(),
-            cmd: None,
+            switch_target: None,
         }
     }
 }
@@ -263,8 +294,8 @@ pub enum FrontendRequest {
     AuthorizeKey(String, String),
     /// remove fingerprint (fingerprint)
     RemoveAuthorizedKey(String),
-    /// change the hook command
-    UpdateEnterHook(u64, Option<String>),
+    /// change the switch-controller target
+    UpdateSwitchTarget(u64, Option<SwitchHost>),
     /// save config file
     SaveConfiguration,
 }

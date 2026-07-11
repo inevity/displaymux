@@ -1,24 +1,5 @@
-use lan_mouse_ipc::ClientHandle;
-use serde::{Deserialize, Serialize};
+use lan_mouse_ipc::{ClientHandle, SwitchHost};
 use thiserror::Error;
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub(crate) enum SwitchHost {
-    Linux,
-    Mac,
-    Windows,
-}
-
-impl SwitchHost {
-    pub(crate) const fn as_str(self) -> &'static str {
-        match self {
-            Self::Linux => "linux",
-            Self::Mac => "mac",
-            Self::Windows => "windows",
-        }
-    }
-}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct LeaseIdentity {
