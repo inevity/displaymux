@@ -1,0 +1,42 @@
+#!/bin/bash
+set -uo pipefail
+
+log_directory="${HOME}/Library/Logs"
+stdout_log="${log_directory}/lan-mouse.log"
+stderr_log="${log_directory}/lan-mouse.err.log"
+max_bytes={{ lan_mouse_log_max_bytes }}
+backup_count={{ lan_mouse_log_backups }}
+
+/bin/mkdir -p "${log_directory}"
+/usr/bin/touch "${stdout_log}" "${stderr_log}"
+
+rotate_stream() {
+    local path="$1"
+    local line=""
+    local size=0
+    local line_size=0
+    local index=0
+    local LC_ALL=C
+
+    size=$(/usr/bin/stat -f %z "${path}" 2>/dev/null || printf '0')
+    while IFS= read -r line || [[ -n "${line}" ]]; do
+        line_size=$(({% raw %}${#line}{% endraw %} + 1))
+        if (( size > 0 && size + line_size > max_bytes )); then
+            /bin/rm -f "${path}.${backup_count}"
+            for ((index = backup_count - 1; index >= 1; index--)); do
+                if [[ -e "${path}.${index}" ]]; then
+                    /bin/mv -f "${path}.${index}" "${path}.$((index + 1))"
+                fi
+            done
+            /bin/mv -f "${path}" "${path}.1"
+            : > "${path}"
+            size=0
+        fi
+        printf '%s\n' "${line}" >> "${path}"
+        size=$((size + line_size))
+    done
+}
+
+exec > >(rotate_stream "${stdout_log}") 2> >(rotate_stream "${stderr_log}")
+export RUST_LOG=lan_mouse=info
+exec "{{ lan_mouse_macos_binary }}" daemon
