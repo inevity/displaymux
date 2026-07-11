@@ -1,5 +1,17 @@
+use crate::config::SwitchControllerConfig;
+use futures::StreamExt;
 use lan_mouse_ipc::{ClientHandle, SwitchHost};
+use reqwest::{Client, Response, StatusCode, Url};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use std::time::{Duration, Instant};
 use thiserror::Error;
+use tokio_util::sync::CancellationToken;
+
+const PROTOCOL_VERSION: u16 = 1;
+// Controller responses contain one state record. Capping them prevents a
+// broken or unauthenticated endpoint from turning control traffic into an
+// unbounded allocation.
+const MAX_RESPONSE_BYTES: usize = 64 * 1024;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct LeaseIdentity {
@@ -22,6 +34,17 @@ pub(crate) struct GateContext {
     pub(crate) handle: ClientHandle,
     pub(crate) target: SwitchHost,
     pub(crate) lease: LeaseIdentity,
+}
+
+impl GateContext {
+    pub(crate) fn same_identity(&self, other: &Self) -> bool {
+        self.handle == other.handle
+            && self.target == other.target
+            && self.lease.request_id == other.lease.request_id
+            && self.lease.lease_id == other.lease.lease_id
+            && self.lease.lease_epoch == other.lease.lease_epoch
+            && self.lease.peer_session_epoch == other.lease.peer_session_epoch
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -68,8 +91,18 @@ pub(crate) struct BundleLeaseManager {
 }
 
 impl BundleLeaseManager {
+    #[cfg(test)]
     pub(crate) fn state(&self) -> &BundleGateState {
         &self.state
+    }
+
+    pub(crate) fn context(&self) -> Option<&GateContext> {
+        match &self.state {
+            BundleGateState::Local => None,
+            BundleGateState::Preparing(context)
+            | BundleGateState::GrantArmed { context, .. }
+            | BundleGateState::RemoteOwned { context, .. } => Some(context),
+        }
     }
 
     pub(crate) fn reserve(
@@ -119,11 +152,12 @@ impl BundleLeaseManager {
         context: &GateContext,
         request_epoch: u64,
         grant_epoch: u64,
+        lease_expires_at_ms: u64,
         grant_expires_at_ms: u64,
         peer_bundle_ready: bool,
         peer_session_epoch: u64,
         now_ms: u64,
-    ) -> Result<GrantIdentity, GateError> {
+    ) -> Result<(GateContext, GrantIdentity), GateError> {
         let BundleGateState::Preparing(current) = &self.state else {
             return Err(GateError::InvalidState);
         };
@@ -134,7 +168,10 @@ impl BundleLeaseManager {
             self.state = BundleGateState::Local;
             return Err(GateError::PeerNotReady);
         }
-        if current.lease.expires_at_ms <= now_ms || grant_expires_at_ms <= now_ms {
+        if current.lease.expires_at_ms <= now_ms
+            || lease_expires_at_ms <= now_ms
+            || grant_expires_at_ms <= now_ms
+        {
             self.state = BundleGateState::Local;
             return Err(GateError::Expired);
         }
@@ -147,11 +184,13 @@ impl BundleLeaseManager {
             grant_epoch,
             expires_at_ms: grant_expires_at_ms,
         };
+        let mut context = current.clone();
+        context.lease.expires_at_ms = context.lease.expires_at_ms.min(lease_expires_at_ms);
         self.state = BundleGateState::GrantArmed {
-            context: current.clone(),
+            context: context.clone(),
             grant: grant.clone(),
         };
-        Ok(grant)
+        Ok((context, grant))
     }
 
     pub(crate) fn commit(
@@ -244,6 +283,596 @@ impl BundleLeaseManager {
             | BundleGateState::RemoteOwned { context, .. } => Some(context),
         }
     }
+
+    pub(crate) fn deadline_ms(&self) -> Option<u64> {
+        match &self.state {
+            BundleGateState::Local => None,
+            BundleGateState::Preparing(context) => Some(context.lease.expires_at_ms),
+            BundleGateState::GrantArmed { context, grant } => {
+                Some(context.lease.expires_at_ms.min(grant.expires_at_ms))
+            }
+            BundleGateState::RemoteOwned {
+                context,
+                renewed_until_ms,
+                ..
+            } => Some(context.lease.expires_at_ms.min(*renewed_until_ms)),
+        }
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct SwitchController {
+    config: SwitchControllerConfig,
+    http: Client,
+    started_at: Instant,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct PeerBundleReadiness {
+    pub(crate) online: bool,
+    pub(crate) keyboard_ready: bool,
+    pub(crate) pointer_ready: bool,
+    pub(crate) session_epoch: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct PreparedGrant {
+    pub(crate) request_epoch: u64,
+    pub(crate) grant_epoch: u64,
+    pub(crate) lease_expires_at_ms: u64,
+    pub(crate) grant_expires_at_ms: u64,
+}
+
+#[derive(Debug, Error)]
+pub(crate) enum SwitchClientError {
+    #[error("switch request was cancelled")]
+    Cancelled,
+    #[error("switch request deadline expired")]
+    Timeout,
+    #[error("controller response exceeded the protocol size limit")]
+    ResponseTooLarge,
+    #[error("controller returned protocol version {0}")]
+    ProtocolVersion(u16),
+    #[error("controller returned stale or conflicting identity")]
+    StaleIdentity,
+    #[error("controller denied request: {status}: {reason}")]
+    Denied { status: String, reason: String },
+    #[error("controller returned HTTP {status}: {code}: {message}")]
+    Http {
+        status: StatusCode,
+        code: String,
+        message: String,
+    },
+    #[error("controller URL cannot accept path segments")]
+    InvalidBaseUrl,
+    #[error(transparent)]
+    Request(#[from] reqwest::Error),
+    #[error(transparent)]
+    Json(#[from] serde_json::Error),
+}
+
+impl SwitchController {
+    pub(crate) fn new(config: SwitchControllerConfig) -> Result<Self, SwitchClientError> {
+        let http = Client::builder()
+            .timeout(Duration::from_millis(config.http_timeout_ms))
+            .build()?;
+        Ok(Self {
+            config,
+            http,
+            started_at: Instant::now(),
+        })
+    }
+
+    pub(crate) fn server_host(&self) -> SwitchHost {
+        self.config.server_host
+    }
+
+    pub(crate) fn lease_ttl_ms(&self) -> u64 {
+        self.config.lease_ttl_ms
+    }
+
+    pub(crate) fn renew_interval(&self) -> Duration {
+        Duration::from_millis(self.config.renew_interval_ms)
+    }
+
+    pub(crate) fn now_ms(&self) -> u64 {
+        self.started_at
+            .elapsed()
+            .as_millis()
+            .try_into()
+            .unwrap_or(u64::MAX)
+    }
+
+    pub(crate) async fn prepare(
+        &self,
+        context: &GateContext,
+        readiness: PeerBundleReadiness,
+        cancellation: &CancellationToken,
+    ) -> Result<PreparedGrant, SwitchClientError> {
+        let deadline_ms = self
+            .now_ms()
+            .checked_add(self.config.request_timeout_ms)
+            .ok_or(SwitchClientError::Timeout)?;
+        self.publish_readiness(context.target, readiness, cancellation)
+            .await?;
+        if self.now_ms() >= deadline_ms {
+            return Err(SwitchClientError::Timeout);
+        }
+        let body = CreateEnterRequest {
+            client_id: self.config.local_host.to_string(),
+            request_id: context.lease.request_id.clone(),
+            lease_id: context.lease.lease_id.clone(),
+            lease_epoch: context.lease.lease_epoch,
+            peer_session_epoch: context.lease.peer_session_epoch,
+            lease_ttl_ms: self.config.lease_ttl_ms,
+        };
+        let mut result = self
+            .request_enter(
+                self.http
+                    .post(self.endpoint(["enter", &context.target.to_string()])?)
+                    .bearer_auth(&self.config.token)
+                    .json(&body),
+                cancellation,
+            )
+            .await?;
+
+        loop {
+            self.validate_request(context, &result.envelope.data)?;
+            match result.envelope.data.status {
+                RemoteRequestStatus::Grant => {
+                    let grant = result
+                        .envelope
+                        .data
+                        .grant
+                        .as_ref()
+                        .ok_or(SwitchClientError::StaleIdentity)?;
+                    return Ok(PreparedGrant {
+                        request_epoch: result.envelope.data.request_epoch,
+                        grant_epoch: grant.grant_epoch,
+                        lease_expires_at_ms: local_deadline(
+                            result.request_started_ms,
+                            result.envelope.server_now_ms,
+                            result.envelope.data.lease.expires_at_ms,
+                        )?,
+                        grant_expires_at_ms: local_deadline(
+                            result.request_started_ms,
+                            result.envelope.server_now_ms,
+                            grant.expires_at_ms,
+                        )?,
+                    });
+                }
+                RemoteRequestStatus::Waking | RemoteRequestStatus::Switching => {}
+                status => {
+                    return Err(SwitchClientError::Denied {
+                        status: status.as_str().to_string(),
+                        reason: result
+                            .envelope
+                            .data
+                            .reason
+                            .clone()
+                            .unwrap_or_else(|| "no reason supplied".to_string()),
+                    });
+                }
+            }
+
+            let now_ms = self.now_ms();
+            if now_ms >= deadline_ms {
+                return Err(SwitchClientError::Timeout);
+            }
+            let sleep_ms = self
+                .config
+                .poll_interval_ms
+                .min(deadline_ms.saturating_sub(now_ms));
+            tokio::select! {
+                _ = cancellation.cancelled() => return Err(SwitchClientError::Cancelled),
+                _ = tokio::time::sleep(Duration::from_millis(sleep_ms)) => {}
+            }
+            if self.now_ms() >= deadline_ms {
+                return Err(SwitchClientError::Timeout);
+            }
+            result = self
+                .request_enter(
+                    self.http
+                        .get(self.endpoint(["enter", "request", &context.lease.request_id])?)
+                        .bearer_auth(&self.config.token),
+                    cancellation,
+                )
+                .await?;
+        }
+    }
+
+    pub(crate) async fn commit(
+        &self,
+        context: &GateContext,
+        grant: &GrantIdentity,
+        cancellation: &CancellationToken,
+    ) -> Result<u64, SwitchClientError> {
+        let body = CommitRequest {
+            request_epoch: grant.request_epoch,
+            grant_epoch: grant.grant_epoch,
+            lease_id: context.lease.lease_id.clone(),
+            lease_epoch: context.lease.lease_epoch,
+        };
+        let result = self
+            .request_enter(
+                self.http
+                    .post(self.endpoint([
+                        "enter",
+                        "request",
+                        &context.lease.request_id,
+                        "commit",
+                    ])?)
+                    .bearer_auth(&self.config.token)
+                    .json(&body),
+                cancellation,
+            )
+            .await?;
+        self.validate_request(context, &result.envelope.data)?;
+        if result.envelope.data.status != RemoteRequestStatus::Committed {
+            return Err(SwitchClientError::Denied {
+                status: result.envelope.data.status.as_str().to_string(),
+                reason: result
+                    .envelope
+                    .data
+                    .reason
+                    .unwrap_or_else(|| "commit was not accepted".to_string()),
+            });
+        }
+        local_deadline(
+            result.request_started_ms,
+            result.envelope.server_now_ms,
+            result.envelope.data.lease.expires_at_ms,
+        )
+    }
+
+    pub(crate) async fn renew(
+        &self,
+        context: &GateContext,
+        cancellation: &CancellationToken,
+    ) -> Result<u64, SwitchClientError> {
+        let body = RenewRequest {
+            lease_id: context.lease.lease_id.clone(),
+            lease_epoch: context.lease.lease_epoch,
+            peer_session_epoch: context.lease.peer_session_epoch,
+        };
+        let request_started_ms = self.now_ms();
+        let response = self
+            .send(
+                self.http
+                    .post(self.endpoint([
+                        "internal",
+                        "enter",
+                        "request",
+                        &context.lease.request_id,
+                        "renew",
+                    ])?)
+                    .bearer_auth(&self.config.token)
+                    .json(&body),
+                cancellation,
+            )
+            .await?;
+        let envelope: ApiEnvelope<RenewResponse> = self.decode(response).await?;
+        if !envelope.data.renewed {
+            return Err(SwitchClientError::Denied {
+                status: envelope.data.phase,
+                reason: "lease renewal was rejected".to_string(),
+            });
+        }
+        local_deadline(
+            request_started_ms,
+            envelope.server_now_ms,
+            envelope
+                .data
+                .renewed_until_ms
+                .ok_or(SwitchClientError::StaleIdentity)?,
+        )
+    }
+
+    pub(crate) async fn cancel(
+        &self,
+        context: &GateContext,
+        reason: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<(), SwitchClientError> {
+        let response = self
+            .send(
+                self.http
+                    .post(self.endpoint([
+                        "internal",
+                        "enter",
+                        "request",
+                        &context.lease.request_id,
+                        "cancel",
+                    ])?)
+                    .bearer_auth(&self.config.token)
+                    .json(&CancelRequest { reason }),
+                cancellation,
+            )
+            .await?;
+        let _: ApiEnvelope<RemoteEnterRequest> = self.decode(response).await?;
+        Ok(())
+    }
+
+    pub(crate) async fn publish_readiness(
+        &self,
+        host: SwitchHost,
+        readiness: PeerBundleReadiness,
+        cancellation: &CancellationToken,
+    ) -> Result<(), SwitchClientError> {
+        let response = self
+            .send(
+                self.http
+                    .post(self.endpoint(["internal", "readiness", &host.to_string()])?)
+                    .bearer_auth(&self.config.token)
+                    .json(&ReadinessRequest::from(readiness)),
+                cancellation,
+            )
+            .await?;
+        let envelope: ApiEnvelope<ReadinessResponse> = self.decode(response).await?;
+        if envelope.data.host != host
+            || envelope.data.readiness.session_epoch != readiness.session_epoch
+            || envelope.data.readiness.online != readiness.online
+            || envelope.data.readiness.keyboard_ready != readiness.keyboard_ready
+            || envelope.data.readiness.pointer_ready != readiness.pointer_ready
+        {
+            return Err(SwitchClientError::StaleIdentity);
+        }
+        Ok(())
+    }
+
+    fn endpoint<const N: usize>(&self, segments: [&str; N]) -> Result<Url, SwitchClientError> {
+        let mut url = self.config.url.clone();
+        let mut path = url
+            .path_segments_mut()
+            .map_err(|_| SwitchClientError::InvalidBaseUrl)?;
+        path.pop_if_empty();
+        path.extend(segments);
+        drop(path);
+        Ok(url)
+    }
+
+    async fn request_enter(
+        &self,
+        request: reqwest::RequestBuilder,
+        cancellation: &CancellationToken,
+    ) -> Result<TimedEnvelope<RemoteEnterRequest>, SwitchClientError> {
+        let request_started_ms = self.now_ms();
+        let response = self.send(request, cancellation).await?;
+        let envelope = self.decode(response).await?;
+        Ok(TimedEnvelope {
+            envelope,
+            request_started_ms,
+        })
+    }
+
+    async fn send(
+        &self,
+        request: reqwest::RequestBuilder,
+        cancellation: &CancellationToken,
+    ) -> Result<Response, SwitchClientError> {
+        tokio::select! {
+            _ = cancellation.cancelled() => Err(SwitchClientError::Cancelled),
+            response = request.send() => Ok(response?),
+        }
+    }
+
+    async fn decode<T: DeserializeOwned>(
+        &self,
+        response: Response,
+    ) -> Result<ApiEnvelope<T>, SwitchClientError> {
+        let status = response.status();
+        let mut body = Vec::new();
+        let mut stream = response.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk?;
+            if body.len().saturating_add(chunk.len()) > MAX_RESPONSE_BYTES {
+                return Err(SwitchClientError::ResponseTooLarge);
+            }
+            body.extend_from_slice(&chunk);
+        }
+        if let Ok(envelope) = serde_json::from_slice::<ApiEnvelope<T>>(&body) {
+            if envelope.protocol_version != PROTOCOL_VERSION {
+                return Err(SwitchClientError::ProtocolVersion(
+                    envelope.protocol_version,
+                ));
+            }
+            return Ok(envelope);
+        }
+        if let Ok(error) = serde_json::from_slice::<ApiError>(&body) {
+            if error.protocol_version != PROTOCOL_VERSION {
+                return Err(SwitchClientError::ProtocolVersion(error.protocol_version));
+            }
+            return Err(SwitchClientError::Http {
+                status,
+                code: error.code,
+                message: error.message,
+            });
+        }
+        if !status.is_success() {
+            return Err(SwitchClientError::Http {
+                status,
+                code: "invalid_error_response".to_string(),
+                message: "controller returned an unparseable error body".to_string(),
+            });
+        }
+        match serde_json::from_slice::<ApiEnvelope<T>>(&body) {
+            Err(error) => Err(error.into()),
+            Ok(_) => unreachable!("successful parse returned above"),
+        }
+    }
+
+    fn validate_request(
+        &self,
+        context: &GateContext,
+        request: &RemoteEnterRequest,
+    ) -> Result<(), SwitchClientError> {
+        if request.request_id != context.lease.request_id
+            || request.target != context.target
+            || request.lease.lease_id != context.lease.lease_id
+            || request.lease.lease_epoch != context.lease.lease_epoch
+            || request.lease.peer_session_epoch != context.lease.peer_session_epoch
+            || request.request_epoch == 0
+        {
+            return Err(SwitchClientError::StaleIdentity);
+        }
+        Ok(())
+    }
+}
+
+fn local_deadline(
+    request_started_ms: u64,
+    server_now_ms: u64,
+    remote_deadline_ms: u64,
+) -> Result<u64, SwitchClientError> {
+    let remaining_ms = remote_deadline_ms
+        .checked_sub(server_now_ms)
+        .filter(|remaining| *remaining > 0)
+        .ok_or(SwitchClientError::Timeout)?;
+    request_started_ms
+        .checked_add(remaining_ms)
+        .ok_or(SwitchClientError::Timeout)
+}
+
+struct TimedEnvelope<T> {
+    envelope: ApiEnvelope<T>,
+    request_started_ms: u64,
+}
+
+#[derive(Deserialize)]
+struct ApiEnvelope<T> {
+    protocol_version: u16,
+    server_now_ms: u64,
+    data: T,
+}
+
+#[derive(Deserialize)]
+struct ApiError {
+    protocol_version: u16,
+    code: String,
+    message: String,
+}
+
+#[derive(Serialize)]
+struct CreateEnterRequest {
+    client_id: String,
+    request_id: String,
+    lease_id: String,
+    lease_epoch: u64,
+    peer_session_epoch: u64,
+    lease_ttl_ms: u64,
+}
+
+#[derive(Serialize)]
+struct CommitRequest {
+    request_epoch: u64,
+    grant_epoch: u64,
+    lease_id: String,
+    lease_epoch: u64,
+}
+
+#[derive(Serialize)]
+struct RenewRequest {
+    lease_id: String,
+    lease_epoch: u64,
+    peer_session_epoch: u64,
+}
+
+#[derive(Serialize)]
+struct CancelRequest<'a> {
+    reason: &'a str,
+}
+
+#[derive(Serialize)]
+struct ReadinessRequest {
+    online: bool,
+    keyboard_ready: bool,
+    pointer_ready: bool,
+    session_epoch: u64,
+}
+
+impl From<PeerBundleReadiness> for ReadinessRequest {
+    fn from(readiness: PeerBundleReadiness) -> Self {
+        Self {
+            online: readiness.online,
+            keyboard_ready: readiness.keyboard_ready,
+            pointer_ready: readiness.pointer_ready,
+            session_epoch: readiness.session_epoch,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct RemoteEnterRequest {
+    request_id: String,
+    target: SwitchHost,
+    request_epoch: u64,
+    lease: RemoteLeaseIdentity,
+    status: RemoteRequestStatus,
+    grant: Option<RemoteGrantIdentity>,
+    reason: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct RemoteLeaseIdentity {
+    lease_id: String,
+    lease_epoch: u64,
+    peer_session_epoch: u64,
+    expires_at_ms: u64,
+}
+
+#[derive(Deserialize)]
+struct RemoteGrantIdentity {
+    grant_epoch: u64,
+    expires_at_ms: u64,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+enum RemoteRequestStatus {
+    Waking,
+    Switching,
+    Grant,
+    Committed,
+    Denied,
+    Cancelled,
+    Fallback,
+    Expired,
+}
+
+impl RemoteRequestStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Waking => "waking",
+            Self::Switching => "switching",
+            Self::Grant => "grant",
+            Self::Committed => "committed",
+            Self::Denied => "denied",
+            Self::Cancelled => "cancelled",
+            Self::Fallback => "fallback",
+            Self::Expired => "expired",
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct RenewResponse {
+    renewed: bool,
+    renewed_until_ms: Option<u64>,
+    phase: String,
+}
+
+#[derive(Deserialize)]
+struct ReadinessResponse {
+    host: SwitchHost,
+    readiness: RemoteReadiness,
+}
+
+#[derive(Deserialize)]
+struct RemoteReadiness {
+    online: bool,
+    keyboard_ready: bool,
+    pointer_ready: bool,
+    session_epoch: u64,
 }
 
 #[cfg(test)]
@@ -267,8 +896,9 @@ mod tests {
 
     fn arm(manager: &mut BundleLeaseManager, context: &GateContext) -> GrantIdentity {
         manager
-            .arm_grant(context, 7, 9, 140, true, 22, 110)
+            .arm_grant(context, 7, 9, 150, 140, true, 22, 110)
             .unwrap()
+            .1
     }
 
     #[test]
@@ -317,7 +947,7 @@ mod tests {
         stale.lease.request_id = "old-request".to_string();
 
         assert_eq!(
-            manager.arm_grant(&stale, 7, 9, 140, true, 22, 110),
+            manager.arm_grant(&stale, 7, 9, 150, 140, true, 22, 110),
             Err(GateError::StaleIdentity)
         );
         assert_eq!(manager.state(), &BundleGateState::Preparing(context));
@@ -329,10 +959,25 @@ mod tests {
         let context = reserve(&mut manager);
 
         assert_eq!(
-            manager.arm_grant(&context, 7, 9, 140, false, 22, 110),
+            manager.arm_grant(&context, 7, 9, 150, 140, false, 22, 110),
             Err(GateError::PeerNotReady)
         );
         assert_eq!(manager.state(), &BundleGateState::Local);
+    }
+
+    #[test]
+    fn grant_clamps_local_lease_to_daemon_remaining_time() {
+        let mut manager = BundleLeaseManager::default();
+        let context = reserve(&mut manager);
+
+        manager
+            .arm_grant(&context, 7, 9, 130, 140, true, 22, 110)
+            .unwrap();
+
+        let BundleGateState::GrantArmed { context, .. } = manager.state() else {
+            panic!("grant was not armed");
+        };
+        assert_eq!(context.lease.expires_at_ms, 130);
     }
 
     #[test]
@@ -434,5 +1079,44 @@ mod tests {
 
         assert_eq!(manager.expire(140), Some(context));
         assert_eq!(manager.state(), &BundleGateState::Local);
+    }
+
+    #[test]
+    fn remote_deadline_maps_from_request_start_conservatively() {
+        assert_eq!(local_deadline(200, 1_000, 1_300).unwrap(), 500);
+        assert!(matches!(
+            local_deadline(200, 1_300, 1_300),
+            Err(SwitchClientError::Timeout)
+        ));
+    }
+
+    #[test]
+    fn parses_versioned_grant_envelope() {
+        let envelope: ApiEnvelope<RemoteEnterRequest> = serde_json::from_value(serde_json::json!({
+            "protocol_version": 1,
+            "server_now_ms": 1000,
+            "data": {
+                "request_id": "request-1",
+                "target": "windows",
+                "request_epoch": 7,
+                "lease": {
+                    "lease_id": "lease-1",
+                    "lease_epoch": 3,
+                    "peer_session_epoch": 22,
+                    "expires_at_ms": 1400
+                },
+                "status": "grant",
+                "grant": {
+                    "grant_epoch": 9,
+                    "expires_at_ms": 1200
+                },
+                "reason": null
+            }
+        }))
+        .unwrap();
+
+        assert_eq!(envelope.protocol_version, PROTOCOL_VERSION);
+        assert_eq!(envelope.data.target, SwitchHost::Windows);
+        assert_eq!(envelope.data.grant.unwrap().grant_epoch, 9);
     }
 }

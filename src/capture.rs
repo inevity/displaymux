@@ -18,6 +18,7 @@ use crate::connect::LanMouseConnection;
 
 pub(crate) struct Capture {
     cancellation_token: CancellationToken,
+    gate: Rc<RefCell<CaptureGate>>,
     request_tx: Sender<CaptureRequest>,
     task: JoinHandle<()>,
     event_rx: Receiver<ICaptureEvent>,
@@ -65,10 +66,6 @@ enum CaptureRequest {
     Reenable,
     /// set release bind
     SetReleaseBind(Vec<scancode::Linux>),
-    /// arm one outgoing client for one matching capture begin
-    Arm(CaptureHandle, u64),
-    /// invalidate an unconsumed permit if its epoch still matches
-    Disarm(u64),
 }
 
 impl Capture {
@@ -80,14 +77,16 @@ impl Capture {
         let (request_tx, request_rx) = channel();
         let (event_tx, event_rx) = channel();
         let cancellation_token = CancellationToken::new();
+        let gate = Rc::new(RefCell::new(CaptureGate::default()));
         let capture_task = CaptureTask {
+            active_peer_session_epoch: None,
             active_client: None,
             backend,
             cancellation_token: cancellation_token.clone(),
             captures: Default::default(),
             conn,
             event_tx,
-            gate: Default::default(),
+            gate: gate.clone(),
             request_rx,
             release_bind: Rc::new(RefCell::new(release_bind)),
             state: Default::default(),
@@ -95,6 +94,7 @@ impl Capture {
         let task = spawn_local(capture_task.run());
         Self {
             cancellation_token,
+            gate,
             request_tx,
             task,
             event_rx,
@@ -134,21 +134,26 @@ impl Capture {
     }
 
     pub(crate) fn release(&self) {
+        self.gate.borrow_mut().clear();
         self.request_tx
             .send(CaptureRequest::Release)
             .expect("channel closed");
     }
 
-    pub(crate) fn arm(&self, handle: CaptureHandle, lease_epoch: u64) {
-        self.request_tx
-            .send(CaptureRequest::Arm(handle, lease_epoch))
-            .expect("channel closed");
+    pub(crate) fn arm(
+        &self,
+        handle: CaptureHandle,
+        lease_epoch: u64,
+        peer_session_epoch: u64,
+        valid_for: Duration,
+    ) {
+        self.gate
+            .borrow_mut()
+            .arm(handle, lease_epoch, peer_session_epoch, valid_for);
     }
 
     pub(crate) fn disarm(&self, lease_epoch: u64) {
-        self.request_tx
-            .send(CaptureRequest::Disarm(lease_epoch))
-            .expect("channel closed");
+        self.gate.borrow_mut().disarm(lease_epoch);
     }
 
     pub(crate) async fn event(&mut self) -> ICaptureEvent {
@@ -178,13 +183,14 @@ macro_rules! debounce {
 }
 
 struct CaptureTask {
+    active_peer_session_epoch: Option<u64>,
     active_client: Option<CaptureHandle>,
     backend: Option<input_capture::Backend>,
     cancellation_token: CancellationToken,
     captures: Vec<(CaptureHandle, Position, CaptureType)>,
     conn: LanMouseConnection,
     event_tx: Sender<ICaptureEvent>,
-    gate: CaptureGate,
+    gate: Rc<RefCell<CaptureGate>>,
     release_bind: Rc<RefCell<Vec<scancode::Linux>>>,
     request_rx: Receiver<CaptureRequest>,
     state: State,
@@ -197,7 +203,7 @@ impl CaptureTask {
 
     fn remove_capture(&mut self, handle: CaptureHandle) {
         self.captures.retain(|&(h, ..)| handle != h);
-        self.gate.remove(handle);
+        self.gate.borrow_mut().remove(handle);
     }
 
     fn is_default_capture_at(&self, pos: Position) -> bool {
@@ -233,14 +239,10 @@ impl CaptureTask {
                         CaptureRequest::Reenable => break,
                         CaptureRequest::Create(h, p, t) => self.add_capture(h, p, t),
                         CaptureRequest::Destroy(h) => self.remove_capture(h),
-                        CaptureRequest::Release => self.gate.clear(),
+                        CaptureRequest::Release => self.gate.borrow_mut().clear(),
                         CaptureRequest::SetReleaseBind(bind) => {
                             self.release_bind.borrow_mut().clone_from(&bind);
                         }
-                        CaptureRequest::Arm(handle, lease_epoch) => {
-                            self.gate.arm(handle, lease_epoch);
-                        }
-                        CaptureRequest::Disarm(lease_epoch) => self.gate.disarm(lease_epoch),
                     },
                     _ = self.cancellation_token.cancelled() => return,
                 }
@@ -317,10 +319,37 @@ impl CaptureTask {
                             log::info!("releasing capture: left remote client device region");
                             self.release_capture(capture).await?;
                         },
-                        ProtoEvent::Readiness { .. } => {
+                        ProtoEvent::Readiness {
+                            keyboard_ready,
+                            pointer_ready,
+                            session_epoch,
+                        } => {
+                            if self.active_client == Some(handle)
+                                && (!keyboard_ready
+                                    || !pointer_ready
+                                    || self.active_peer_session_epoch != Some(session_epoch))
+                            {
+                                log::warn!("releasing capture: peer input readiness changed");
+                                self.release_capture(capture).await?;
+                            }
                             self.event_tx
                                 .send(ICaptureEvent::PeerReadiness(handle))
                                 .expect("channel closed");
+                        }
+                        ProtoEvent::ReleaseRequest { release_epoch } => {
+                            log::info!(
+                                "releasing capture for peer request epoch {release_epoch}"
+                            );
+                            self.release_capture(capture).await?;
+                            if let Err(error) = self
+                                .conn
+                                .send(ProtoEvent::ReleaseAck { release_epoch }, handle)
+                                .await
+                            {
+                                log::warn!(
+                                    "failed to acknowledge release epoch {release_epoch}: {error}"
+                                );
+                            }
                         }
                         _ => {}
                     }
@@ -328,7 +357,7 @@ impl CaptureTask {
                 e = self.request_rx.recv() => match e.expect("channel closed") {
                     CaptureRequest::Reenable => { /* already active */ },
                     CaptureRequest::Release => {
-                        self.gate.clear();
+                        self.gate.borrow_mut().clear();
                         self.release_capture(capture).await?;
                     }
                     CaptureRequest::Create(h, p, t) => {
@@ -342,10 +371,6 @@ impl CaptureTask {
                     CaptureRequest::SetReleaseBind(bind) => {
                         self.release_bind.borrow_mut().clone_from(&bind);
                     }
-                    CaptureRequest::Arm(handle, lease_epoch) => {
-                        self.gate.arm(handle, lease_epoch);
-                    }
-                    CaptureRequest::Disarm(lease_epoch) => self.gate.disarm(lease_epoch),
                 },
                 _ = self.cancellation_token.cancelled() => break,
             }
@@ -387,7 +412,8 @@ impl CaptureTask {
         // An outgoing capture may only become active by consuming a current,
         // one-shot permit. The first crossing is always released immediately.
         if event == CaptureEvent::Begin && Some(handle) != self.active_client {
-            let Some(lease_epoch) = self.gate.consume(handle) else {
+            let permit = self.gate.borrow_mut().consume(handle);
+            let Some(permit) = permit else {
                 self.event_tx
                     .send(ICaptureEvent::CaptureCandidate(handle))
                     .expect("channel closed");
@@ -396,10 +422,11 @@ impl CaptureTask {
             };
             self.state = State::WaitingForAck;
             self.active_client.replace(handle);
+            self.active_peer_session_epoch = Some(permit.peer_session_epoch);
             self.event_tx
                 .send(ICaptureEvent::ClientEntered {
                     handle,
-                    lease_epoch,
+                    lease_epoch: permit.lease_epoch,
                 })
                 .expect("channel closed");
         }
@@ -430,7 +457,8 @@ impl CaptureTask {
 
     async fn release_capture(&mut self, capture: &mut InputCapture) -> Result<(), CaptureError> {
         // If we have an active client, notify them we're leaving
-        if let Some(handle) = self.active_client.take() {
+        let released_handle = if let Some(handle) = self.active_client.take() {
+            self.active_peer_session_epoch = None;
             // Synthesize key-up events for every key still held in the
             // capture's pressed_keys set BEFORE sending Leave. Without
             // this, pressing the release-bind chord (typically all four
@@ -470,51 +498,79 @@ impl CaptureTask {
             if let Err(e) = self.conn.send(ProtoEvent::Leave(0), handle).await {
                 log::warn!("failed to send Leave to client {handle}: {e}");
             }
+            Some(handle)
+        } else {
+            None
+        };
+        capture.release().await?;
+        if let Some(handle) = released_handle {
             self.event_tx
                 .send(ICaptureEvent::ClientReleased(handle))
                 .expect("channel closed");
         }
-        capture.release().await
+        Ok(())
     }
 }
 
 #[derive(Debug, Default)]
 struct CaptureGate {
-    armed: Option<(CaptureHandle, u64)>,
+    armed: Option<CapturePermit>,
     last_epoch: u64,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct CapturePermit {
+    handle: CaptureHandle,
+    lease_epoch: u64,
+    peer_session_epoch: u64,
+    expires_at: Instant,
+}
+
 impl CaptureGate {
-    fn arm(&mut self, handle: CaptureHandle, lease_epoch: u64) {
+    fn arm(
+        &mut self,
+        handle: CaptureHandle,
+        lease_epoch: u64,
+        peer_session_epoch: u64,
+        valid_for: Duration,
+    ) {
         if lease_epoch > self.last_epoch {
-            self.last_epoch = lease_epoch;
-            self.armed = Some((handle, lease_epoch));
+            if let Some(expires_at) = Instant::now().checked_add(valid_for) {
+                self.last_epoch = lease_epoch;
+                self.armed = Some(CapturePermit {
+                    handle,
+                    lease_epoch,
+                    peer_session_epoch,
+                    expires_at,
+                });
+            }
         }
     }
 
-    fn consume(&mut self, handle: CaptureHandle) -> Option<u64> {
-        let (armed_handle, lease_epoch) = self.armed?;
-        if armed_handle != handle {
+    fn consume(&mut self, handle: CaptureHandle) -> Option<CapturePermit> {
+        let permit = self.armed?;
+        if permit.expires_at <= Instant::now() {
+            self.armed = None;
+            return None;
+        }
+        if permit.handle != handle {
             return None;
         }
         self.armed = None;
-        Some(lease_epoch)
+        Some(permit)
     }
 
     fn disarm(&mut self, lease_epoch: u64) {
         if self
             .armed
-            .is_some_and(|(_, armed_epoch)| armed_epoch == lease_epoch)
+            .is_some_and(|permit| permit.lease_epoch == lease_epoch)
         {
             self.armed = None;
         }
     }
 
     fn remove(&mut self, handle: CaptureHandle) {
-        if self
-            .armed
-            .is_some_and(|(armed_handle, _)| armed_handle == handle)
-        {
+        if self.armed.is_some_and(|permit| permit.handle == handle) {
             self.armed = None;
         }
     }
@@ -582,26 +638,36 @@ mod tests {
     fn first_crossing_has_no_capture_permit() {
         let mut gate = CaptureGate::default();
 
-        assert_eq!(gate.consume(4), None);
+        assert!(gate.consume(4).is_none());
     }
 
     #[test]
     fn permit_is_targeted_and_consumed_once() {
         let mut gate = CaptureGate::default();
-        gate.arm(4, 7);
+        gate.arm(4, 7, 22, Duration::from_secs(1));
 
-        assert_eq!(gate.consume(5), None);
-        assert_eq!(gate.consume(4), Some(7));
-        assert_eq!(gate.consume(4), None);
+        assert!(gate.consume(5).is_none());
+        let permit = gate.consume(4).unwrap();
+        assert_eq!(permit.lease_epoch, 7);
+        assert_eq!(permit.peer_session_epoch, 22);
+        assert!(gate.consume(4).is_none());
     }
 
     #[test]
     fn delayed_arm_and_disarm_cannot_change_newer_permit() {
         let mut gate = CaptureGate::default();
-        gate.arm(4, 8);
-        gate.arm(5, 7);
+        gate.arm(4, 8, 22, Duration::from_secs(1));
+        gate.arm(5, 7, 31, Duration::from_secs(1));
         gate.disarm(7);
 
-        assert_eq!(gate.consume(4), Some(8));
+        assert_eq!(gate.consume(4).unwrap().lease_epoch, 8);
+    }
+
+    #[test]
+    fn expired_permit_cannot_enable_capture() {
+        let mut gate = CaptureGate::default();
+        gate.arm(4, 8, 22, Duration::ZERO);
+
+        assert!(gate.consume(4).is_none());
     }
 }

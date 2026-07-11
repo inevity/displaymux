@@ -74,11 +74,18 @@ pub(crate) enum EmulationEvent {
         pointer_ready: bool,
         session_epoch: u64,
     },
+    ReleaseAcknowledged {
+        addr: SocketAddr,
+        release_epoch: u64,
+    },
 }
 
 enum EmulationRequest {
     Reenable,
-    Release(SocketAddr),
+    Release {
+        addr: SocketAddr,
+        release_epoch: u64,
+    },
     ChangePort(u16),
     Terminate,
 }
@@ -105,9 +112,12 @@ impl Emulation {
         }
     }
 
-    pub(crate) fn send_leave_event(&self, addr: SocketAddr) {
+    pub(crate) fn request_capture_release(&self, addr: SocketAddr, release_epoch: u64) {
         self.request_tx
-            .send(EmulationRequest::Release(addr))
+            .send(EmulationRequest::Release {
+                addr,
+                release_epoch,
+            })
             .expect("channel closed");
     }
 
@@ -146,11 +156,39 @@ struct ListenTask {
     event_tx: Sender<EmulationEvent>,
 }
 
+#[derive(Default)]
+struct PendingReleases {
+    epochs: HashMap<SocketAddr, u64>,
+}
+
+impl PendingReleases {
+    fn request(&mut self, addr: SocketAddr, release_epoch: u64) {
+        self.epochs.insert(addr, release_epoch);
+    }
+
+    fn retry_epoch(&self, addr: SocketAddr) -> Option<u64> {
+        self.epochs.get(&addr).copied()
+    }
+
+    fn acknowledge(&mut self, addr: SocketAddr, release_epoch: u64) -> bool {
+        if self.epochs.get(&addr) != Some(&release_epoch) {
+            return false;
+        }
+        self.epochs.remove(&addr);
+        true
+    }
+
+    fn disconnected(&mut self, addr: SocketAddr) {
+        self.epochs.remove(&addr);
+    }
+}
+
 impl ListenTask {
     async fn run(mut self) {
         let mut interval = tokio::time::interval(Duration::from_secs(5));
         let mut last_response = HashMap::new();
         let mut rejected_connections = HashMap::new();
+        let mut pending_releases = PendingReleases::default();
         loop {
             select! {
                 e = self.listener.next() => {match e {
@@ -172,6 +210,9 @@ impl ListenTask {
                             }
                             ProtoEvent::Input(event) => self.emulation_proxy.consume(event, addr),
                             ProtoEvent::Ping => {
+                                if let Some(release_epoch) = pending_releases.retry_epoch(addr) {
+                                    self.listener.reply(addr, ProtoEvent::ReleaseRequest { release_epoch }).await;
+                                }
                                 self.listener.reply(addr, ProtoEvent::Pong(self.emulation_proxy.emulation_active.get())).await;
                                 self.listener.reply(addr, self.emulation_proxy.readiness()).await;
                             }
@@ -203,6 +244,14 @@ impl ListenTask {
                                     session_epoch,
                                 }).expect("channel closed");
                             }
+                            ProtoEvent::ReleaseAck { release_epoch } => {
+                                if pending_releases.acknowledge(addr, release_epoch) {
+                                    self.event_tx.send(EmulationEvent::ReleaseAcknowledged {
+                                        addr,
+                                        release_epoch,
+                                    }).expect("channel closed");
+                                }
+                            }
                             _ => {}
                         }
                     }
@@ -227,7 +276,10 @@ impl ListenTask {
                     // reenable emulation
                     EmulationRequest::Reenable => self.emulation_proxy.reenable(),
                     // notify the other end that we hit a barrier (should release capture)
-                    EmulationRequest::Release(addr) => self.listener.reply(addr, ProtoEvent::Leave(0)).await,
+                    EmulationRequest::Release { addr, release_epoch } => {
+                        pending_releases.request(addr, release_epoch);
+                        self.listener.reply(addr, ProtoEvent::ReleaseRequest { release_epoch }).await;
+                    }
                     EmulationRequest::ChangePort(port) => {
                         self.listener.request_port_change(port);
                         let result = self.listener.port_changed().await;
@@ -241,6 +293,7 @@ impl ListenTask {
                             log::warn!("releasing keys: {addr} not responding!");
                             self.emulation_proxy.remove(addr);
                             self.event_tx.send(EmulationEvent::Disconnected { addr }).expect("channel closed");
+                            pending_releases.disconnected(addr);
                             false
                         } else {
                             true
@@ -507,5 +560,44 @@ impl<T> Drop for DropGuard<T> {
         self.tx
             .send(self.on_drop.take().expect("item"))
             .expect("channel closed");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn peer() -> SocketAddr {
+        "127.0.0.1:4242".parse().unwrap()
+    }
+
+    #[test]
+    fn pending_release_retries_current_epoch_until_acknowledged() {
+        let mut pending = PendingReleases::default();
+        pending.request(peer(), 7);
+
+        assert_eq!(pending.retry_epoch(peer()), Some(7));
+        assert!(pending.acknowledge(peer(), 7));
+        assert_eq!(pending.retry_epoch(peer()), None);
+    }
+
+    #[test]
+    fn stale_ack_cannot_clear_newer_release_request() {
+        let mut pending = PendingReleases::default();
+        pending.request(peer(), 7);
+        pending.request(peer(), 8);
+
+        assert!(!pending.acknowledge(peer(), 7));
+        assert_eq!(pending.retry_epoch(peer()), Some(8));
+    }
+
+    #[test]
+    fn disconnect_removes_pending_release() {
+        let mut pending = PendingReleases::default();
+        pending.request(peer(), 7);
+
+        pending.disconnected(peer());
+
+        assert_eq!(pending.retry_epoch(peer()), None);
     }
 }

@@ -7,6 +7,10 @@ use crate::{
     dns::{DnsEvent, DnsResolver},
     emulation::{Emulation, EmulationEvent},
     listen::{LanMouseListener, ListenerCreationError},
+    switch::{
+        BundleLeaseManager, GateContext, GrantIdentity, PeerBundleReadiness, PreparedGrant,
+        SwitchClientError, SwitchController,
+    },
 };
 use futures::StreamExt;
 use lan_mouse_ipc::{
@@ -18,10 +22,18 @@ use std::{
     collections::{HashMap, HashSet, VecDeque},
     io,
     net::{IpAddr, SocketAddr},
+    pin::Pin,
     sync::{Arc, RwLock},
+    time::Duration,
 };
 use thiserror::Error;
-use tokio::{signal, sync::Notify};
+use tokio::{
+    signal,
+    sync::{Notify, mpsc},
+    task::{JoinHandle, spawn_local},
+    time::Sleep,
+};
+use tokio_util::sync::CancellationToken;
 
 #[derive(Debug, Error)]
 pub enum ServiceError {
@@ -33,6 +45,15 @@ pub enum ServiceError {
     ListenError(#[from] ListenerCreationError),
     #[error("failed to load certificate: `{0}`")]
     Certificate(#[from] crypto::Error),
+    #[error("failed to initialize switch controller: `{0}`")]
+    SwitchController(String),
+}
+
+async fn wait_for_switch_deadline(deadline: &mut Option<Pin<Box<Sleep>>>) {
+    match deadline {
+        Some(deadline) => deadline.as_mut().await,
+        None => futures::future::pending().await,
+    }
 }
 
 pub struct Service {
@@ -67,6 +88,16 @@ pub struct Service {
     /// map from capture handle to connection info
     incoming_conn_info: HashMap<ClientHandle, Incoming>,
     next_trigger_handle: u64,
+    bundle_lease: BundleLeaseManager,
+    switch_controller: Option<SwitchController>,
+    switch_deadline: Option<Pin<Box<Sleep>>>,
+    switch_event_rx: mpsc::Receiver<SwitchTaskEvent>,
+    switch_event_tx: mpsc::Sender<SwitchTaskEvent>,
+    switch_task: Option<SwitchTask>,
+    next_switch_task_epoch: u64,
+    active_switch_capture: Option<(ClientHandle, u64)>,
+    pending_switch_cleanup: Option<(GateContext, &'static str)>,
+    next_release_epoch: u64,
 }
 
 #[derive(Debug)]
@@ -76,8 +107,46 @@ struct Incoming {
     pos: Position,
 }
 
+struct SwitchTask {
+    epoch: u64,
+    cancellation: CancellationToken,
+    task: JoinHandle<()>,
+}
+
+enum SwitchTaskEvent {
+    Prepared {
+        task_epoch: u64,
+        context: GateContext,
+        result: Result<PreparedGrant, SwitchClientError>,
+    },
+    Committed {
+        task_epoch: u64,
+        context: GateContext,
+        grant: GrantIdentity,
+        result: Result<u64, SwitchClientError>,
+    },
+    Renewed {
+        task_epoch: u64,
+        context: GateContext,
+        result: Result<u64, SwitchClientError>,
+    },
+    CleanupFinished {
+        task_epoch: u64,
+        request_id: String,
+        result: Result<(), SwitchClientError>,
+    },
+}
+
 impl Service {
     pub async fn new(config: Config) -> Result<Self, ServiceError> {
+        let switch_controller = config
+            .switch_controller()
+            .map(|config| {
+                SwitchController::new(config)
+                    .map_err(|error| ServiceError::SwitchController(error.to_string()))
+            })
+            .transpose()?;
+        let (switch_event_tx, switch_event_rx) = mpsc::channel(1);
         let client_manager = ClientManager::default();
         for client in config.clients() {
             client_manager.add_with_config(client);
@@ -123,6 +192,16 @@ impl Service {
             incoming_conn_info: Default::default(),
             incoming_conns: Default::default(),
             next_trigger_handle: 0,
+            bundle_lease: Default::default(),
+            switch_controller,
+            switch_deadline: None,
+            switch_event_rx,
+            switch_event_tx,
+            switch_task: None,
+            next_switch_task_epoch: 0,
+            active_switch_capture: None,
+            pending_switch_cleanup: None,
+            next_release_epoch: 0,
         };
         Ok(service)
     }
@@ -147,14 +226,34 @@ impl Service {
                 event = self.emulation.event() => self.handle_emulation_event(event),
                 event = self.capture.event() => self.handle_capture_event(event),
                 event = self.resolver.event() => self.handle_resolver_event(event),
+                event = self.switch_event_rx.recv() => {
+                    self.handle_switch_task_event(event.expect("switch event channel closed"));
+                }
+                _ = wait_for_switch_deadline(&mut self.switch_deadline) => {
+                    self.handle_switch_deadline();
+                }
                 _ = self.config.changed() => self.handle_config_change(),
                 r = signal::ctrl_c() => break r.expect("failed to wait for CTRL+C"),
             }
         }
 
         log::info!("terminating service ...");
+        let switch_context = self.bundle_lease.invalidate();
+        self.capture.release();
+        self.cancel_switch_task();
+        self.switch_deadline = None;
         log::debug!("terminating capture ...");
         self.capture.terminate().await;
+        self.active_switch_capture = None;
+        if let (Some(controller), Some(context)) = (&self.switch_controller, switch_context) {
+            let cancellation = CancellationToken::new();
+            if let Err(error) = controller
+                .cancel(&context, "service_shutdown", &cancellation)
+                .await
+            {
+                log::warn!("failed to notify controller during shutdown: {error}");
+            }
+        }
         log::debug!("terminating emulation ...");
         self.emulation.terminate().await;
         log::debug!("terminating dns resolver ...");
@@ -241,6 +340,19 @@ impl Service {
     }
 
     fn handle_config_change(&mut self) {
+        self.fail_gate("config_changed");
+        self.switch_controller = match self
+            .config
+            .switch_controller()
+            .map(SwitchController::new)
+            .transpose()
+        {
+            Ok(controller) => controller,
+            Err(error) => {
+                log::error!("failed to apply switch controller config: {error}");
+                None
+            }
+        };
         for h in self.client_manager.registered_clients() {
             self.remove_client(h);
         }
@@ -296,6 +408,7 @@ impl Service {
                 if let Some(handle) = self.client_manager.get_client(addr) {
                     self.client_manager.clear_peer_readiness(handle);
                     self.broadcast_client(handle);
+                    self.handle_peer_readiness_change(handle);
                 }
                 if let Some(addr) = self.remove_incoming(addr) {
                     self.notify_frontend(FrontendEvent::IncomingDisconnected(addr));
@@ -346,8 +459,15 @@ impl Service {
                         session_epoch,
                     ) {
                         self.broadcast_client(handle);
+                        self.handle_peer_readiness_change(handle);
                     }
                 }
+            }
+            EmulationEvent::ReleaseAcknowledged {
+                addr,
+                release_epoch,
+            } => {
+                log::info!("peer {addr} acknowledged capture release epoch {release_epoch}");
             }
         }
     }
@@ -358,28 +478,661 @@ impl Service {
                 // we entered the capture zone for an incoming connection
                 // => notify it that its capture should be released
                 if let Some(incoming) = self.incoming_conn_info.get(&handle) {
-                    self.emulation.send_leave_event(incoming.addr);
+                    self.next_release_epoch = self
+                        .next_release_epoch
+                        .checked_add(1)
+                        .expect("release epoch exhausted");
+                    self.emulation
+                        .request_capture_release(incoming.addr, self.next_release_epoch);
                 }
             }
             ICaptureEvent::CaptureDisabled => {
                 self.capture_status = Status::Disabled;
                 self.notify_frontend(FrontendEvent::CaptureStatus(self.capture_status));
+                self.active_switch_capture = None;
+                if self.pending_switch_cleanup.is_some() {
+                    self.complete_pending_switch_cleanup();
+                } else {
+                    self.release_gate_after_capture("capture_backend_disabled");
+                }
             }
             ICaptureEvent::CaptureEnabled => {
                 self.capture_status = Status::Enabled;
                 self.notify_frontend(FrontendEvent::CaptureStatus(self.capture_status));
             }
             ICaptureEvent::CaptureCandidate(handle) => {
-                log::debug!("capture candidate {handle} remains local until a grant is armed");
+                self.handle_capture_candidate(handle);
             }
             ICaptureEvent::ClientEntered {
                 handle,
                 lease_epoch,
-            } => log::info!("entered client {handle} with lease epoch {lease_epoch}"),
+            } => {
+                self.active_switch_capture = Some((handle, lease_epoch));
+                self.handle_client_entered(handle, lease_epoch);
+            }
             ICaptureEvent::ClientReleased(handle) => {
                 log::info!("released client {handle} capture");
+                self.active_switch_capture = None;
+                if self.pending_switch_cleanup.is_some() {
+                    self.complete_pending_switch_cleanup();
+                } else {
+                    self.release_gate_after_capture("capture_released");
+                }
             }
-            ICaptureEvent::PeerReadiness(handle) => self.broadcast_client(handle),
+            ICaptureEvent::PeerReadiness(handle) => {
+                self.broadcast_client(handle);
+                self.handle_peer_readiness_change(handle);
+            }
+        }
+    }
+
+    fn peer_readiness(&self, handle: ClientHandle) -> Option<PeerBundleReadiness> {
+        self.client_manager.peer_input_readiness(handle).map(
+            |(online, keyboard_ready, pointer_ready, session_epoch)| PeerBundleReadiness {
+                online,
+                keyboard_ready,
+                pointer_ready,
+                session_epoch,
+            },
+        )
+    }
+
+    fn handle_capture_candidate(&mut self, handle: ClientHandle) {
+        let Some(target) = self.client_manager.switch_target(handle) else {
+            log::warn!("capture candidate {handle} rejected: switch target is not configured");
+            return;
+        };
+        if self
+            .switch_controller
+            .as_ref()
+            .is_some_and(|controller| target == controller.server_host())
+        {
+            log::info!(
+                "server-host capture candidate {handle} stays local; hub release drives fallback"
+            );
+            return;
+        }
+        let Some(controller) = self.switch_controller.clone() else {
+            log::warn!("capture candidate {handle} rejected: switch controller is not configured");
+            return;
+        };
+        if self.switch_task.is_some() {
+            log::debug!("capture candidate {handle} rejected: controller operation is active");
+            return;
+        }
+        let Some(readiness) = self.peer_readiness(handle) else {
+            log::warn!("capture candidate {handle} rejected: client does not exist");
+            return;
+        };
+        let bundle_ready = readiness.online
+            && readiness.keyboard_ready
+            && readiness.pointer_ready
+            && readiness.session_epoch != 0;
+        let request_id = format!("request-{:032x}", rand::random::<u128>());
+        let lease_id = format!("lease-{:032x}", rand::random::<u128>());
+        let context = match self.bundle_lease.reserve(
+            handle,
+            target,
+            request_id,
+            lease_id,
+            readiness.session_epoch,
+            bundle_ready,
+            controller.now_ms(),
+            controller.lease_ttl_ms(),
+        ) {
+            Ok(context) => context,
+            Err(error) => {
+                log::warn!("capture candidate {handle} rejected: {error}");
+                return;
+            }
+        };
+        self.reset_switch_deadline();
+        if !self.start_prepare_task(context.clone(), readiness) {
+            self.fail_context(context, "controller_busy");
+        }
+    }
+
+    fn start_prepare_task(&mut self, context: GateContext, readiness: PeerBundleReadiness) -> bool {
+        let Some(controller) = self.switch_controller.clone() else {
+            return false;
+        };
+        let Some((task_epoch, cancellation)) = self.begin_switch_task() else {
+            return false;
+        };
+        let task_cancellation = cancellation.clone();
+        let event_tx = self.switch_event_tx.clone();
+        let task_context = context.clone();
+        let task = spawn_local(async move {
+            let result = controller
+                .prepare(&task_context, readiness, &task_cancellation)
+                .await;
+            let _ = event_tx
+                .send(SwitchTaskEvent::Prepared {
+                    task_epoch,
+                    context: task_context,
+                    result,
+                })
+                .await;
+        });
+        self.switch_task = Some(SwitchTask {
+            epoch: task_epoch,
+            cancellation,
+            task,
+        });
+        log::info!(
+            "preparing switch request {} lease {} epoch {} target {}",
+            context.lease.request_id,
+            context.lease.lease_id,
+            context.lease.lease_epoch,
+            context.target
+        );
+        true
+    }
+
+    fn start_commit_task(&mut self, context: GateContext, grant: GrantIdentity) -> bool {
+        let Some(controller) = self.switch_controller.clone() else {
+            return false;
+        };
+        let Some((task_epoch, cancellation)) = self.begin_switch_task() else {
+            return false;
+        };
+        let task_cancellation = cancellation.clone();
+        let event_tx = self.switch_event_tx.clone();
+        let task_context = context.clone();
+        let task_grant = grant.clone();
+        let task = spawn_local(async move {
+            let result = controller
+                .commit(&task_context, &task_grant, &task_cancellation)
+                .await;
+            let _ = event_tx
+                .send(SwitchTaskEvent::Committed {
+                    task_epoch,
+                    context: task_context,
+                    grant: task_grant,
+                    result,
+                })
+                .await;
+        });
+        self.switch_task = Some(SwitchTask {
+            epoch: task_epoch,
+            cancellation,
+            task,
+        });
+        true
+    }
+
+    fn begin_switch_task(&mut self) -> Option<(u64, CancellationToken)> {
+        if self.switch_task.is_some() {
+            return None;
+        }
+        self.next_switch_task_epoch = self
+            .next_switch_task_epoch
+            .checked_add(1)
+            .expect("switch task epoch exhausted");
+        Some((self.next_switch_task_epoch, CancellationToken::new()))
+    }
+
+    fn start_renewal_task(&mut self, context: GateContext) -> bool {
+        let Some(controller) = self.switch_controller.clone() else {
+            return false;
+        };
+        let Some((task_epoch, cancellation)) = self.begin_switch_task() else {
+            return false;
+        };
+        let task_cancellation = cancellation.clone();
+        let event_tx = self.switch_event_tx.clone();
+        let task_context = context.clone();
+        let renew_interval = controller.renew_interval();
+        let task = spawn_local(async move {
+            loop {
+                tokio::select! {
+                    _ = task_cancellation.cancelled() => break,
+                    _ = tokio::time::sleep(renew_interval) => {}
+                }
+                let result = controller.renew(&task_context, &task_cancellation).await;
+                let failed = result.is_err();
+                if event_tx
+                    .send(SwitchTaskEvent::Renewed {
+                        task_epoch,
+                        context: task_context.clone(),
+                        result,
+                    })
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+                if failed {
+                    break;
+                }
+            }
+        });
+        self.switch_task = Some(SwitchTask {
+            epoch: task_epoch,
+            cancellation,
+            task,
+        });
+        true
+    }
+
+    fn start_cleanup_task(&mut self, context: GateContext, reason: &'static str) {
+        let Some(controller) = self.switch_controller.clone() else {
+            return;
+        };
+        let Some((task_epoch, cancellation)) = self.begin_switch_task() else {
+            return;
+        };
+        let readiness = self.peer_readiness(context.handle);
+        let task_cancellation = cancellation.clone();
+        let event_tx = self.switch_event_tx.clone();
+        let request_id = context.lease.request_id.clone();
+        let task = spawn_local(async move {
+            let readiness_result = if let Some(readiness) = readiness {
+                controller
+                    .publish_readiness(context.target, readiness, &task_cancellation)
+                    .await
+            } else {
+                Ok(())
+            };
+            let cancel_result = controller
+                .cancel(&context, reason, &task_cancellation)
+                .await;
+            let result = cancel_result.and(readiness_result);
+            let _ = event_tx
+                .send(SwitchTaskEvent::CleanupFinished {
+                    task_epoch,
+                    request_id,
+                    result,
+                })
+                .await;
+        });
+        self.switch_task = Some(SwitchTask {
+            epoch: task_epoch,
+            cancellation,
+            task,
+        });
+    }
+
+    fn handle_switch_task_event(&mut self, event: SwitchTaskEvent) {
+        match event {
+            SwitchTaskEvent::Prepared {
+                task_epoch,
+                context,
+                result,
+            } => {
+                if !self.finish_switch_task(task_epoch) {
+                    return;
+                }
+                self.handle_prepared(context, result);
+            }
+            SwitchTaskEvent::Committed {
+                task_epoch,
+                context,
+                grant,
+                result,
+            } => {
+                if !self.finish_switch_task(task_epoch) {
+                    return;
+                }
+                self.handle_committed(context, grant, result);
+            }
+            SwitchTaskEvent::Renewed {
+                task_epoch,
+                context,
+                result,
+            } => {
+                if self.switch_task.as_ref().map(|task| task.epoch) != Some(task_epoch) {
+                    return;
+                }
+                self.handle_renewed(task_epoch, context, result);
+            }
+            SwitchTaskEvent::CleanupFinished {
+                task_epoch,
+                request_id,
+                result,
+            } => {
+                if !self.finish_switch_task(task_epoch) {
+                    return;
+                }
+                match result {
+                    Ok(()) => log::info!("controller cleanup completed for {request_id}"),
+                    Err(error) => {
+                        log::warn!("controller cleanup failed for {request_id}: {error}")
+                    }
+                }
+            }
+        }
+    }
+
+    fn handle_prepared(
+        &mut self,
+        context: GateContext,
+        result: Result<PreparedGrant, SwitchClientError>,
+    ) {
+        if !self
+            .bundle_lease
+            .context()
+            .is_some_and(|current| current.same_identity(&context))
+        {
+            return;
+        }
+        let prepared = match result {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                log::warn!(
+                    "switch preparation failed for {}: {error}",
+                    context.lease.request_id
+                );
+                self.fail_gate("prepare_failed");
+                return;
+            }
+        };
+        let Some(readiness) = self.peer_readiness(context.handle) else {
+            self.fail_context(context, "peer_missing_before_grant");
+            return;
+        };
+        let bundle_ready = readiness.online && readiness.keyboard_ready && readiness.pointer_ready;
+        let (context, grant) = match self.bundle_lease.arm_grant(
+            &context,
+            prepared.request_epoch,
+            prepared.grant_epoch,
+            prepared.lease_expires_at_ms,
+            prepared.grant_expires_at_ms,
+            bundle_ready,
+            readiness.session_epoch,
+            self.controller_now_ms(),
+        ) {
+            Ok(armed) => armed,
+            Err(error) => {
+                log::warn!("grant rejected locally: {error}");
+                self.fail_context(context, "grant_rejected_locally");
+                return;
+            }
+        };
+        self.reset_switch_deadline();
+        let Some(controller) = self.switch_controller.as_ref() else {
+            self.fail_context(context, "controller_missing_after_grant");
+            return;
+        };
+        if context.target == controller.server_host() {
+            if !self.start_commit_task(context.clone(), grant) {
+                self.fail_context(context, "commit_task_busy");
+            }
+            return;
+        }
+        let now_ms = controller.now_ms();
+        let Some(deadline_ms) = self.bundle_lease.deadline_ms() else {
+            self.fail_context(context, "grant_deadline_missing");
+            return;
+        };
+        let Some(valid_for_ms) = deadline_ms.checked_sub(now_ms) else {
+            self.fail_context(context, "grant_expired_before_arm");
+            return;
+        };
+        if valid_for_ms == 0 {
+            self.fail_context(context, "grant_expired_before_arm");
+            return;
+        }
+        self.capture.arm(
+            context.handle,
+            context.lease.lease_epoch,
+            context.lease.peer_session_epoch,
+            Duration::from_millis(valid_for_ms),
+        );
+        log::info!(
+            "armed switch request {} lease epoch {} for second crossing",
+            context.lease.request_id,
+            context.lease.lease_epoch
+        );
+    }
+
+    fn handle_client_entered(&mut self, handle: ClientHandle, lease_epoch: u64) {
+        let Some(context) = self.bundle_lease.context().cloned() else {
+            self.capture.release();
+            return;
+        };
+        let Some(readiness) = self.peer_readiness(handle) else {
+            self.fail_context(context, "peer_missing_before_commit");
+            return;
+        };
+        let bundle_ready = readiness.online && readiness.keyboard_ready && readiness.pointer_ready;
+        match self.bundle_lease.commit(
+            handle,
+            lease_epoch,
+            bundle_ready,
+            readiness.session_epoch,
+            self.controller_now_ms(),
+        ) {
+            Ok((context, grant)) => {
+                self.reset_switch_deadline();
+                if !self.start_commit_task(context.clone(), grant) {
+                    self.fail_context(context, "commit_task_busy");
+                }
+            }
+            Err(error) => {
+                log::warn!("capture commit rejected locally: {error}");
+                self.fail_context(context, "capture_commit_rejected");
+            }
+        }
+    }
+
+    fn handle_committed(
+        &mut self,
+        context: GateContext,
+        _grant: GrantIdentity,
+        result: Result<u64, SwitchClientError>,
+    ) {
+        if !self
+            .bundle_lease
+            .context()
+            .is_some_and(|current| current.same_identity(&context))
+        {
+            return;
+        }
+        let renewed_until_ms = match result {
+            Ok(deadline) => deadline,
+            Err(error) => {
+                log::warn!(
+                    "controller commit failed for {}: {error}",
+                    context.lease.request_id
+                );
+                self.fail_gate("controller_commit_failed");
+                return;
+            }
+        };
+        let Some(controller) = self.switch_controller.as_ref() else {
+            self.fail_context(context, "controller_missing_after_commit");
+            return;
+        };
+        if context.target == controller.server_host() {
+            self.bundle_lease.invalidate();
+            self.switch_deadline = None;
+            log::info!(
+                "server-host switch {} committed; input remains local",
+                context.lease.request_id
+            );
+            return;
+        }
+        let Some(readiness) = self.peer_readiness(context.handle) else {
+            self.fail_context(context, "peer_missing_after_commit");
+            return;
+        };
+        let bundle_ready = readiness.online && readiness.keyboard_ready && readiness.pointer_ready;
+        if let Err(error) = self.bundle_lease.renew(
+            &context.lease.request_id,
+            renewed_until_ms,
+            bundle_ready,
+            readiness.session_epoch,
+            controller.now_ms(),
+        ) {
+            log::warn!("committed lease acknowledgement rejected locally: {error}");
+            self.fail_context(context, "commit_ack_rejected");
+            return;
+        }
+        self.reset_switch_deadline();
+        let context = self
+            .bundle_lease
+            .context()
+            .cloned()
+            .expect("renewed lease has context");
+        if !self.start_renewal_task(context.clone()) {
+            self.fail_context(context, "renewal_task_busy");
+        }
+    }
+
+    fn handle_renewed(
+        &mut self,
+        task_epoch: u64,
+        context: GateContext,
+        result: Result<u64, SwitchClientError>,
+    ) {
+        if !self
+            .bundle_lease
+            .context()
+            .is_some_and(|current| current.same_identity(&context))
+        {
+            self.cancel_switch_task();
+            return;
+        }
+        let renewed_until_ms = match result {
+            Ok(deadline) => deadline,
+            Err(error) => {
+                log::warn!(
+                    "lease renewal failed for {}: {error}",
+                    context.lease.request_id
+                );
+                self.finish_switch_task(task_epoch);
+                self.fail_gate("lease_renewal_failed");
+                return;
+            }
+        };
+        let Some(readiness) = self.peer_readiness(context.handle) else {
+            self.finish_switch_task(task_epoch);
+            self.fail_context(context, "peer_missing_during_renewal");
+            return;
+        };
+        let bundle_ready = readiness.online && readiness.keyboard_ready && readiness.pointer_ready;
+        if let Err(error) = self.bundle_lease.renew(
+            &context.lease.request_id,
+            renewed_until_ms,
+            bundle_ready,
+            readiness.session_epoch,
+            self.controller_now_ms(),
+        ) {
+            log::warn!("lease renewal acknowledgement rejected locally: {error}");
+            self.finish_switch_task(task_epoch);
+            self.fail_context(context, "renewal_ack_rejected");
+            return;
+        }
+        self.reset_switch_deadline();
+    }
+
+    fn handle_peer_readiness_change(&mut self, handle: ClientHandle) {
+        let Some(context) = self
+            .bundle_lease
+            .context()
+            .filter(|context| context.handle == handle)
+            .cloned()
+        else {
+            return;
+        };
+        let Some(readiness) = self.peer_readiness(handle) else {
+            self.fail_context(context, "peer_removed");
+            return;
+        };
+        if !readiness.online
+            || !readiness.keyboard_ready
+            || !readiness.pointer_ready
+            || readiness.session_epoch != context.lease.peer_session_epoch
+        {
+            self.fail_context(context, "peer_readiness_lost");
+        }
+    }
+
+    fn controller_now_ms(&self) -> u64 {
+        self.switch_controller
+            .as_ref()
+            .map(SwitchController::now_ms)
+            .unwrap_or(u64::MAX)
+    }
+
+    fn reset_switch_deadline(&mut self) {
+        let Some(deadline_ms) = self.bundle_lease.deadline_ms() else {
+            self.switch_deadline = None;
+            return;
+        };
+        let now_ms = self.controller_now_ms();
+        self.switch_deadline = Some(Box::pin(tokio::time::sleep(Duration::from_millis(
+            deadline_ms.saturating_sub(now_ms),
+        ))));
+    }
+
+    fn handle_switch_deadline(&mut self) {
+        self.switch_deadline = None;
+        let now_ms = self.controller_now_ms();
+        if let Some(context) = self.bundle_lease.expire(now_ms) {
+            self.fail_context(context, "local_lease_expired");
+        } else {
+            self.reset_switch_deadline();
+        }
+    }
+
+    fn fail_gate(&mut self, reason: &'static str) {
+        if let Some(context) = self.bundle_lease.invalidate() {
+            self.fail_context(context, reason);
+        }
+    }
+
+    fn fail_context(&mut self, context: GateContext, reason: &'static str) {
+        if self
+            .bundle_lease
+            .context()
+            .is_some_and(|current| current.same_identity(&context))
+        {
+            self.bundle_lease.invalidate();
+        }
+        self.capture.disarm(context.lease.lease_epoch);
+        self.cancel_switch_task();
+        self.switch_deadline = None;
+        log::warn!(
+            "switch request {} failed closed: {reason}",
+            context.lease.request_id
+        );
+        if self.active_switch_capture == Some((context.handle, context.lease.lease_epoch)) {
+            self.pending_switch_cleanup = Some((context, reason));
+            self.capture.release();
+        } else {
+            self.start_cleanup_task(context, reason);
+        }
+    }
+
+    fn release_gate_after_capture(&mut self, reason: &'static str) {
+        let Some(context) = self.bundle_lease.invalidate() else {
+            return;
+        };
+        self.cancel_switch_task();
+        self.switch_deadline = None;
+        self.start_cleanup_task(context, reason);
+    }
+
+    fn complete_pending_switch_cleanup(&mut self) {
+        if let Some((context, reason)) = self.pending_switch_cleanup.take() {
+            self.start_cleanup_task(context, reason);
+        }
+    }
+
+    fn finish_switch_task(&mut self, task_epoch: u64) -> bool {
+        if self.switch_task.as_ref().map(|task| task.epoch) != Some(task_epoch) {
+            return false;
+        }
+        self.switch_task.take();
+        true
+    }
+
+    fn cancel_switch_task(&mut self) {
+        if let Some(task) = self.switch_task.take() {
+            task.cancellation.cancel();
+            task.task.abort();
         }
     }
 

@@ -323,6 +323,7 @@ impl ClientManager {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn peer_bundle_ready(&self, handle: ClientHandle) -> Option<(bool, u64)> {
         self.clients
             .borrow()
@@ -330,6 +331,23 @@ impl ClientManager {
             .map(|(_, state)| {
                 (
                     state.alive && state.keyboard_ready && state.pointer_ready,
+                    state.peer_session_epoch,
+                )
+            })
+    }
+
+    pub(crate) fn peer_input_readiness(
+        &self,
+        handle: ClientHandle,
+    ) -> Option<(bool, bool, bool, u64)> {
+        self.clients
+            .borrow()
+            .get(handle as usize)
+            .map(|(_, state)| {
+                (
+                    state.alive,
+                    state.keyboard_ready,
+                    state.pointer_ready,
                     state.peer_session_epoch,
                 )
             })
