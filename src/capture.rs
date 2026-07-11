@@ -30,13 +30,15 @@ pub(crate) enum ICaptureEvent {
     CaptureDisabled,
     /// capture disabled
     CaptureEnabled,
-    /// A (new) client was entered.
-    /// In contrast to [`ICaptureEvent::CaptureBegin`] this
-    /// event is only triggered when the capture was
-    /// explicitly released in the meantime by
-    /// either the remote client leaving its device region,
-    /// a new device entering the screen or the release bind.
-    ClientEntered(u64),
+    /// An unarmed outgoing edge was reached and immediately released.
+    CaptureCandidate(CaptureHandle),
+    /// A client was entered with a matching one-shot gate permit.
+    ClientEntered {
+        handle: CaptureHandle,
+        lease_epoch: u64,
+    },
+    /// An active outgoing capture was released.
+    ClientReleased(CaptureHandle),
     /// A peer readiness/session update was received on the outgoing connection.
     PeerReadiness(u64),
 }
@@ -63,6 +65,10 @@ enum CaptureRequest {
     Reenable,
     /// set release bind
     SetReleaseBind(Vec<scancode::Linux>),
+    /// arm one outgoing client for one matching capture begin
+    Arm(CaptureHandle, u64),
+    /// invalidate an unconsumed permit if its epoch still matches
+    Disarm(u64),
 }
 
 impl Capture {
@@ -81,6 +87,7 @@ impl Capture {
             captures: Default::default(),
             conn,
             event_tx,
+            gate: Default::default(),
             request_rx,
             release_bind: Rc::new(RefCell::new(release_bind)),
             state: Default::default(),
@@ -132,6 +139,18 @@ impl Capture {
             .expect("channel closed");
     }
 
+    pub(crate) fn arm(&self, handle: CaptureHandle, lease_epoch: u64) {
+        self.request_tx
+            .send(CaptureRequest::Arm(handle, lease_epoch))
+            .expect("channel closed");
+    }
+
+    pub(crate) fn disarm(&self, lease_epoch: u64) {
+        self.request_tx
+            .send(CaptureRequest::Disarm(lease_epoch))
+            .expect("channel closed");
+    }
+
     pub(crate) async fn event(&mut self) -> ICaptureEvent {
         self.event_rx.recv().await.expect("channel closed")
     }
@@ -165,6 +184,7 @@ struct CaptureTask {
     captures: Vec<(CaptureHandle, Position, CaptureType)>,
     conn: LanMouseConnection,
     event_tx: Sender<ICaptureEvent>,
+    gate: CaptureGate,
     release_bind: Rc<RefCell<Vec<scancode::Linux>>>,
     request_rx: Receiver<CaptureRequest>,
     state: State,
@@ -177,6 +197,7 @@ impl CaptureTask {
 
     fn remove_capture(&mut self, handle: CaptureHandle) {
         self.captures.retain(|&(h, ..)| handle != h);
+        self.gate.remove(handle);
     }
 
     fn is_default_capture_at(&self, pos: Position) -> bool {
@@ -212,10 +233,14 @@ impl CaptureTask {
                         CaptureRequest::Reenable => break,
                         CaptureRequest::Create(h, p, t) => self.add_capture(h, p, t),
                         CaptureRequest::Destroy(h) => self.remove_capture(h),
-                        CaptureRequest::Release => { /* nothing to do */ }
+                        CaptureRequest::Release => self.gate.clear(),
                         CaptureRequest::SetReleaseBind(bind) => {
                             self.release_bind.borrow_mut().clone_from(&bind);
                         }
+                        CaptureRequest::Arm(handle, lease_epoch) => {
+                            self.gate.arm(handle, lease_epoch);
+                        }
+                        CaptureRequest::Disarm(lease_epoch) => self.gate.disarm(lease_epoch),
                     },
                     _ = self.cancellation_token.cancelled() => return,
                 }
@@ -302,7 +327,10 @@ impl CaptureTask {
                 },
                 e = self.request_rx.recv() => match e.expect("channel closed") {
                     CaptureRequest::Reenable => { /* already active */ },
-                    CaptureRequest::Release => self.release_capture(capture).await?,
+                    CaptureRequest::Release => {
+                        self.gate.clear();
+                        self.release_capture(capture).await?;
+                    }
                     CaptureRequest::Create(h, p, t) => {
                         self.add_capture(h, p, t);
                         capture.create(h, p).await?;
@@ -314,6 +342,10 @@ impl CaptureTask {
                     CaptureRequest::SetReleaseBind(bind) => {
                         self.release_bind.borrow_mut().clone_from(&bind);
                     }
+                    CaptureRequest::Arm(handle, lease_epoch) => {
+                        self.gate.arm(handle, lease_epoch);
+                    }
+                    CaptureRequest::Disarm(lease_epoch) => self.gate.disarm(lease_epoch),
                 },
                 _ = self.cancellation_token.cancelled() => break,
             }
@@ -352,13 +384,29 @@ impl CaptureTask {
             return Ok(());
         }
 
-        // activated a new client
+        // An outgoing capture may only become active by consuming a current,
+        // one-shot permit. The first crossing is always released immediately.
         if event == CaptureEvent::Begin && Some(handle) != self.active_client {
+            let Some(lease_epoch) = self.gate.consume(handle) else {
+                self.event_tx
+                    .send(ICaptureEvent::CaptureCandidate(handle))
+                    .expect("channel closed");
+                capture.release().await?;
+                return Ok(());
+            };
             self.state = State::WaitingForAck;
             self.active_client.replace(handle);
             self.event_tx
-                .send(ICaptureEvent::ClientEntered(handle))
+                .send(ICaptureEvent::ClientEntered {
+                    handle,
+                    lease_epoch,
+                })
                 .expect("channel closed");
+        }
+
+        if Some(handle) != self.active_client {
+            capture.release().await?;
+            return Ok(());
         }
 
         let opposite_pos = to_proto_pos(self.get_pos(handle).opposite());
@@ -375,7 +423,7 @@ impl CaptureTask {
         if let Err(e) = self.conn.send(event, handle).await {
             const DUR: Duration = Duration::from_millis(500);
             debounce!(PREV_LOG, DUR, log::warn!("releasing capture: {e}"));
-            capture.release().await?;
+            self.release_capture(capture).await?;
         }
         Ok(())
     }
@@ -422,8 +470,57 @@ impl CaptureTask {
             if let Err(e) = self.conn.send(ProtoEvent::Leave(0), handle).await {
                 log::warn!("failed to send Leave to client {handle}: {e}");
             }
+            self.event_tx
+                .send(ICaptureEvent::ClientReleased(handle))
+                .expect("channel closed");
         }
         capture.release().await
+    }
+}
+
+#[derive(Debug, Default)]
+struct CaptureGate {
+    armed: Option<(CaptureHandle, u64)>,
+    last_epoch: u64,
+}
+
+impl CaptureGate {
+    fn arm(&mut self, handle: CaptureHandle, lease_epoch: u64) {
+        if lease_epoch > self.last_epoch {
+            self.last_epoch = lease_epoch;
+            self.armed = Some((handle, lease_epoch));
+        }
+    }
+
+    fn consume(&mut self, handle: CaptureHandle) -> Option<u64> {
+        let (armed_handle, lease_epoch) = self.armed?;
+        if armed_handle != handle {
+            return None;
+        }
+        self.armed = None;
+        Some(lease_epoch)
+    }
+
+    fn disarm(&mut self, lease_epoch: u64) {
+        if self
+            .armed
+            .is_some_and(|(_, armed_epoch)| armed_epoch == lease_epoch)
+        {
+            self.armed = None;
+        }
+    }
+
+    fn remove(&mut self, handle: CaptureHandle) {
+        if self
+            .armed
+            .is_some_and(|(armed_handle, _)| armed_handle == handle)
+        {
+            self.armed = None;
+        }
+    }
+
+    fn clear(&mut self) {
+        self.armed = None;
     }
 }
 
@@ -474,5 +571,37 @@ impl<T> Drop for DropGuard<T> {
         self.tx
             .send(self.on_drop.take().expect("item"))
             .expect("channel closed");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn first_crossing_has_no_capture_permit() {
+        let mut gate = CaptureGate::default();
+
+        assert_eq!(gate.consume(4), None);
+    }
+
+    #[test]
+    fn permit_is_targeted_and_consumed_once() {
+        let mut gate = CaptureGate::default();
+        gate.arm(4, 7);
+
+        assert_eq!(gate.consume(5), None);
+        assert_eq!(gate.consume(4), Some(7));
+        assert_eq!(gate.consume(4), None);
+    }
+
+    #[test]
+    fn delayed_arm_and_disarm_cannot_change_newer_permit() {
+        let mut gate = CaptureGate::default();
+        gate.arm(4, 8);
+        gate.arm(5, 7);
+        gate.disarm(7);
+
+        assert_eq!(gate.consume(4), Some(8));
     }
 }

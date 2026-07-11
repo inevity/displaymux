@@ -21,7 +21,7 @@ use std::{
     sync::{Arc, RwLock},
 };
 use thiserror::Error;
-use tokio::{process::Command, signal, sync::Notify};
+use tokio::{signal, sync::Notify};
 
 #[derive(Debug, Error)]
 pub enum ServiceError {
@@ -368,9 +368,15 @@ impl Service {
                 self.capture_status = Status::Enabled;
                 self.notify_frontend(FrontendEvent::CaptureStatus(self.capture_status));
             }
-            ICaptureEvent::ClientEntered(handle) => {
-                log::info!("entering client {handle} ...");
-                self.spawn_hook_command(handle);
+            ICaptureEvent::CaptureCandidate(handle) => {
+                log::debug!("capture candidate {handle} remains local until a grant is armed");
+            }
+            ICaptureEvent::ClientEntered {
+                handle,
+                lease_epoch,
+            } => log::info!("entered client {handle} with lease epoch {lease_epoch}"),
+            ICaptureEvent::ClientReleased(handle) => {
+                log::info!("released client {handle} capture");
             }
             ICaptureEvent::PeerReadiness(handle) => self.broadcast_client(handle),
         }
@@ -602,31 +608,5 @@ impl Service {
             .map(|(c, s)| FrontendEvent::State(handle, c, s))
             .unwrap_or(FrontendEvent::NoSuchClient(handle));
         self.notify_frontend(event);
-    }
-
-    fn spawn_hook_command(&self, handle: ClientHandle) {
-        let Some(cmd) = self.client_manager.get_enter_cmd(handle) else {
-            return;
-        };
-        tokio::task::spawn_local(async move {
-            log::info!("spawning command!");
-            let mut child = match Command::new("sh").arg("-c").arg(cmd.as_str()).spawn() {
-                Ok(c) => c,
-                Err(e) => {
-                    log::warn!("could not execute cmd: {e}");
-                    return;
-                }
-            };
-            match child.wait().await {
-                Ok(s) => {
-                    if s.success() {
-                        log::info!("{cmd} exited successfully");
-                    } else {
-                        log::warn!("{cmd} exited with {s}");
-                    }
-                }
-                Err(e) => log::warn!("{cmd}: {e}"),
-            }
-        });
     }
 }
