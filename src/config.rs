@@ -60,7 +60,7 @@ fn default_path() -> Result<PathBuf, VarError> {
     Ok(PathBuf::from(default_path))
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+#[derive(Serialize, Deserialize, Clone, Default, PartialEq)]
 struct ConfigToml {
     capture_backend: Option<CaptureBackend>,
     emulation_backend: Option<EmulationBackend>,
@@ -69,6 +69,104 @@ struct ConfigToml {
     cert_path: Option<PathBuf>,
     clients: Option<Vec<TomlClient>>,
     authorized_fingerprints: Option<HashMap<String, String>>,
+    switch_controller: Option<SwitchControllerToml>,
+}
+
+#[derive(Clone, Deserialize, PartialEq, Serialize)]
+struct SwitchControllerToml {
+    url: String,
+    token: String,
+    local_host: SwitchHost,
+    server_host: SwitchHost,
+    http_timeout_ms: u64,
+    request_timeout_ms: u64,
+    poll_interval_ms: u64,
+    lease_ttl_ms: u64,
+    renew_interval_ms: u64,
+}
+
+#[derive(Clone)]
+pub(crate) struct SwitchControllerConfig {
+    pub(crate) url: reqwest::Url,
+    pub(crate) token: String,
+    pub(crate) local_host: SwitchHost,
+    pub(crate) server_host: SwitchHost,
+    pub(crate) http_timeout_ms: u64,
+    pub(crate) request_timeout_ms: u64,
+    pub(crate) poll_interval_ms: u64,
+    pub(crate) lease_ttl_ms: u64,
+    pub(crate) renew_interval_ms: u64,
+}
+
+impl TryFrom<SwitchControllerToml> for SwitchControllerConfig {
+    type Error = ConfigError;
+
+    fn try_from(config: SwitchControllerToml) -> Result<Self, Self::Error> {
+        let mut url = reqwest::Url::parse(&config.url)
+            .map_err(|error| ConfigError::SwitchController(error.to_string()))?;
+        if !matches!(url.scheme(), "http" | "https")
+            || !url.username().is_empty()
+            || url.password().is_some()
+            || url.query().is_some()
+            || url.fragment().is_some()
+        {
+            return Err(ConfigError::SwitchController(
+                "url must be an http(s) base URL without credentials, query, or fragment"
+                    .to_string(),
+            ));
+        }
+        if !url.path().ends_with('/') {
+            let path = format!("{}/", url.path());
+            url.set_path(&path);
+        }
+        if config.token.is_empty() {
+            return Err(ConfigError::SwitchController(
+                "token must not be empty".to_string(),
+            ));
+        }
+        if config.http_timeout_ms == 0
+            || config.request_timeout_ms == 0
+            || config.poll_interval_ms == 0
+            || config.lease_ttl_ms == 0
+            || config.renew_interval_ms == 0
+        {
+            return Err(ConfigError::SwitchController(
+                "all controller timing values must be non-zero".to_string(),
+            ));
+        }
+        if config.http_timeout_ms > config.request_timeout_ms {
+            return Err(ConfigError::SwitchController(
+                "http_timeout_ms must not exceed request_timeout_ms".to_string(),
+            ));
+        }
+        if config.poll_interval_ms >= config.request_timeout_ms {
+            return Err(ConfigError::SwitchController(
+                "poll_interval_ms must be less than request_timeout_ms".to_string(),
+            ));
+        }
+        if config.request_timeout_ms >= config.lease_ttl_ms {
+            return Err(ConfigError::SwitchController(
+                "lease_ttl_ms must exceed request_timeout_ms".to_string(),
+            ));
+        }
+        if config.renew_interval_ms >= config.lease_ttl_ms {
+            return Err(ConfigError::SwitchController(
+                "renew_interval_ms must be less than lease_ttl_ms".to_string(),
+            ));
+        }
+
+        Ok(Self {
+            url,
+            token: config.token,
+            local_host: config.local_host,
+            server_host: config.server_host,
+            http_timeout_ms: config.http_timeout_ms,
+            request_timeout_ms: config.request_timeout_ms,
+            poll_interval_ms: config.poll_interval_ms,
+            lease_ttl_ms: config.lease_ttl_ms,
+            renew_interval_ms: config.renew_interval_ms,
+        })
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug, Eq, PartialEq)]
@@ -250,7 +348,6 @@ impl Display for EmulationBackend {
     }
 }
 
-#[derive(Debug)]
 pub struct Config {
     /// command line arguments
     args: Args,
@@ -333,6 +430,8 @@ pub enum ConfigError {
     Var(#[from] VarError),
     #[error(transparent)]
     Watcher(#[from] notify::Error),
+    #[error("invalid switch controller configuration: {0}")]
+    SwitchController(String),
 }
 
 const DEFAULT_RELEASE_KEYS: [scancode::Linux; 4] =
@@ -373,6 +472,12 @@ impl Config {
             }
             Ok(c) => Some(c),
         };
+        if let Some(controller) = config_toml
+            .as_ref()
+            .and_then(|config| config.switch_controller.clone())
+        {
+            SwitchControllerConfig::try_from(controller)?;
+        }
 
         // --cert-path <file> overrules default location
         let cert_path = args
@@ -486,6 +591,15 @@ impl Config {
             .collect()
     }
 
+    pub(crate) fn switch_controller(&self) -> Option<SwitchControllerConfig> {
+        self.config_toml
+            .as_ref()
+            .and_then(|config| config.switch_controller.clone())
+            .map(SwitchControllerConfig::try_from)
+            .transpose()
+            .expect("switch controller was validated before installation")
+    }
+
     /// release bind for returning control to the host
     pub fn release_bind(&self) -> Vec<scancode::Linux> {
         self.config_toml
@@ -531,6 +645,12 @@ impl Config {
         let mut changed = false;
         match toml_edit::de::from_document::<ConfigToml>(current_config) {
             Ok(current_config) => {
+                if let Some(controller) = current_config.switch_controller.clone() {
+                    if let Err(error) = SwitchControllerConfig::try_from(controller) {
+                        log::warn!("{:?}: {error}", self.config_path());
+                        return Ok(false);
+                    }
+                }
                 changed = self
                     .config_toml
                     .as_ref()
@@ -576,5 +696,54 @@ impl Config {
         let _ = self.watch();
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn controller_toml() -> SwitchControllerToml {
+        SwitchControllerToml {
+            url: "http://127.0.0.1:9876".to_string(),
+            token: "test-token".to_string(),
+            local_host: SwitchHost::Linux,
+            server_host: SwitchHost::Linux,
+            http_timeout_ms: 500,
+            request_timeout_ms: 2_000,
+            poll_interval_ms: 100,
+            lease_ttl_ms: 5_000,
+            renew_interval_ms: 1_000,
+        }
+    }
+
+    #[test]
+    fn validates_complete_switch_controller() {
+        let controller = SwitchControllerConfig::try_from(controller_toml()).unwrap();
+
+        assert_eq!(controller.url.as_str(), "http://127.0.0.1:9876/");
+        assert_eq!(controller.server_host, SwitchHost::Linux);
+    }
+
+    #[test]
+    fn rejects_lease_that_can_expire_before_request_deadline() {
+        let mut config = controller_toml();
+        config.lease_ttl_ms = config.request_timeout_ms;
+
+        assert!(matches!(
+            SwitchControllerConfig::try_from(config),
+            Err(ConfigError::SwitchController(_))
+        ));
+    }
+
+    #[test]
+    fn rejects_url_with_embedded_credentials() {
+        let mut config = controller_toml();
+        config.url = "http://user:secret@127.0.0.1:9876".to_string();
+
+        assert!(matches!(
+            SwitchControllerConfig::try_from(config),
+            Err(ConfigError::SwitchController(_))
+        ));
     }
 }
