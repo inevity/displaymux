@@ -87,13 +87,17 @@ async fn ready(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Respon
     } else {
         StatusCode::SERVICE_UNAVAILABLE
     };
+    let server_now_ms = state.coordinator.now_ms();
     (
         status,
-        Json(ApiEnvelope::new(ReadyResponse {
-            ready: snapshot.ready(),
-            phase: snapshot.phase,
-            fallback_required: snapshot.fallback_required,
-        })),
+        Json(ApiEnvelope::new(
+            server_now_ms,
+            ReadyResponse {
+                ready: snapshot.ready(),
+                phase: snapshot.phase,
+                fallback_required: snapshot.fallback_required,
+            },
+        )),
     )
         .into_response()
 }
@@ -103,6 +107,7 @@ async fn status(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Respo
         return response;
     }
     Json(ApiEnvelope::new(
+        state.coordinator.now_ms(),
         (*state.snapshot_rx.borrow()).as_ref().clone(),
     ))
     .into_response()
@@ -147,7 +152,7 @@ async fn create_enter(
         },
     };
     match state.coordinator.apply(event).await {
-        Ok(snapshot) => request_response(&snapshot, &request_id),
+        Ok(snapshot) => request_response(&snapshot, &request_id, state.coordinator.now_ms()),
         Err(error) => coordinator_error(error),
     }
 }
@@ -160,7 +165,11 @@ async fn poll_enter(
     if let Err(response) = authorize(&headers, &state.controller_token) {
         return response;
     }
-    request_response(&state.snapshot_rx.borrow(), &request_id)
+    request_response(
+        &state.snapshot_rx.borrow(),
+        &request_id,
+        state.coordinator.now_ms(),
+    )
 }
 
 async fn commit_enter(
@@ -183,7 +192,7 @@ async fn commit_enter(
         })
         .await
     {
-        Ok(snapshot) => request_response(&snapshot, &request_id),
+        Ok(snapshot) => request_response(&snapshot, &request_id, state.coordinator.now_ms()),
         Err(error) => coordinator_error(error),
     }
 }
@@ -205,7 +214,7 @@ async fn cancel_enter(
         })
         .await
     {
-        Ok(snapshot) => request_response(&snapshot, &request_id),
+        Ok(snapshot) => request_response(&snapshot, &request_id, state.coordinator.now_ms()),
         Err(error) => coordinator_error(error),
     }
 }
@@ -229,10 +238,17 @@ async fn renew_enter(
         })
         .await
     {
-        Ok(snapshot) => Json(ApiEnvelope::new(RenewResponse {
-            renewed: snapshot.active_session.is_some(),
-            phase: snapshot.phase,
-        }))
+        Ok(snapshot) => Json(ApiEnvelope::new(
+            state.coordinator.now_ms(),
+            RenewResponse {
+                renewed: snapshot.active_session.is_some(),
+                renewed_until_ms: snapshot
+                    .active_session
+                    .as_ref()
+                    .map(|session| session.renewed_until_ms),
+                phase: snapshot.phase,
+            },
+        ))
         .into_response(),
         Err(error) => coordinator_error(error),
     }
@@ -266,10 +282,13 @@ async fn update_readiness(
         })
         .await
     {
-        Ok(snapshot) => Json(ApiEnvelope::new(ReadinessResponse {
-            host,
-            readiness: snapshot.peers.get(&host).cloned().unwrap_or_default(),
-        }))
+        Ok(snapshot) => Json(ApiEnvelope::new(
+            state.coordinator.now_ms(),
+            ReadinessResponse {
+                host,
+                readiness: snapshot.peers.get(&host).cloned().unwrap_or_default(),
+            },
+        ))
         .into_response(),
         Err(error) => coordinator_error(error),
     }
@@ -294,18 +313,21 @@ async fn multiview(state: Arc<AppState>, headers: HeaderMap, enabled: bool) -> R
     {
         Ok(snapshot) => (
             StatusCode::ACCEPTED,
-            Json(ApiEnvelope::new(MultiViewResponse {
-                enabled,
-                phase: snapshot.phase,
-                switch_epoch: snapshot.switch_epoch,
-            })),
+            Json(ApiEnvelope::new(
+                state.coordinator.now_ms(),
+                MultiViewResponse {
+                    enabled,
+                    phase: snapshot.phase,
+                    switch_epoch: snapshot.switch_epoch,
+                },
+            )),
         )
             .into_response(),
         Err(error) => coordinator_error(error),
     }
 }
 
-fn request_response(state: &ProtocolState, request_id: &str) -> Response {
+fn request_response(state: &ProtocolState, request_id: &str, server_now_ms: u64) -> Response {
     let Some(request) = state.request(request_id).cloned() else {
         return api_error(
             StatusCode::NOT_FOUND,
@@ -321,7 +343,7 @@ fn request_response(state: &ProtocolState, request_id: &str) -> Response {
         | RequestStatus::Fallback
         | RequestStatus::Expired => StatusCode::CONFLICT,
     };
-    (status, Json(ApiEnvelope::new(request))).into_response()
+    (status, Json(ApiEnvelope::new(server_now_ms, request))).into_response()
 }
 
 fn coordinator_error(error: CoordinatorError) -> Response {
@@ -452,13 +474,15 @@ struct ReadinessRequest {
 #[derive(Debug, Serialize)]
 struct ApiEnvelope<T> {
     protocol_version: u16,
+    server_now_ms: u64,
     data: T,
 }
 
 impl<T> ApiEnvelope<T> {
-    fn new(data: T) -> Self {
+    fn new(server_now_ms: u64, data: T) -> Self {
         Self {
             protocol_version: PROTOCOL_VERSION,
+            server_now_ms,
             data,
         }
     }
@@ -483,6 +507,7 @@ struct ReadyResponse {
 #[derive(Debug, Serialize)]
 struct RenewResponse {
     renewed: bool,
+    renewed_until_ms: Option<u64>,
     phase: crate::domain::ProtocolPhase,
 }
 
@@ -625,6 +650,10 @@ mod tests {
         let body = body_json(response).await;
         assert_eq!(body["data"]["request_id"], "request-1");
         assert_eq!(body["data"]["status"], "switching");
+        let server_now_ms = body["server_now_ms"].as_u64().unwrap();
+        let lease_expires_at_ms = body["data"]["lease"]["expires_at_ms"].as_u64().unwrap();
+        assert!(lease_expires_at_ms >= server_now_ms);
+        assert!(lease_expires_at_ms - server_now_ms <= 300);
         assert_eq!(handle.snapshot().keyboard_owner, Host::Linux);
         assert!(matches!(
             effects.ordinary.recv().await,
@@ -634,6 +663,101 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[tokio::test]
+    async fn renewal_returns_deadline_in_the_daemon_clock_domain() {
+        let (app, handle, _effects) = ready_app().await;
+        let create_response = app
+            .clone()
+            .oneshot(
+                authenticated(Request::builder().method("POST").uri("/enter/mac"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "client_id": "hub",
+                            "request_id": "request-1",
+                            "lease_id": "lease-1",
+                            "lease_epoch": 1,
+                            "peer_session_epoch": 9,
+                            "lease_ttl_ms": 300
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(create_response.status(), StatusCode::ACCEPTED);
+
+        let switch_epoch = handle.snapshot().switch_epoch;
+        handle
+            .apply(Event::Observation {
+                switch_epoch,
+                mode: TvMode::Fullscreen,
+                input: Some(Host::Mac),
+                signals: BTreeMap::from([
+                    (Host::Linux, true),
+                    (Host::Mac, true),
+                    (Host::Windows, false),
+                ]),
+            })
+            .await
+            .unwrap();
+        let request = handle.snapshot().active_request.clone().unwrap();
+        let grant = request.grant.clone().unwrap();
+
+        let commit_response = app
+            .clone()
+            .oneshot(
+                authenticated(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/enter/request/request-1/commit"),
+                )
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "request_epoch": request.request_epoch,
+                        "grant_epoch": grant.grant_epoch,
+                        "lease_id": request.lease.lease_id,
+                        "lease_epoch": request.lease.lease_epoch
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(commit_response.status(), StatusCode::OK);
+
+        let renew_response = app
+            .oneshot(
+                authenticated(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/internal/enter/request/request-1/renew"),
+                )
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "lease_id": "lease-1",
+                        "lease_epoch": 1,
+                        "peer_session_epoch": 9
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(renew_response.status(), StatusCode::OK);
+        let body = body_json(renew_response).await;
+        assert_eq!(body["data"]["renewed"], true);
+        let server_now_ms = body["server_now_ms"].as_u64().unwrap();
+        let renewed_until_ms = body["data"]["renewed_until_ms"].as_u64().unwrap();
+        assert!(renewed_until_ms > server_now_ms);
+        assert!(renewed_until_ms - server_now_ms <= TIMING.lease_ms);
     }
 
     #[tokio::test]
