@@ -71,6 +71,7 @@ impl Display for Backend {
 }
 
 pub struct InputEmulation {
+    backend: Backend,
     emulation: Box<dyn Emulation>,
     handles: HashSet<EmulationHandle>,
     pressed_keys: HashMap<EmulationHandle, HashSet<u32>>,
@@ -94,6 +95,7 @@ impl InputEmulation {
             Backend::Dummy => Box::new(dummy::DummyEmulation::new()),
         };
         Ok(Self {
+            backend,
             emulation,
             handles: HashSet::new(),
             pressed_keys: HashMap::new(),
@@ -135,6 +137,10 @@ impl InputEmulation {
         }
 
         Err(EmulationCreationError::NoAvailableBackend)
+    }
+
+    pub fn backend(&self) -> Backend {
+        self.backend
     }
 
     pub async fn consume(

@@ -53,6 +53,8 @@ pub(crate) enum EmulationEvent {
     },
     /// emulation was enabled
     EmulationEnabled {
+        keyboard_ready: bool,
+        pointer_ready: bool,
         session_epoch: u64,
     },
     /// capture should be released
@@ -67,12 +69,6 @@ pub(crate) enum EmulationEvent {
     PeerHello {
         addr: SocketAddr,
         commit: [u8; 8],
-    },
-    PeerReadiness {
-        addr: SocketAddr,
-        keyboard_ready: bool,
-        pointer_ready: bool,
-        session_epoch: u64,
     },
     ReleaseAcknowledged {
         addr: SocketAddr,
@@ -213,7 +209,7 @@ impl ListenTask {
                                 if let Some(release_epoch) = pending_releases.retry_epoch(addr) {
                                     self.listener.reply(addr, ProtoEvent::ReleaseRequest { release_epoch }).await;
                                 }
-                                self.listener.reply(addr, ProtoEvent::Pong(self.emulation_proxy.emulation_active.get())).await;
+                                self.listener.reply(addr, ProtoEvent::Pong(self.emulation_proxy.control_ready())).await;
                                 self.listener.reply(addr, self.emulation_proxy.readiness()).await;
                             }
                             // Peer's version handshake. Echo our own
@@ -233,17 +229,8 @@ impl ListenTask {
                                 self.event_tx.send(EmulationEvent::PeerHello { addr, commit }).expect("channel closed");
                             }
                             ProtoEvent::Readiness {
-                                keyboard_ready,
-                                pointer_ready,
-                                session_epoch,
-                            } => {
-                                self.event_tx.send(EmulationEvent::PeerReadiness {
-                                    addr,
-                                    keyboard_ready,
-                                    pointer_ready,
-                                    session_epoch,
-                                }).expect("channel closed");
-                            }
+                                ..
+                            } => {}
                             ProtoEvent::ReleaseAck { release_epoch } => {
                                 if pending_releases.acknowledge(addr, release_epoch) {
                                     self.event_tx.send(EmulationEvent::ReleaseAcknowledged {
@@ -310,7 +297,8 @@ impl ListenTask {
 /// proxy handling the actual input emulation,
 /// discarding events when it is disabled
 pub(crate) struct EmulationProxy {
-    emulation_active: Rc<Cell<bool>>,
+    keyboard_ready: Rc<Cell<bool>>,
+    pointer_ready: Rc<Cell<bool>>,
     session_epoch: Rc<Cell<u64>>,
     exit_requested: Rc<Cell<bool>>,
     request_tx: Sender<ProxyRequest>,
@@ -329,7 +317,8 @@ impl EmulationProxy {
     fn new(backend: Option<input_emulation::Backend>) -> Self {
         let (request_tx, request_rx) = channel();
         let (event_tx, event_rx) = channel();
-        let emulation_active = Rc::new(Cell::new(false));
+        let keyboard_ready = Rc::new(Cell::new(false));
+        let pointer_ready = Rc::new(Cell::new(false));
         let session_epoch = Rc::new(Cell::new(0));
         let exit_requested = Rc::new(Cell::new(false));
         let emulation_task = EmulationTask {
@@ -343,7 +332,8 @@ impl EmulationProxy {
         };
         let task = spawn_local(emulation_task.run());
         Self {
-            emulation_active,
+            keyboard_ready,
+            pointer_ready,
             session_epoch,
             exit_requested,
             request_tx,
@@ -355,13 +345,19 @@ impl EmulationProxy {
     async fn event(&mut self) -> EmulationEvent {
         let event = self.event_rx.recv().await.expect("channel closed");
         match &event {
-            EmulationEvent::EmulationEnabled { session_epoch } => {
+            EmulationEvent::EmulationEnabled {
+                keyboard_ready,
+                pointer_ready,
+                session_epoch,
+            } => {
                 self.session_epoch.set(*session_epoch);
-                self.emulation_active.set(true);
+                self.keyboard_ready.set(*keyboard_ready);
+                self.pointer_ready.set(*pointer_ready);
             }
             EmulationEvent::EmulationDisabled { session_epoch } => {
                 self.session_epoch.set(*session_epoch);
-                self.emulation_active.set(false);
+                self.keyboard_ready.set(false);
+                self.pointer_ready.set(false);
             }
             _ => {}
         }
@@ -370,15 +366,19 @@ impl EmulationProxy {
 
     fn readiness(&self) -> ProtoEvent {
         ProtoEvent::Readiness {
-            keyboard_ready: self.emulation_active.get(),
-            pointer_ready: self.emulation_active.get(),
+            keyboard_ready: self.keyboard_ready.get(),
+            pointer_ready: self.pointer_ready.get(),
             session_epoch: self.session_epoch.get(),
         }
     }
 
+    fn control_ready(&self) -> bool {
+        self.keyboard_ready.get() && self.pointer_ready.get()
+    }
+
     fn consume(&self, event: Event, addr: SocketAddr) {
         // ignore events if emulation is currently disabled
-        if self.emulation_active.get() {
+        if self.control_ready() {
             self.request_tx
                 .send(ProxyRequest::Input(event, addr))
                 .expect("channel closed");
@@ -444,6 +444,7 @@ impl EmulationTask {
             // allow termination event while requesting input emulation
             _ = wait_for_termination(&mut self.request_rx) => return Ok(()),
         };
+        let (keyboard_ready, pointer_ready) = backend_readiness(emulation.backend());
 
         let enabled_epoch = self.next_session_epoch;
         let disabled_epoch = enabled_epoch
@@ -457,6 +458,8 @@ impl EmulationTask {
         let _emulation_guard = DropGuard::new(
             self.event_tx.clone(),
             EmulationEvent::EmulationEnabled {
+                keyboard_ready,
+                pointer_ready,
                 session_epoch: enabled_epoch,
             },
             EmulationEvent::EmulationDisabled {
@@ -523,6 +526,11 @@ impl EmulationTask {
             }
         }
     }
+}
+
+fn backend_readiness(backend: input_emulation::Backend) -> (bool, bool) {
+    let ready = backend != input_emulation::Backend::Dummy;
+    (ready, ready)
 }
 
 fn to_ipc_pos(pos: Position) -> lan_mouse_ipc::Position {
@@ -602,5 +610,13 @@ mod tests {
         pending.disconnected(peer());
 
         assert_eq!(pending.retry_epoch(peer()), None);
+    }
+
+    #[test]
+    fn dummy_backend_never_reports_control_readiness() {
+        assert_eq!(
+            backend_readiness(input_emulation::Backend::Dummy),
+            (false, false)
+        );
     }
 }

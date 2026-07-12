@@ -351,6 +351,7 @@ async fn receive_loop(
     ping_response: Rc<RefCell<HashSet<SocketAddr>>>,
 ) {
     let mut buf = [0u8; MAX_EVENT_SIZE];
+    let mut latest_peer_session_epoch = None;
     while conn.recv(&mut buf).await.is_ok() {
         let current = conns
             .lock()
@@ -380,6 +381,14 @@ async fn receive_loop(
                         pointer_ready,
                         session_epoch,
                     } => {
+                        if !accept_readiness_epoch(
+                            &mut latest_peer_session_epoch,
+                            keyboard_ready,
+                            pointer_ready,
+                            session_epoch,
+                        ) {
+                            continue;
+                        }
                         client_manager.set_peer_readiness(
                             handle,
                             keyboard_ready,
@@ -410,6 +419,22 @@ async fn receive_loop(
         ))
         .expect("channel closed");
     }
+}
+
+fn accept_readiness_epoch(
+    latest: &mut Option<u64>,
+    keyboard_ready: bool,
+    pointer_ready: bool,
+    candidate: u64,
+) -> bool {
+    if candidate == 0 {
+        return latest.is_none() && !keyboard_ready && !pointer_ready;
+    }
+    if latest.is_some_and(|current| candidate < current) {
+        return false;
+    }
+    *latest = Some(candidate);
+    true
 }
 
 async fn disconnect(
@@ -485,5 +510,45 @@ mod tests {
                 .expect("active client did not start a readiness connection");
             })
             .await;
+    }
+
+    #[test]
+    fn readiness_order_is_scoped_to_one_connection() {
+        let mut first_connection = None;
+        assert!(accept_readiness_epoch(
+            &mut first_connection,
+            true,
+            true,
+            100
+        ));
+        assert!(accept_readiness_epoch(
+            &mut first_connection,
+            false,
+            false,
+            102
+        ));
+        assert!(!accept_readiness_epoch(
+            &mut first_connection,
+            true,
+            true,
+            101
+        ));
+
+        let mut restarted_connection = None;
+        assert!(accept_readiness_epoch(
+            &mut restarted_connection,
+            true,
+            true,
+            3
+        ));
+    }
+
+    #[test]
+    fn zero_epoch_only_describes_initial_unavailability() {
+        let mut latest = None;
+        assert!(accept_readiness_epoch(&mut latest, false, false, 0));
+        assert!(!accept_readiness_epoch(&mut latest, true, true, 0));
+        assert!(accept_readiness_epoch(&mut latest, true, true, 7));
+        assert!(!accept_readiness_epoch(&mut latest, false, false, 0));
     }
 }

@@ -452,24 +452,6 @@ impl Service {
                     }
                 }
             }
-            EmulationEvent::PeerReadiness {
-                addr,
-                keyboard_ready,
-                pointer_ready,
-                session_epoch,
-            } => {
-                if let Some(handle) = self.client_manager.get_client(addr) {
-                    if self.client_manager.set_peer_readiness(
-                        handle,
-                        keyboard_ready,
-                        pointer_ready,
-                        session_epoch,
-                    ) {
-                        self.broadcast_client(handle);
-                        self.handle_peer_readiness_change(handle);
-                    }
-                }
-            }
             EmulationEvent::ReleaseAcknowledged {
                 addr,
                 release_epoch,

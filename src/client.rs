@@ -315,9 +315,6 @@ impl ClientManager {
         if session_epoch == 0 && (keyboard_ready || pointer_ready) {
             return false;
         }
-        if state.peer_session_epoch != 0 && session_epoch < state.peer_session_epoch {
-            return false;
-        }
 
         state.keyboard_ready = keyboard_ready;
         state.pointer_ready = pointer_ready;
@@ -422,18 +419,6 @@ mod tests {
 
         assert!(clients.set_peer_readiness(handle, true, true, 10));
         assert_eq!(clients.peer_bundle_ready(handle), Some((true, 10)));
-    }
-
-    #[test]
-    fn stale_readiness_cannot_revive_newer_session() {
-        let clients = ClientManager::default();
-        let handle = clients.add_client();
-        clients.set_peer_commit(handle, Some(local_commit()));
-        clients.set_alive(handle, true);
-
-        assert!(clients.set_peer_readiness(handle, false, false, 12));
-        assert!(!clients.set_peer_readiness(handle, true, true, 11));
-        assert_eq!(clients.peer_bundle_ready(handle), Some((false, 12)));
     }
 
     #[test]
