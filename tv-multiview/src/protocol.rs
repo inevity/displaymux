@@ -803,6 +803,7 @@ fn request_observation(
     switch_epoch: u64,
 ) {
     state.observation_in_flight = Some(switch_epoch);
+    state.next_signal_poll_ms = None;
     state.phase_deadline_ms = Some(now_ms.saturating_add(timing.observation_ms));
     effects.push(Effect::Observe { switch_epoch });
 }
@@ -1824,6 +1825,12 @@ mod tests {
                 switch_epoch: remote.switch_epoch
             }]
         );
+        assert_eq!(polling.next.next_signal_poll_ms, None);
+        assert_eq!(
+            polling.next.next_deadline_ms(),
+            polling.next.phase_deadline_ms
+        );
+        assert!(polling.next.next_deadline_ms().unwrap() > poll_at);
 
         let duplicate = apply(&polling.next, Event::Tick, poll_at + 1, TIMING).unwrap();
         assert!(duplicate.effects.is_empty());
@@ -1831,6 +1838,7 @@ mod tests {
             duplicate.next.observation_in_flight,
             Some(remote.switch_epoch)
         );
+        assert!(duplicate.next.next_deadline_ms().unwrap() > poll_at + 1);
 
         let timed_out = apply(
             &duplicate.next,
