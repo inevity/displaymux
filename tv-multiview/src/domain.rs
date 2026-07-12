@@ -82,25 +82,13 @@ pub enum ProtocolPhase {
     MultiviewChanging,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PeerReadiness {
     pub online: bool,
     pub keyboard_ready: bool,
     pub pointer_ready: bool,
     pub session_epoch: u64,
     pub observed_at_ms: u64,
-}
-
-impl Default for PeerReadiness {
-    fn default() -> Self {
-        Self {
-            online: false,
-            keyboard_ready: false,
-            pointer_ready: false,
-            session_epoch: 0,
-            observed_at_ms: 0,
-        }
-    }
 }
 
 impl PeerReadiness {
@@ -164,21 +152,11 @@ pub struct ActiveSession {
     pub renewed_until_ms: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SignalObservation {
     pub present: bool,
     pub switch_epoch: u64,
     pub observed_at_ms: u64,
-}
-
-impl Default for SignalObservation {
-    fn default() -> Self {
-        Self {
-            present: false,
-            switch_epoch: 0,
-            observed_at_ms: 0,
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

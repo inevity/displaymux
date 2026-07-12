@@ -24,6 +24,26 @@ use tracing::{debug, error, info, warn};
 
 type TvSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
+trait SsapSocket {
+    async fn write_message(&mut self, message: Message) -> Result<(), SsapError>;
+    async fn read_message(&mut self) -> Result<Message, SsapError>;
+}
+
+impl SsapSocket for TvSocket {
+    async fn write_message(&mut self, message: Message) -> Result<(), SsapError> {
+        self.send(message).await?;
+        self.flush().await?;
+        Ok(())
+    }
+
+    async fn read_message(&mut self) -> Result<Message, SsapError> {
+        self.next()
+            .await
+            .ok_or(SsapError::Closed)?
+            .map_err(Into::into)
+    }
+}
+
 #[derive(Debug)]
 struct ReconnectBackoff {
     initial_ms: u64,
@@ -147,17 +167,38 @@ async fn connect_and_run(
             .await
             .map_err(|_| SsapError::Timeout("connect"))??;
 
+    run_connected_session(
+        &mut socket,
+        config,
+        client_key,
+        coordinator,
+        effects,
+        backoff,
+        runtime_metrics,
+    )
+    .await
+}
+
+async fn run_connected_session<S: SsapSocket>(
+    socket: &mut S,
+    config: &DaemonConfig,
+    client_key: &str,
+    coordinator: &CoordinatorHandle,
+    effects: &mut EffectReceivers,
+    backoff: &mut ReconnectBackoff,
+    runtime_metrics: &RuntimeMetrics,
+) -> Result<(), SsapError> {
     coordinator
         .notify_safety(Event::TransportRegistering)
         .await
         .map_err(|_| SsapError::CoordinatorClosed)?;
-    send_json(&mut socket, codec::registration(client_key)).await?;
-    wait_for_registration(&mut socket, config.timeouts.command_ms).await?;
+    send_json(socket, codec::registration(client_key)).await?;
+    wait_for_registration(socket, config.timeouts.command_ms).await?;
     info!(event = "ssap_registered", client_key_present = true);
 
-    send_json(&mut socket, codec::subscription()).await?;
+    send_json(socket, codec::subscription()).await?;
     let subscription = wait_for_id(
-        &mut socket,
+        socket,
         codec::MULTIVIEW_SUBSCRIPTION_ID,
         config.timeouts.command_ms,
         coordinator,
@@ -172,7 +213,7 @@ async fn connect_and_run(
 
     let mut next_id = 1u64;
     let switch_epoch = coordinator.snapshot().switch_epoch;
-    let (mode, input, signals) = observe(&mut socket, &mut next_id, config, coordinator).await?;
+    let (mode, input, signals) = observe(socket, &mut next_id, config, coordinator).await?;
     coordinator
         .notify_safety(Event::TransportSynchronized {
             mode,
@@ -193,34 +234,33 @@ async fn connect_and_run(
             biased;
             effect = effects.safety.recv() => {
                 let Some(effect) = effect else { return Ok(()); };
-                execute_effect(&mut socket, &mut next_id, config, coordinator, effect).await?;
+                execute_effect(socket, &mut next_id, config, coordinator, effect).await?;
                 last_received = Instant::now();
             }
-            message = socket.next() => {
-                let message = message.ok_or(SsapError::Closed)??;
-                if let Some(value) = decode_message(&mut socket, message).await? {
+            message = socket.read_message() => {
+                let message = message?;
+                if let Some(value) = decode_message(socket, message).await? {
                     handle_unsolicited(value, coordinator).await?;
                 }
                 last_received = Instant::now();
             }
             effect = effects.ordinary.recv() => {
                 let Some(effect) = effect else { return Ok(()); };
-                execute_effect(&mut socket, &mut next_id, config, coordinator, effect).await?;
+                execute_effect(socket, &mut next_id, config, coordinator, effect).await?;
                 last_received = Instant::now();
             }
             _ = keepalive.tick() => {
                 if last_received.elapsed() >= Duration::from_millis(config.timeouts.keepalive_timeout_ms) {
                     return Err(SsapError::Timeout("keepalive"));
                 }
-                socket.send(Message::Ping(Vec::new().into())).await?;
-                socket.flush().await?;
+                socket.write_message(Message::Ping(Vec::new().into())).await?;
             }
         }
     }
 }
 
-async fn execute_effect(
-    socket: &mut TvSocket,
+async fn execute_effect<S: SsapSocket>(
+    socket: &mut S,
     next_id: &mut u64,
     config: &DaemonConfig,
     coordinator: &CoordinatorHandle,
@@ -329,8 +369,8 @@ async fn execute_effect(
     Ok(())
 }
 
-async fn observe(
-    socket: &mut TvSocket,
+async fn observe<S: SsapSocket>(
+    socket: &mut S,
     next_id: &mut u64,
     config: &DaemonConfig,
     coordinator: &CoordinatorHandle,
@@ -370,8 +410,8 @@ async fn observe(
     ))
 }
 
-async fn request_payload(
-    socket: &mut TvSocket,
+async fn request_payload<S: SsapSocket>(
+    socket: &mut S,
     next_id: &mut u64,
     uri: &str,
     payload: Value,
@@ -385,7 +425,10 @@ async fn request_payload(
     Ok(codec::successful_payload(&response)?.clone())
 }
 
-async fn wait_for_registration(socket: &mut TvSocket, timeout_ms: u64) -> Result<(), SsapError> {
+async fn wait_for_registration<S: SsapSocket>(
+    socket: &mut S,
+    timeout_ms: u64,
+) -> Result<(), SsapError> {
     tokio::time::timeout(Duration::from_millis(timeout_ms), async {
         loop {
             let value = receive_json(socket).await?;
@@ -398,8 +441,8 @@ async fn wait_for_registration(socket: &mut TvSocket, timeout_ms: u64) -> Result
     .map_err(|_| SsapError::Timeout("registration"))?
 }
 
-async fn wait_for_id(
-    socket: &mut TvSocket,
+async fn wait_for_id<S: SsapSocket>(
+    socket: &mut S,
     expected_id: &str,
     timeout_ms: u64,
     coordinator: &CoordinatorHandle,
@@ -435,31 +478,30 @@ async fn handle_unsolicited(
     Ok(())
 }
 
-async fn send_json(socket: &mut TvSocket, value: Value) -> Result<(), SsapError> {
-    socket.send(Message::Text(value.to_string().into())).await?;
-    socket.flush().await?;
-    Ok(())
+async fn send_json<S: SsapSocket>(socket: &mut S, value: Value) -> Result<(), SsapError> {
+    socket
+        .write_message(Message::Text(value.to_string().into()))
+        .await
 }
 
-async fn receive_json(socket: &mut TvSocket) -> Result<Value, SsapError> {
+async fn receive_json<S: SsapSocket>(socket: &mut S) -> Result<Value, SsapError> {
     loop {
-        let message = socket.next().await.ok_or(SsapError::Closed)??;
+        let message = socket.read_message().await?;
         if let Some(value) = decode_message(socket, message).await? {
             return Ok(value);
         }
     }
 }
 
-async fn decode_message(
-    socket: &mut TvSocket,
+async fn decode_message<S: SsapSocket>(
+    socket: &mut S,
     message: Message,
 ) -> Result<Option<Value>, SsapError> {
     match message {
         Message::Text(text) => Ok(Some(serde_json::from_str(&text)?)),
         Message::Binary(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
         Message::Ping(payload) => {
-            socket.send(Message::Pong(payload)).await?;
-            socket.flush().await?;
+            socket.write_message(Message::Pong(payload)).await?;
             Ok(None)
         }
         Message::Pong(_) | Message::Frame(_) => Ok(None),
@@ -544,6 +586,94 @@ impl SsapError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        coordinator,
+        domain::ProtocolState,
+        protocol::{Event, ProtocolTiming},
+    };
+    use std::{collections::VecDeque, future::pending};
+
+    enum ReadStep {
+        Message(Message),
+        Pending,
+    }
+
+    #[derive(Default)]
+    struct ScriptedSocket {
+        incoming: VecDeque<ReadStep>,
+        sent: Vec<Message>,
+    }
+
+    impl ScriptedSocket {
+        fn new(incoming: impl IntoIterator<Item = Message>) -> Self {
+            Self {
+                incoming: incoming.into_iter().map(ReadStep::Message).collect(),
+                sent: Vec::new(),
+            }
+        }
+    }
+
+    impl SsapSocket for ScriptedSocket {
+        async fn write_message(&mut self, message: Message) -> Result<(), SsapError> {
+            self.sent.push(message);
+            Ok(())
+        }
+
+        async fn read_message(&mut self) -> Result<Message, SsapError> {
+            match self.incoming.pop_front() {
+                Some(ReadStep::Message(message)) => Ok(message),
+                Some(ReadStep::Pending) => pending().await,
+                None => Err(SsapError::Closed),
+            }
+        }
+    }
+
+    fn test_config() -> DaemonConfig {
+        toml::from_str(
+            r#"
+bind_address = "127.0.0.1:8765"
+tv_ip = "192.0.2.10"
+server_host = "linux"
+controller_token = "test-token"
+client_key_path = "/tmp/client-key.sqlite"
+
+[inputs]
+linux = "HDMI_4"
+mac = "HDMI_3"
+windows = "HDMI_2"
+"#,
+        )
+        .unwrap()
+    }
+
+    fn timing(config: &DaemonConfig) -> ProtocolTiming {
+        ProtocolTiming {
+            command_ms: config.timeouts.command_ms,
+            observation_ms: config.timeouts.observation_ms,
+            grant_ms: config.timeouts.grant_ms,
+            wake_ms: config.timeouts.wake_ms,
+            lease_ms: config.timeouts.lease_ms,
+            signal_poll_ms: config.timeouts.signal_poll_ms,
+        }
+    }
+
+    fn text(value: Value) -> Message {
+        Message::Text(value.to_string().into())
+    }
+
+    fn response(id: &str, payload: Value) -> Message {
+        text(json!({"id": id, "type": "response", "payload": payload}))
+    }
+
+    async fn wait_until(mut condition: impl FnMut() -> bool) {
+        tokio::time::timeout(Duration::from_millis(100), async {
+            while !condition() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("condition was not reached");
+    }
 
     #[test]
     fn parses_colon_separated_mac() {
@@ -568,5 +698,146 @@ mod tests {
         assert_eq!(backoff.failed(), (2_000, 2));
         backoff.synchronized();
         assert_eq!(backoff.failed(), (1_000, 1));
+    }
+
+    #[tokio::test]
+    async fn connected_session_registers_subscribes_and_resynchronizes() {
+        let config = test_config();
+        let (coordinator, mut effects, coordinator_task) =
+            coordinator::spawn(ProtocolState::new(Host::Linux, 32), timing(&config), 8, 4);
+        let mut socket = ScriptedSocket::new([
+            text(json!({
+                "type": "registered",
+                "payload": {"client-key": "test-key"}
+            })),
+            response(
+                codec::MULTIVIEW_SUBSCRIPTION_ID,
+                json!({"subscribed": true}),
+            ),
+            response(
+                "request-1",
+                json!({
+                    "returnValue": true,
+                    "settings": {"multiViewStatus": "off"}
+                }),
+            ),
+            response(
+                "request-2",
+                json!({"returnValue": true, "appId": "com.webos.app.hdmi4"}),
+            ),
+            response(
+                "request-3",
+                json!({
+                    "returnValue": true,
+                    "devices": [
+                        {"id": "HDMI_2", "hdmiSignalExist": false},
+                        {"id": "HDMI_3", "hdmiSignalExist": false},
+                        {"id": "HDMI_4", "hdmiSignalExist": true}
+                    ]
+                }),
+            ),
+        ]);
+        let mut backoff = ReconnectBackoff::new(1_000, 60_000);
+        assert_eq!(backoff.failed(), (1_000, 1));
+        let result = run_connected_session(
+            &mut socket,
+            &config,
+            "test-key",
+            &coordinator,
+            &mut effects,
+            &mut backoff,
+            &RuntimeMetrics::default(),
+        )
+        .await;
+
+        assert!(matches!(result, Err(SsapError::Closed)));
+        wait_until(|| coordinator.snapshot().ready()).await;
+        let snapshot = coordinator.snapshot();
+        assert!(snapshot.ready());
+        assert_eq!(snapshot.observed_input, Some(Host::Linux));
+        assert!(snapshot.input_signal[&Host::Linux].present);
+        assert_eq!(backoff.failed(), (1_000, 1));
+        let sent: Vec<Value> = socket
+            .sent
+            .iter()
+            .map(|message| match message {
+                Message::Text(text) => serde_json::from_str(text).unwrap(),
+                other => panic!("unexpected outbound message: {other:?}"),
+            })
+            .collect();
+        assert_eq!(sent[0]["id"], "register-0");
+        assert_eq!(sent[1]["id"], codec::MULTIVIEW_SUBSCRIPTION_ID);
+        assert_eq!(sent[2]["id"], "request-1");
+        assert_eq!(sent[3]["id"], "request-2");
+        assert_eq!(sent[4]["id"], "request-3");
+        coordinator_task.abort();
+    }
+
+    #[tokio::test]
+    async fn wait_for_id_handles_callback_and_discards_delayed_old_response() {
+        let config = test_config();
+        let (coordinator, _effects, coordinator_task) =
+            coordinator::spawn(ProtocolState::new(Host::Linux, 32), timing(&config), 8, 4);
+        coordinator
+            .apply_safety(Event::TransportSynchronized {
+                mode: TvMode::Fullscreen,
+                input: Some(Host::Linux),
+                signals: BTreeMap::from([
+                    (Host::Linux, true),
+                    (Host::Mac, false),
+                    (Host::Windows, false),
+                ]),
+            })
+            .await
+            .unwrap();
+        let mut socket = ScriptedSocket::new([
+            response(
+                codec::MULTIVIEW_SUBSCRIPTION_ID,
+                json!({
+                    "returnValue": true,
+                    "settings": {"multiViewStatus": "on"}
+                }),
+            ),
+            response("request-old", json!({"returnValue": true})),
+            response("request-current", json!({"returnValue": true, "value": 7})),
+        ]);
+
+        let current = wait_for_id(&mut socket, "request-current", 100, &coordinator)
+            .await
+            .unwrap();
+        assert_eq!(current["payload"]["value"], 7);
+        wait_until(|| coordinator.snapshot().fallback_reason.is_some()).await;
+        assert_eq!(
+            coordinator.snapshot().fallback_reason.as_deref(),
+            Some("manual_tv_override")
+        );
+        coordinator_task.abort();
+    }
+
+    #[tokio::test]
+    async fn receive_json_replies_to_ping_before_returning_payload() {
+        let mut socket = ScriptedSocket::new([
+            Message::Ping(vec![1, 2, 3].into()),
+            text(json!({"id": "request-1", "payload": {"returnValue": true}})),
+        ]);
+
+        let value = receive_json(&mut socket).await.unwrap();
+        assert_eq!(value["id"], "request-1");
+        assert_eq!(socket.sent, vec![Message::Pong(vec![1, 2, 3].into())]);
+    }
+
+    #[tokio::test]
+    async fn response_timeout_is_bounded() {
+        let config = test_config();
+        let (coordinator, _effects, coordinator_task) =
+            coordinator::spawn(ProtocolState::new(Host::Linux, 32), timing(&config), 8, 4);
+        let mut socket = ScriptedSocket {
+            incoming: VecDeque::from([ReadStep::Pending]),
+            sent: Vec::new(),
+        };
+
+        let result = wait_for_id(&mut socket, "request-1", 1, &coordinator).await;
+        assert!(matches!(result, Err(SsapError::Timeout("response"))));
+        coordinator_task.abort();
     }
 }

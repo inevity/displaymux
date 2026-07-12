@@ -692,15 +692,14 @@ pub fn apply(
                     timing,
                     "observation_timeout",
                 );
-            } else if matches!(
+            } else if (matches!(
                 next.phase,
                 ProtocolPhase::FallbackCommandPending | ProtocolPhase::FallbackVerifying
             ) && next
                 .phase_deadline_ms
-                .is_some_and(|deadline| deadline <= now_ms)
+                .is_some_and(|deadline| deadline <= now_ms))
+                || (next.phase == ProtocolPhase::FallbackDeferred && next.daemon_healthy())
             {
-                issue_fallback_command(&mut next, &mut effects, now_ms, timing);
-            } else if next.phase == ProtocolPhase::FallbackDeferred && next.daemon_healthy() {
                 issue_fallback_command(&mut next, &mut effects, now_ms, timing);
             } else if next.phase == ProtocolPhase::MultiviewChanging
                 && next
@@ -1044,6 +1043,40 @@ mod tests {
             10,
             TIMING,
         )
+    }
+
+    fn remote_owned() -> ProtocolState {
+        let state = ready_peer(&synchronized(), Host::Mac, 11);
+        let switching = create_mac(&state).unwrap().next;
+        let switch_epoch = switching.switch_epoch;
+        let granted = apply(
+            &switching,
+            Event::Observation {
+                switch_epoch,
+                mode: TvMode::Fullscreen,
+                input: Some(Host::Mac),
+                signals: signals(Host::Mac),
+            },
+            20,
+            TIMING,
+        )
+        .unwrap()
+        .next;
+        let request = granted.active_request.as_ref().unwrap();
+        apply(
+            &granted,
+            Event::Commit {
+                request_id: request.request_id.clone(),
+                request_epoch: request.request_epoch,
+                grant_epoch: request.grant.as_ref().unwrap().grant_epoch,
+                lease_id: request.lease.lease_id.clone(),
+                lease_epoch: request.lease.lease_epoch,
+            },
+            30,
+            TIMING,
+        )
+        .unwrap()
+        .next
     }
 
     #[test]
@@ -1499,5 +1532,247 @@ mod tests {
                 ..
             }]
         ));
+    }
+
+    #[test]
+    fn command_failure_releases_locally_and_starts_verified_fallback() {
+        let state = ready_peer(&synchronized(), Host::Mac, 11);
+        let switching = create_mac(&state).unwrap().next;
+        let failed = apply(
+            &switching,
+            Event::CommandFailed {
+                switch_epoch: switching.switch_epoch,
+                reason: "command rejected".to_string(),
+            },
+            11,
+            TIMING,
+        )
+        .unwrap();
+
+        assert_eq!(failed.next.keyboard_owner, Host::Linux);
+        assert_eq!(failed.next.pointer_owner, Host::Linux);
+        assert_eq!(failed.next.phase, ProtocolPhase::FallbackCommandPending);
+        assert!(matches!(
+            failed.effects.as_slice(),
+            [Effect::SetInput {
+                target: Host::Linux,
+                fallback: true,
+                ..
+            }]
+        ));
+    }
+
+    #[test]
+    fn active_lease_expiry_releases_both_inputs_before_fallback_io() {
+        let remote = remote_owned();
+        let deadline = remote.active_session.as_ref().unwrap().renewed_until_ms;
+        let expired = apply(&remote, Event::Tick, deadline, TIMING).unwrap();
+
+        assert_eq!(expired.next.keyboard_owner, Host::Linux);
+        assert_eq!(expired.next.pointer_owner, Host::Linux);
+        assert!(expired.next.active_session.is_none());
+        assert_eq!(
+            expired.next.fallback_reason.as_deref(),
+            Some("active_lease_expired")
+        );
+        assert!(matches!(
+            expired.effects.as_slice(),
+            [Effect::SetInput {
+                target: Host::Linux,
+                fallback: true,
+                ..
+            }]
+        ));
+    }
+
+    #[test]
+    fn signal_poll_is_single_flight_and_timeout_falls_back() {
+        let remote = remote_owned();
+        let poll_at = remote.next_signal_poll_ms.unwrap();
+        let polling = apply(&remote, Event::Tick, poll_at, TIMING).unwrap();
+        assert_eq!(
+            polling.effects,
+            vec![Effect::Observe {
+                switch_epoch: remote.switch_epoch
+            }]
+        );
+
+        let duplicate = apply(&polling.next, Event::Tick, poll_at + 1, TIMING).unwrap();
+        assert!(duplicate.effects.is_empty());
+        assert_eq!(
+            duplicate.next.observation_in_flight,
+            Some(remote.switch_epoch)
+        );
+
+        let timed_out = apply(
+            &duplicate.next,
+            Event::Tick,
+            duplicate.next.phase_deadline_ms.unwrap(),
+            TIMING,
+        )
+        .unwrap();
+        assert_eq!(timed_out.next.keyboard_owner, Host::Linux);
+        assert_eq!(
+            timed_out.next.fallback_reason.as_deref(),
+            Some("observation_timeout")
+        );
+    }
+
+    #[test]
+    fn invalid_renewal_and_active_readiness_loss_fail_local() {
+        let remote = remote_owned();
+        let session = remote.active_session.as_ref().unwrap();
+        let invalid_renewal = apply(
+            &remote,
+            Event::Renew {
+                request_id: session.request_id.clone(),
+                lease_id: session.lease.lease_id.clone(),
+                lease_epoch: session.lease.lease_epoch,
+                peer_session_epoch: session.lease.peer_session_epoch + 1,
+            },
+            40,
+            TIMING,
+        )
+        .unwrap();
+        assert_eq!(invalid_renewal.next.keyboard_owner, Host::Linux);
+        assert_eq!(
+            invalid_renewal.next.fallback_reason.as_deref(),
+            Some("lease_renewal_rejected")
+        );
+
+        let readiness_lost = apply(
+            &remote,
+            Event::PeerReadinessUpdated {
+                host: Host::Mac,
+                readiness: PeerReadiness::default(),
+            },
+            40,
+            TIMING,
+        )
+        .unwrap();
+        assert_eq!(readiness_lost.next.keyboard_owner, Host::Linux);
+        assert_eq!(
+            readiness_lost.next.fallback_reason.as_deref(),
+            Some("active_peer_readiness_lost")
+        );
+    }
+
+    #[test]
+    fn unexpected_subscription_during_remote_ownership_falls_back() {
+        let remote = remote_owned();
+        let changed = apply(
+            &remote,
+            Event::SubscriptionObserved {
+                mode: TvMode::Multiview,
+                input: None,
+            },
+            40,
+            TIMING,
+        )
+        .unwrap();
+
+        assert_eq!(changed.next.keyboard_owner, Host::Linux);
+        assert_eq!(
+            changed.next.fallback_reason.as_deref(),
+            Some("unexpected_tv_subscription")
+        );
+    }
+
+    #[test]
+    fn multiview_on_verifies_observation_and_off_verifies_server_fallback() {
+        let state = synchronized();
+        let requested = apply(
+            &state,
+            Event::MultiViewRequested { enabled: true },
+            10,
+            TIMING,
+        )
+        .unwrap();
+        let switch_epoch = requested.next.switch_epoch;
+        assert_eq!(
+            requested.effects,
+            vec![Effect::SetMultiView {
+                enabled: true,
+                switch_epoch
+            }]
+        );
+        let acknowledged = apply(
+            &requested.next,
+            Event::MultiViewAcknowledged {
+                switch_epoch,
+                enabled: true,
+            },
+            11,
+            TIMING,
+        )
+        .unwrap();
+        assert_eq!(acknowledged.effects, vec![Effect::Observe { switch_epoch }]);
+        let enabled = apply(
+            &acknowledged.next,
+            Event::Observation {
+                switch_epoch,
+                mode: TvMode::Multiview,
+                input: Some(Host::Linux),
+                signals: signals(Host::Linux),
+            },
+            12,
+            TIMING,
+        )
+        .unwrap()
+        .next;
+        assert_eq!(enabled.phase, ProtocolPhase::Idle);
+        assert_eq!(enabled.tv_mode, TvMode::Multiview);
+
+        let off = apply(
+            &enabled,
+            Event::MultiViewRequested { enabled: false },
+            20,
+            TIMING,
+        )
+        .unwrap();
+        let off_epoch = off.next.switch_epoch;
+        let off_ack = apply(
+            &off.next,
+            Event::MultiViewAcknowledged {
+                switch_epoch: off_epoch,
+                enabled: false,
+            },
+            21,
+            TIMING,
+        )
+        .unwrap();
+        let observed = apply(
+            &off_ack.next,
+            Event::Observation {
+                switch_epoch: off_epoch,
+                mode: TvMode::Fullscreen,
+                input: Some(Host::Linux),
+                signals: signals(Host::Linux),
+            },
+            22,
+            TIMING,
+        )
+        .unwrap();
+        assert_eq!(observed.next.phase, ProtocolPhase::FallbackCommandPending);
+        assert!(matches!(
+            observed.effects.as_slice(),
+            [Effect::SetInput {
+                target: Host::Linux,
+                fallback: true,
+                ..
+            }]
+        ));
+    }
+
+    #[test]
+    fn shutdown_from_remote_ownership_is_local_and_deferred() {
+        let remote = remote_owned();
+        let shutdown = apply(&remote, Event::Shutdown, 40, TIMING).unwrap();
+
+        assert_eq!(shutdown.next.keyboard_owner, Host::Linux);
+        assert_eq!(shutdown.next.pointer_owner, Host::Linux);
+        assert_eq!(shutdown.next.phase, ProtocolPhase::FallbackDeferred);
+        assert!(shutdown.next.active_session.is_none());
+        assert!(shutdown.effects.is_empty());
     }
 }

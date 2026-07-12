@@ -8,7 +8,7 @@ use crate::{
     protocol::{Event, ProtocolError},
 };
 use axum::{
-    extract::{Path, Request, State},
+    extract::{rejection::JsonRejection, Path, Request, State},
     http::{HeaderMap, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -29,6 +29,18 @@ struct AppState {
     controller_token: Arc<str>,
     max_lease_ms: u64,
     runtime_metrics: RuntimeMetrics,
+}
+
+struct ApiFailure {
+    status: StatusCode,
+    code: &'static str,
+    message: String,
+}
+
+impl IntoResponse for ApiFailure {
+    fn into_response(self) -> Response {
+        api_error(self.status, self.code, self.message)
+    }
 }
 
 pub fn router(
@@ -74,8 +86,8 @@ async fn authenticate(
     request: Request,
     next: Next,
 ) -> Response {
-    if let Err(response) = authorize(request.headers(), &state.controller_token) {
-        return response;
+    if let Err(error) = authorize(request.headers(), &state.controller_token) {
+        return error.into_response();
     }
     next.run(request).await
 }
@@ -85,8 +97,8 @@ async fn health() -> &'static str {
 }
 
 async fn ready(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
-    if let Err(response) = authorize(&headers, &state.controller_token) {
-        return response;
+    if let Err(error) = authorize(&headers, &state.controller_token) {
+        return error.into_response();
     }
     let snapshot = state.snapshot_rx.borrow().clone();
     let status = if snapshot.ready() {
@@ -110,8 +122,8 @@ async fn ready(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Respon
 }
 
 async fn status(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
-    if let Err(response) = authorize(&headers, &state.controller_token) {
-        return response;
+    if let Err(error) = authorize(&headers, &state.controller_token) {
+        return error.into_response();
     }
     let now_ms = state.coordinator.now_ms();
     let protocol = (*state.snapshot_rx.borrow()).as_ref().clone();
@@ -227,11 +239,15 @@ async fn create_enter(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Path(target): Path<String>,
-    Json(body): Json<CreateEnterRequest>,
+    body: Result<Json<CreateEnterRequest>, JsonRejection>,
 ) -> Response {
-    if let Err(response) = authorize(&headers, &state.controller_token) {
-        return response;
+    if let Err(error) = authorize(&headers, &state.controller_token) {
+        return error.into_response();
     }
+    let body = match json_body(body) {
+        Ok(body) => body,
+        Err(error) => return error.into_response(),
+    };
     let target = match Host::from_str(&target) {
         Ok(target) => target,
         Err(error) => return api_error(StatusCode::BAD_REQUEST, "invalid_host", error.to_string()),
@@ -239,6 +255,8 @@ async fn create_enter(
     if body.request_id.is_empty()
         || body.client_id.is_empty()
         || body.lease_id.is_empty()
+        || body.lease_epoch == 0
+        || body.peer_session_epoch == 0
         || body.lease_ttl_ms == 0
         || body.lease_ttl_ms > state.max_lease_ms
     {
@@ -272,8 +290,8 @@ async fn poll_enter(
     headers: HeaderMap,
     Path(request_id): Path<String>,
 ) -> Response {
-    if let Err(response) = authorize(&headers, &state.controller_token) {
-        return response;
+    if let Err(error) = authorize(&headers, &state.controller_token) {
+        return error.into_response();
     }
     request_response(
         &state.snapshot_rx.borrow(),
@@ -286,10 +304,25 @@ async fn commit_enter(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Path(request_id): Path<String>,
-    Json(body): Json<CommitRequest>,
+    body: Result<Json<CommitRequest>, JsonRejection>,
 ) -> Response {
-    if let Err(response) = authorize(&headers, &state.controller_token) {
-        return response;
+    if let Err(error) = authorize(&headers, &state.controller_token) {
+        return error.into_response();
+    }
+    let body = match json_body(body) {
+        Ok(body) => body,
+        Err(error) => return error.into_response(),
+    };
+    if body.request_epoch == 0
+        || body.grant_epoch == 0
+        || body.lease_id.is_empty()
+        || body.lease_epoch == 0
+    {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_identity",
+            "current request, grant, and lease identities are required",
+        );
     }
     match state
         .coordinator
@@ -311,10 +344,21 @@ async fn cancel_enter(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Path(request_id): Path<String>,
-    Json(body): Json<CancelRequest>,
+    body: Result<Json<CancelRequest>, JsonRejection>,
 ) -> Response {
-    if let Err(response) = authorize(&headers, &state.controller_token) {
-        return response;
+    if let Err(error) = authorize(&headers, &state.controller_token) {
+        return error.into_response();
+    }
+    let body = match json_body(body) {
+        Ok(body) => body,
+        Err(error) => return error.into_response(),
+    };
+    if body.reason.is_empty() {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_reason",
+            "cancellation reason is required",
+        );
     }
     match state
         .coordinator
@@ -333,10 +377,21 @@ async fn renew_enter(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Path(request_id): Path<String>,
-    Json(body): Json<RenewRequest>,
+    body: Result<Json<RenewRequest>, JsonRejection>,
 ) -> Response {
-    if let Err(response) = authorize(&headers, &state.controller_token) {
-        return response;
+    if let Err(error) = authorize(&headers, &state.controller_token) {
+        return error.into_response();
+    }
+    let body = match json_body(body) {
+        Ok(body) => body,
+        Err(error) => return error.into_response(),
+    };
+    if body.lease_id.is_empty() || body.lease_epoch == 0 || body.peer_session_epoch == 0 {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_identity",
+            "current lease and peer session identities are required",
+        );
     }
     match state
         .coordinator
@@ -368,11 +423,15 @@ async fn update_readiness(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Path(host): Path<String>,
-    Json(body): Json<ReadinessRequest>,
+    body: Result<Json<ReadinessRequest>, JsonRejection>,
 ) -> Response {
-    if let Err(response) = authorize(&headers, &state.controller_token) {
-        return response;
+    if let Err(error) = authorize(&headers, &state.controller_token) {
+        return error.into_response();
     }
+    let body = match json_body(body) {
+        Ok(body) => body,
+        Err(error) => return error.into_response(),
+    };
     let host = match Host::from_str(&host) {
         Ok(host) => host,
         Err(error) => return api_error(StatusCode::BAD_REQUEST, "invalid_host", error.to_string()),
@@ -413,8 +472,8 @@ async fn multiview_off(State(state): State<Arc<AppState>>, headers: HeaderMap) -
 }
 
 async fn multiview(state: Arc<AppState>, headers: HeaderMap, enabled: bool) -> Response {
-    if let Err(response) = authorize(&headers, &state.controller_token) {
-        return response;
+    if let Err(error) = authorize(&headers, &state.controller_token) {
+        return error.into_response();
     }
     match state
         .coordinator
@@ -503,7 +562,7 @@ fn coordinator_error(error: CoordinatorError) -> Response {
     }
 }
 
-fn authorize(headers: &HeaderMap, expected_token: &str) -> Result<(), Response> {
+fn authorize(headers: &HeaderMap, expected_token: &str) -> Result<(), ApiFailure> {
     let presented = headers
         .get(AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
@@ -512,12 +571,20 @@ fn authorize(headers: &HeaderMap, expected_token: &str) -> Result<(), Response> 
     {
         Ok(())
     } else {
-        Err(api_error(
-            StatusCode::UNAUTHORIZED,
-            "unauthorized",
-            "missing or invalid bearer token",
-        ))
+        Err(ApiFailure {
+            status: StatusCode::UNAUTHORIZED,
+            code: "unauthorized",
+            message: "missing or invalid bearer token".to_string(),
+        })
     }
+}
+
+fn json_body<T>(body: Result<Json<T>, JsonRejection>) -> Result<T, ApiFailure> {
+    body.map(|Json(body)| body).map_err(|rejection| ApiFailure {
+        status: StatusCode::BAD_REQUEST,
+        code: "invalid_json",
+        message: rejection.body_text(),
+    })
 }
 
 fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
@@ -700,6 +767,20 @@ mod tests {
 
     fn authenticated(request: axum::http::request::Builder) -> axum::http::request::Builder {
         request.header(AUTHORIZATION, "Bearer test-token")
+    }
+
+    fn create_body(request_id: &str, lease_id: &str) -> Body {
+        Body::from(
+            json!({
+                "client_id": "hub",
+                "request_id": request_id,
+                "lease_id": lease_id,
+                "lease_epoch": 1,
+                "peer_session_epoch": 9,
+                "lease_ttl_ms": 300
+            })
+            .to_string(),
+        )
     }
 
     async fn body_json(response: Response) -> Value {
@@ -950,5 +1031,234 @@ mod tests {
         assert_eq!(body["data"]["runtime"]["retry_alert"], false);
         assert!(body["data"]["uptime_seconds"].is_number());
         assert!(body["data"].get("active_request").is_none());
+    }
+
+    #[tokio::test]
+    async fn malformed_json_and_zero_identities_are_typed_bad_requests() {
+        let (app, _, _) = ready_app().await;
+        let malformed = app
+            .clone()
+            .oneshot(
+                authenticated(Request::builder().method("POST").uri("/enter/mac"))
+                    .header("content-type", "application/json")
+                    .body(Body::from("{"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(malformed.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(body_json(malformed).await["code"], "invalid_json");
+
+        let zero_epoch = app
+            .oneshot(
+                authenticated(Request::builder().method("POST").uri("/enter/mac"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "client_id": "hub",
+                            "request_id": "request-1",
+                            "lease_id": "lease-1",
+                            "lease_epoch": 0,
+                            "peer_session_epoch": 9,
+                            "lease_ttl_ms": 300
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(zero_epoch.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(body_json(zero_epoch).await["code"], "invalid_identity");
+    }
+
+    #[tokio::test]
+    async fn duplicate_create_is_idempotent_and_conflict_names_active_request() {
+        let (app, _, mut effects) = ready_app().await;
+        let first = app
+            .clone()
+            .oneshot(
+                authenticated(Request::builder().method("POST").uri("/enter/mac"))
+                    .header("content-type", "application/json")
+                    .body(create_body("request-1", "lease-1"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::ACCEPTED);
+        assert!(effects.ordinary.recv().await.is_some());
+
+        let duplicate = app
+            .clone()
+            .oneshot(
+                authenticated(Request::builder().method("POST").uri("/enter/mac"))
+                    .header("content-type", "application/json")
+                    .body(create_body("request-1", "lease-1"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(duplicate.status(), StatusCode::ACCEPTED);
+        assert!(tokio::time::timeout(
+            std::time::Duration::from_millis(10),
+            effects.ordinary.recv()
+        )
+        .await
+        .is_err());
+
+        let conflict = app
+            .oneshot(
+                authenticated(Request::builder().method("POST").uri("/enter/mac"))
+                    .header("content-type", "application/json")
+                    .body(create_body("request-2", "lease-2"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(conflict.status(), StatusCode::CONFLICT);
+        let body = body_json(conflict).await;
+        assert_eq!(body["code"], "request_busy");
+        assert_eq!(body["active_request_id"], "request-1");
+    }
+
+    #[tokio::test]
+    async fn poll_stale_commit_and_cancel_have_typed_contracts() {
+        let (app, handle, _effects) = ready_app().await;
+        let created = app
+            .clone()
+            .oneshot(
+                authenticated(Request::builder().method("POST").uri("/enter/mac"))
+                    .header("content-type", "application/json")
+                    .body(create_body("request-1", "lease-1"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(created.status(), StatusCode::ACCEPTED);
+
+        let polled = app
+            .clone()
+            .oneshot(
+                authenticated(Request::builder().uri("/enter/request/request-1"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(polled.status(), StatusCode::ACCEPTED);
+        let missing = app
+            .clone()
+            .oneshot(
+                authenticated(Request::builder().uri("/enter/request/missing"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+
+        let switch_epoch = handle.snapshot().switch_epoch;
+        handle
+            .apply(Event::Observation {
+                switch_epoch,
+                mode: TvMode::Fullscreen,
+                input: Some(Host::Mac),
+                signals: BTreeMap::from([
+                    (Host::Linux, true),
+                    (Host::Mac, true),
+                    (Host::Windows, false),
+                ]),
+            })
+            .await
+            .unwrap();
+        let request = handle.snapshot().active_request.clone().unwrap();
+        let stale_commit = app
+            .clone()
+            .oneshot(
+                authenticated(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/enter/request/request-1/commit"),
+                )
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "request_epoch": request.request_epoch,
+                        "grant_epoch": request.grant.as_ref().unwrap().grant_epoch + 1,
+                        "lease_id": request.lease.lease_id,
+                        "lease_epoch": request.lease.lease_epoch
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(stale_commit.status(), StatusCode::CONFLICT);
+        assert_eq!(body_json(stale_commit).await["code"], "request_conflict");
+        assert_eq!(handle.snapshot().keyboard_owner, Host::Linux);
+
+        let cancelled = app
+            .oneshot(
+                authenticated(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/internal/enter/request/request-1/cancel"),
+                )
+                .header("content-type", "application/json")
+                .body(Body::from(json!({"reason": "test_cancel"}).to_string()))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(cancelled.status(), StatusCode::CONFLICT);
+        assert_eq!(body_json(cancelled).await["data"]["status"], "cancelled");
+        assert_eq!(handle.snapshot().pointer_owner, Host::Linux);
+    }
+
+    #[tokio::test]
+    async fn readiness_and_multiview_routes_drive_typed_protocol_events() {
+        let (app, _, mut effects) = ready_app().await;
+        let readiness = app
+            .clone()
+            .oneshot(
+                authenticated(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/internal/readiness/windows"),
+                )
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "online": true,
+                        "keyboard_ready": true,
+                        "pointer_ready": false,
+                        "session_epoch": 12
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(readiness.status(), StatusCode::OK);
+        let body = body_json(readiness).await;
+        assert_eq!(body["data"]["host"], "windows");
+        assert_eq!(body["data"]["readiness"]["pointer_ready"], false);
+
+        let multiview = app
+            .oneshot(
+                authenticated(Request::builder().method("POST").uri("/multiview/on"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(multiview.status(), StatusCode::ACCEPTED);
+        assert_eq!(body_json(multiview).await["data"]["enabled"], true);
+        assert!(matches!(
+            effects.ordinary.recv().await,
+            Some(crate::protocol::Effect::SetMultiView { enabled: true, .. })
+        ));
     }
 }

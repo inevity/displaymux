@@ -280,11 +280,21 @@ async fn run(mut state: ProtocolState, timing: ProtocolTiming, mut runtime: Coor
     loop {
         let timer = deadline_sleep(&state, runtime.started);
         tokio::pin!(timer);
-        let request = tokio::select! {
-            biased;
-            request = runtime.safety_rx.recv() => request,
-            request = runtime.ordinary_rx.recv() => request,
-            _ = &mut timer => Some(Request { event: Event::Tick, response: None }),
+        let deadline_due = state
+            .next_deadline_ms()
+            .is_some_and(|deadline| deadline <= monotonic_ms(runtime.started));
+        let request = if deadline_due {
+            Some(Request {
+                event: Event::Tick,
+                response: None,
+            })
+        } else {
+            tokio::select! {
+                biased;
+                _ = &mut timer => Some(Request { event: Event::Tick, response: None }),
+                request = runtime.safety_rx.recv() => request,
+                request = runtime.ordinary_rx.recv() => request,
+            }
         };
         let Some(request) = request else {
             break;
@@ -481,6 +491,85 @@ mod tests {
         }
     }
 
+    fn remote_owned_state() -> ProtocolState {
+        let synchronized = protocol::apply(
+            &ProtocolState::new(Host::Linux, 32),
+            synchronized_event(),
+            1,
+            TIMING,
+        )
+        .unwrap()
+        .next;
+        let ready = protocol::apply(
+            &synchronized,
+            Event::PeerReadinessUpdated {
+                host: Host::Mac,
+                readiness: PeerReadiness {
+                    online: true,
+                    keyboard_ready: true,
+                    pointer_ready: true,
+                    session_epoch: 7,
+                    observed_at_ms: 2,
+                },
+            },
+            2,
+            TIMING,
+        )
+        .unwrap()
+        .next;
+        let switching = protocol::apply(
+            &ready,
+            Event::CreateEnter {
+                request_id: "request-1".to_string(),
+                client_id: "client-1".to_string(),
+                target: Host::Mac,
+                lease: LeaseIdentity {
+                    lease_id: "lease-1".to_string(),
+                    lease_epoch: 1,
+                    peer_session_epoch: 7,
+                    expires_at_ms: 1_000,
+                },
+            },
+            10,
+            TIMING,
+        )
+        .unwrap()
+        .next;
+        let switch_epoch = switching.switch_epoch;
+        let granted = protocol::apply(
+            &switching,
+            Event::Observation {
+                switch_epoch,
+                mode: TvMode::Fullscreen,
+                input: Some(Host::Mac),
+                signals: BTreeMap::from([
+                    (Host::Linux, false),
+                    (Host::Mac, true),
+                    (Host::Windows, false),
+                ]),
+            },
+            20,
+            TIMING,
+        )
+        .unwrap()
+        .next;
+        let request = granted.active_request.as_ref().unwrap();
+        protocol::apply(
+            &granted,
+            Event::Commit {
+                request_id: request.request_id.clone(),
+                request_epoch: request.request_epoch,
+                grant_epoch: request.grant.as_ref().unwrap().grant_epoch,
+                lease_id: request.lease.lease_id.clone(),
+                lease_epoch: request.lease.lease_epoch,
+            },
+            30,
+            TIMING,
+        )
+        .unwrap()
+        .next
+    }
+
     #[tokio::test]
     async fn publishes_coherent_snapshot_after_transition() {
         let (handle, _, task) = spawn(ProtocolState::new(Host::Linux, 32), TIMING, 4, 2);
@@ -527,6 +616,37 @@ mod tests {
         assert_eq!(handle.queue_snapshot().ordinary_effects.depth, 1);
         assert!(effects.ordinary.try_recv().is_ok());
         assert_eq!(handle.queue_snapshot().ordinary_effects.depth, 0);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn due_deadline_precedes_already_queued_renewal() {
+        let mut initial = remote_owned_state();
+        let session = initial.active_session.as_mut().unwrap();
+        session.renewed_until_ms = 0;
+        let renew = Event::Renew {
+            request_id: session.request_id.clone(),
+            lease_id: session.lease.lease_id.clone(),
+            lease_epoch: session.lease.lease_epoch,
+            peer_session_epoch: session.lease.peer_session_epoch,
+        };
+        let (handle, _effects, task) = spawn(initial, TIMING, 4, 2);
+        let (response_tx, response_rx) = oneshot::channel();
+        handle
+            .safety_tx
+            .try_send(Request {
+                event: renew,
+                response: Some(response_tx),
+            })
+            .unwrap();
+
+        let snapshot = response_rx.await.unwrap().unwrap();
+        assert_eq!(snapshot.keyboard_owner, Host::Linux);
+        assert_eq!(snapshot.pointer_owner, Host::Linux);
+        assert_eq!(
+            snapshot.fallback_reason.as_deref(),
+            Some("lease_renewal_rejected")
+        );
         task.abort();
     }
 }
