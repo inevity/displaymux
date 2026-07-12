@@ -351,6 +351,26 @@ pub(crate) enum SwitchClientError {
     Json(#[from] serde_json::Error),
 }
 
+impl SwitchClientError {
+    pub(crate) fn notification_detail(&self, operation: &str) -> (&'static str, String) {
+        let code = match self {
+            Self::Timeout => "controller_timeout",
+            Self::StaleIdentity => "controller_identity_race",
+            Self::Request(error) if error.is_timeout() => "controller_timeout",
+            Self::Request(error) if error.is_connect() => "controller_unreachable",
+            Self::Cancelled => "controller_cancelled",
+            Self::ResponseTooLarge => "controller_response_too_large",
+            Self::ProtocolVersion(_) => "controller_protocol_mismatch",
+            Self::Denied { .. } => "controller_denied",
+            Self::Http { .. } => "controller_http_error",
+            Self::InvalidBaseUrl => "controller_configuration_invalid",
+            Self::Request(_) => "controller_request_failed",
+            Self::Json(_) => "controller_response_invalid",
+        };
+        (code, format!("{operation}: {self}"))
+    }
+}
+
 impl SwitchController {
     pub(crate) fn new(config: SwitchControllerConfig) -> Result<Self, SwitchClientError> {
         let http = Client::builder()
@@ -366,6 +386,10 @@ impl SwitchController {
 
     pub(crate) fn server_host(&self) -> SwitchHost {
         self.config.server_host
+    }
+
+    pub(crate) fn local_host(&self) -> SwitchHost {
+        self.config.local_host
     }
 
     pub(crate) fn lease_ttl_ms(&self) -> u64 {
@@ -879,6 +903,18 @@ struct RemoteReadiness {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn notification_details_distinguish_timeout_and_identity_race() {
+        let timeout = SwitchClientError::Timeout.notification_detail("Switch preparation failed");
+        assert_eq!(timeout.0, "controller_timeout");
+        assert!(timeout.1.contains("deadline expired"));
+
+        let stale =
+            SwitchClientError::StaleIdentity.notification_detail("Switch preparation failed");
+        assert_eq!(stale.0, "controller_identity_race");
+        assert!(stale.1.contains("stale or conflicting identity"));
+    }
     use serde_json::{Value, json};
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},

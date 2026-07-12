@@ -7,9 +7,10 @@ use crate::{
     dns::{DnsEvent, DnsResolver},
     emulation::{Emulation, EmulationEvent},
     listen::{LanMouseListener, ListenerCreationError},
+    notification::SystemNotifier,
     switch::{
-        BundleLeaseManager, GateContext, GrantIdentity, PeerBundleReadiness, PreparedGrant,
-        SwitchClientError, SwitchController,
+        BundleLeaseManager, GateContext, GateError, GrantIdentity, PeerBundleReadiness,
+        PreparedGrant, SwitchClientError, SwitchController,
     },
 };
 use futures::StreamExt;
@@ -90,6 +91,7 @@ pub struct Service {
     next_trigger_handle: u64,
     bundle_lease: BundleLeaseManager,
     switch_controller: Option<SwitchController>,
+    system_notifier: SystemNotifier,
     switch_deadline: Option<Pin<Box<Sleep>>>,
     switch_event_rx: mpsc::Receiver<SwitchTaskEvent>,
     switch_event_tx: mpsc::Sender<SwitchTaskEvent>,
@@ -146,6 +148,12 @@ impl Service {
                     .map_err(|error| ServiceError::SwitchController(error.to_string()))
             })
             .transpose()?;
+        let system_notifier = switch_controller
+            .as_ref()
+            .map(|controller| {
+                SystemNotifier::new(controller.local_host(), controller.server_host())
+            })
+            .unwrap_or_else(SystemNotifier::disabled);
         let (switch_event_tx, switch_event_rx) = mpsc::channel(1);
         let client_manager = ClientManager::default();
         for client in config.clients() {
@@ -194,6 +202,7 @@ impl Service {
             next_trigger_handle: 0,
             bundle_lease: Default::default(),
             switch_controller,
+            system_notifier,
             switch_deadline: None,
             switch_event_rx,
             switch_event_tx,
@@ -353,6 +362,13 @@ impl Service {
                 None
             }
         };
+        self.system_notifier = self
+            .switch_controller
+            .as_ref()
+            .map(|controller| {
+                SystemNotifier::new(controller.local_host(), controller.server_host())
+            })
+            .unwrap_or_else(SystemNotifier::disabled);
         for h in self.client_manager.registered_clients() {
             self.remove_client(h);
         }
@@ -482,7 +498,7 @@ impl Service {
                 if self.pending_switch_cleanup.is_some() {
                     self.complete_pending_switch_cleanup();
                 } else {
-                    self.release_gate_after_capture("capture_backend_disabled");
+                    self.release_gate_after_capture("capture_backend_disabled", true);
                 }
             }
             ICaptureEvent::CaptureEnabled => {
@@ -521,16 +537,19 @@ impl Service {
                 } else if self.bundle_lease.context().is_some_and(|context| {
                     context.handle == handle && context.lease.lease_epoch == lease_epoch
                 }) {
-                    self.release_gate_after_capture("capture_commit_not_authorized");
+                    self.release_gate_after_capture("capture_commit_not_authorized", true);
                 }
             }
-            ICaptureEvent::ClientReleased(handle) => {
+            ICaptureEvent::ClientReleased { handle, reason } => {
                 log::info!("released client {handle} capture");
                 self.active_switch_capture = None;
                 if self.pending_switch_cleanup.is_some() {
                     self.complete_pending_switch_cleanup();
                 } else {
-                    self.release_gate_after_capture("capture_released");
+                    self.release_gate_after_capture(
+                        reason.failure_reason().unwrap_or("capture_released"),
+                        reason.failure_reason().is_some(),
+                    );
                 }
             }
             ICaptureEvent::PeerReadiness(handle) => {
@@ -551,9 +570,55 @@ impl Service {
         )
     }
 
+    fn peer_failure_detail(
+        &self,
+        handle: ClientHandle,
+        readiness: &PeerBundleReadiness,
+    ) -> (&'static str, String) {
+        if !readiness.online {
+            return (
+                "peer_offline",
+                "No lan-mouse heartbeat was received; the target may be asleep, stopped, or unreachable"
+                    .to_string(),
+            );
+        }
+        if !self.client_manager.peer_protocol_compatible(handle) {
+            return (
+                "peer_revision_mismatch",
+                "The target lan-mouse revision does not match the server".to_string(),
+            );
+        }
+        if readiness.session_epoch == 0 {
+            return (
+                "peer_readiness_handshake_missing",
+                "The target did not publish a current input-readiness session".to_string(),
+            );
+        }
+        match (readiness.keyboard_ready, readiness.pointer_ready) {
+            (false, false) => (
+                "peer_input_unavailable",
+                "The target keyboard and pointer emulation backends are unavailable".to_string(),
+            ),
+            (false, true) => (
+                "peer_keyboard_unavailable",
+                "The target keyboard emulation backend is unavailable".to_string(),
+            ),
+            (true, false) => (
+                "peer_pointer_unavailable",
+                "The target pointer emulation backend is unavailable".to_string(),
+            ),
+            (true, true) => (
+                "peer_bundle_not_ready",
+                "The target input bundle changed during reservation".to_string(),
+            ),
+        }
+    }
+
     fn handle_capture_candidate(&mut self, handle: ClientHandle) {
         let Some(target) = self.client_manager.switch_target(handle) else {
             log::warn!("capture candidate {handle} rejected: switch target is not configured");
+            self.system_notifier
+                .switch_failed(None, "switch_target_not_configured");
             return;
         };
         if self
@@ -568,6 +633,8 @@ impl Service {
         }
         let Some(controller) = self.switch_controller.clone() else {
             log::warn!("capture candidate {handle} rejected: switch controller is not configured");
+            self.system_notifier
+                .switch_failed(Some(target), "switch_controller_not_configured");
             return;
         };
         if self.switch_task.is_some() {
@@ -576,6 +643,8 @@ impl Service {
         }
         let Some(readiness) = self.peer_readiness(handle) else {
             log::warn!("capture candidate {handle} rejected: client does not exist");
+            self.system_notifier
+                .switch_failed(Some(target), "peer_missing");
             return;
         };
         let bundle_ready = readiness.online
@@ -597,6 +666,27 @@ impl Service {
             Ok(context) => context,
             Err(error) => {
                 log::warn!("capture candidate {handle} rejected: {error}");
+                let (reason, detail) = match error {
+                    GateError::PeerNotReady => self.peer_failure_detail(handle, &readiness),
+                    GateError::Busy => (
+                        "controller_busy",
+                        "Another switch operation is already active".to_string(),
+                    ),
+                    GateError::Expired => (
+                        "local_lease_expired",
+                        "The local keyboard and pointer lease expired".to_string(),
+                    ),
+                    GateError::InvalidIdentity
+                    | GateError::StaleIdentity
+                    | GateError::InvalidState => (
+                        "local_gate_race",
+                        format!(
+                            "A stale or conflicting local gate transition was rejected: {error}"
+                        ),
+                    ),
+                };
+                self.system_notifier
+                    .switch_failed_with_detail(Some(target), reason, detail);
                 return;
             }
         };
@@ -837,7 +927,8 @@ impl Service {
                     "switch preparation failed for {}: {error}",
                     context.lease.request_id
                 );
-                self.fail_gate("prepare_failed");
+                let (reason, detail) = error.notification_detail("TV switch preparation failed");
+                self.fail_gate_with_detail(reason, detail);
                 return;
             }
         };
@@ -859,7 +950,11 @@ impl Service {
             Ok(armed) => armed,
             Err(error) => {
                 log::warn!("grant rejected locally: {error}");
-                self.fail_context(context, "grant_rejected_locally");
+                self.fail_context_with_detail(
+                    context,
+                    "grant_rejected_locally",
+                    format!("A stale, conflicting, or expired TV grant was rejected: {error}"),
+                );
                 return;
             }
         };
@@ -964,7 +1059,8 @@ impl Service {
                     "controller commit failed for {}: {error}",
                     context.lease.request_id
                 );
-                self.fail_gate("controller_commit_failed");
+                let (reason, detail) = error.notification_detail("Input commit failed");
+                self.fail_gate_with_detail(reason, detail);
                 return;
             }
         };
@@ -1030,7 +1126,8 @@ impl Service {
                     context.lease.request_id
                 );
                 self.finish_switch_task(task_epoch);
-                self.fail_gate("lease_renewal_failed");
+                let (reason, detail) = error.notification_detail("Input lease renewal failed");
+                self.fail_gate_with_detail(reason, detail);
                 return;
             }
         };
@@ -1111,7 +1208,31 @@ impl Service {
         }
     }
 
+    fn fail_gate_with_detail(&mut self, reason: &'static str, detail: String) {
+        if let Some(context) = self.bundle_lease.invalidate() {
+            self.fail_context_with_detail(context, reason, detail);
+        }
+    }
+
     fn fail_context(&mut self, context: GateContext, reason: &'static str) {
+        self.fail_context_inner(context, reason, None);
+    }
+
+    fn fail_context_with_detail(
+        &mut self,
+        context: GateContext,
+        reason: &'static str,
+        detail: String,
+    ) {
+        self.fail_context_inner(context, reason, Some(detail));
+    }
+
+    fn fail_context_inner(
+        &mut self,
+        context: GateContext,
+        reason: &'static str,
+        detail: Option<String>,
+    ) {
         if self
             .bundle_lease
             .context()
@@ -1126,6 +1247,13 @@ impl Service {
             "switch request {} failed closed: {reason}",
             context.lease.request_id
         );
+        if let Some(detail) = detail {
+            self.system_notifier
+                .switch_failed_with_detail(Some(context.target), reason, detail);
+        } else {
+            self.system_notifier
+                .switch_failed(Some(context.target), reason);
+        }
         if self.active_switch_capture == Some((context.handle, context.lease.lease_epoch)) {
             self.pending_switch_cleanup = Some((context, reason));
             self.capture.release();
@@ -1150,14 +1278,20 @@ impl Service {
             "switch request {} failed closed before capture authorization: {reason}",
             context.lease.request_id
         );
+        self.system_notifier
+            .switch_failed(Some(context.target), reason);
     }
 
-    fn release_gate_after_capture(&mut self, reason: &'static str) {
+    fn release_gate_after_capture(&mut self, reason: &'static str, notify_failure: bool) {
         let Some(context) = self.bundle_lease.invalidate() else {
             return;
         };
         self.cancel_switch_task();
         self.switch_deadline = None;
+        if notify_failure {
+            self.system_notifier
+                .switch_failed(Some(context.target), reason);
+        }
         self.start_cleanup_task(context, reason);
     }
 

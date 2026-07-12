@@ -48,9 +48,35 @@ pub(crate) enum ICaptureEvent {
         lease_epoch: u64,
     },
     /// An active outgoing capture was released.
-    ClientReleased(CaptureHandle),
+    ClientReleased {
+        handle: CaptureHandle,
+        reason: CaptureReleaseReason,
+    },
     /// A peer readiness/session update was received on the outgoing connection.
     PeerReadiness(u64),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CaptureReleaseReason {
+    PeerLeft,
+    PeerReadinessLost,
+    PeerReleaseRequested,
+    ServiceRequested,
+    ReleaseBind,
+    TransportFailed,
+}
+
+impl CaptureReleaseReason {
+    pub(crate) const fn failure_reason(self) -> Option<&'static str> {
+        match self {
+            Self::PeerReadinessLost => Some("peer_readiness_lost_during_capture"),
+            Self::TransportFailed => Some("peer_transport_failed_during_capture"),
+            Self::PeerLeft
+            | Self::PeerReleaseRequested
+            | Self::ServiceRequested
+            | Self::ReleaseBind => None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -335,7 +361,8 @@ impl CaptureTask {
                         // client disconnected
                         ProtoEvent::Leave(_) => {
                             log::info!("releasing capture: left remote client device region");
-                            self.release_capture(capture).await?;
+                            self.release_capture(capture, CaptureReleaseReason::PeerLeft)
+                                .await?;
                         },
                         ProtoEvent::Readiness {
                             keyboard_ready,
@@ -348,7 +375,11 @@ impl CaptureTask {
                                     || self.active_peer_session_epoch != Some(session_epoch))
                             {
                                 log::warn!("releasing capture: peer input readiness changed");
-                                self.release_capture(capture).await?;
+                                self.release_capture(
+                                    capture,
+                                    CaptureReleaseReason::PeerReadinessLost,
+                                )
+                                .await?;
                             }
                             self.event_tx
                                 .send(ICaptureEvent::PeerReadiness(handle))
@@ -363,7 +394,11 @@ impl CaptureTask {
                             log::info!(
                                 "releasing capture for peer request epoch {release_epoch}"
                             );
-                            self.release_capture(capture).await?;
+                            self.release_capture(
+                                capture,
+                                CaptureReleaseReason::PeerReleaseRequested,
+                            )
+                            .await?;
                             if let Err(error) = self
                                 .conn
                                 .send(ProtoEvent::ReleaseAck { release_epoch }, handle)
@@ -381,7 +416,8 @@ impl CaptureTask {
                     CaptureRequest::Reenable => { /* already active */ },
                     CaptureRequest::Release => {
                         self.gate.borrow_mut().clear();
-                        self.release_capture(capture).await?;
+                        self.release_capture(capture, CaptureReleaseReason::ServiceRequested)
+                            .await?;
                     }
                     CaptureRequest::Create(h, p, t) => {
                         self.add_capture(h, p, t);
@@ -416,7 +452,9 @@ impl CaptureTask {
 
         if capture.keys_pressed(&self.release_bind.borrow()) {
             log::info!("releasing capture: release-bind pressed");
-            return self.release_capture(capture).await;
+            return self
+                .release_capture(capture, CaptureReleaseReason::ReleaseBind)
+                .await;
         }
 
         if event == CaptureEvent::Begin {
@@ -490,12 +528,17 @@ impl CaptureTask {
         if let Err(e) = self.conn.send(event, handle).await {
             const DUR: Duration = Duration::from_millis(500);
             debounce!(PREV_LOG, DUR, log::warn!("releasing capture: {e}"));
-            self.release_capture(capture).await?;
+            self.release_capture(capture, CaptureReleaseReason::TransportFailed)
+                .await?;
         }
         Ok(())
     }
 
-    async fn release_capture(&mut self, capture: &mut InputCapture) -> Result<(), CaptureError> {
+    async fn release_capture(
+        &mut self,
+        capture: &mut InputCapture,
+        reason: CaptureReleaseReason,
+    ) -> Result<(), CaptureError> {
         // If we have an active client, notify them we're leaving
         let released_handle = if let Some(handle) = self.active_client.take() {
             self.active_peer_session_epoch = None;
@@ -545,7 +588,7 @@ impl CaptureTask {
         capture.release().await?;
         if let Some(handle) = released_handle {
             self.event_tx
-                .send(ICaptureEvent::ClientReleased(handle))
+                .send(ICaptureEvent::ClientReleased { handle, reason })
                 .expect("channel closed");
         }
         Ok(())
@@ -702,6 +745,20 @@ impl<T> Drop for DropGuard<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_failed_capture_releases_request_a_notification() {
+        assert_eq!(CaptureReleaseReason::PeerLeft.failure_reason(), None);
+        assert_eq!(CaptureReleaseReason::ReleaseBind.failure_reason(), None);
+        assert_eq!(
+            CaptureReleaseReason::PeerReadinessLost.failure_reason(),
+            Some("peer_readiness_lost_during_capture")
+        );
+        assert_eq!(
+            CaptureReleaseReason::TransportFailed.failure_reason(),
+            Some("peer_transport_failed_during_capture")
+        );
+    }
     use std::{cell::RefCell, rc::Rc};
 
     #[test]
