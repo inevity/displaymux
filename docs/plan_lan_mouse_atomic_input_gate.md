@@ -2,12 +2,13 @@
 
 Parent: [Main fenced switch implementation plan](plan_main_fullscreen_multiview_switch_implementation.md)
 
-Status (2026-07-12): source implementation, automated tests, and native build
-automation are complete at lan-mouse commit
-`c5d7bb4a467ba91d085346dbc85ce7445e400217`. Its Linux no-GTK checks pass; the
-last three-host cache matrix predates this revision. Current macOS/Windows
-native builds, installation, and active-backend acceptance remain blocked on
-explicit coordinated-host authorization.
+Status (2026-07-13): source implementation, automated tests, native builds,
+and coordinated three-host deployment are complete at lan-mouse commit
+`b90f4f9af7c3b86783fa6dd763b874103f76820f`. Linux, macOS, and Windows run the
+same revision. Native capture and emulation backends initialized on both
+spokes after macOS Accessibility approval. The exhaustive live failure matrix
+is blocked by the explicit decision to use the system normally and investigate
+only failures that occur in that use.
 
 ## Objective
 
@@ -15,23 +16,24 @@ Change lan-mouse from a fire-and-forget TV hook producer into the authority that
 
 ## Implementation Evidence
 
-- No-GTK workspace checks and all 42 tests pass: 4 input-capture queue tests,
-  31 core capture/readiness/lease/release/controller tests, 2 bounded-logging
-  tests, 2 CLI status tests, and 3 protocol wire tests. The Linux production
-  feature check also passes.
+- No-GTK workspace check/test and Linux production-feature check/test pass.
+  Coverage includes input-capture queues and same-edge resume, 34 core
+  capture/readiness/lease/release/controller tests, bounded logging, CLI
+  status, protocol wire behavior, and native macOS/Windows display-center
+  arithmetic.
 - The first crossing completes backend release before publishing its candidate.
   A targeted, current, single-use permit then requires a service commit reply
-  before the second crossing can emit `Enter`. Commit validates request, lease,
-  grant, handle, peer session, and deadline as one bundle.
+  before a still-focused same-edge continuation or a later matching crossing
+  can emit `Enter`. Commit validates request, lease, grant, handle, peer
+  session, and deadline as one bundle.
 - Peer readiness names keyboard and pointer capability plus process session
   epoch. Unknown, stale, partial, disconnected, or commit-mismatched peers fail
   closed.
-- Native cache-only release builds succeeded on Linux, macOS, and Windows for
-  protocol revision `4425c57` from one exact git bundle and lockfile vendor
-  archive. Their SHA-256 values are recorded in the main plan. Current revision
-  `c5d7bb4` adds later status/revision fencing plus release-complete and commit
-  authorization ordering fixes; current macOS/Windows native builds are still
-  required before cutover.
+- Native tests and release builds succeeded on Linux, macOS, and Windows for
+  revision `b90f4f9` from one exact git bundle and lockfile vendor archive, and
+  that revision is installed on all three hosts. It includes revision fencing,
+  release-complete and commit-authorization ordering, same-edge continuation,
+  and receiver-side center-before-ack behavior.
 - lan-mouse log production is non-blocking and bounded to 1,024 records of
   16 KiB, and reports accumulated drops when its persistent sink recovers.
 
@@ -89,10 +91,11 @@ Invariant checks:
 
 ## L0: Capture-Gate Feasibility
 
-Status: conservative two-crossing implementation, release-before-notify,
-commit-decision, dropped-decision, and permit-order tests are complete. Manual
-local click/motion/scroll/key behavior on active native backends remains blocked
-until coordinated live deployment.
+Status: completed for the conservative release-first protocol with same-edge
+continuation. Release-before-notify, commit-decision, dropped-decision,
+permit-order, and same-focused-edge tests pass. Coordinated live deployment is
+complete; exhaustive manual input scenarios are blocked by the explicit
+normal-use-first acceptance decision.
 
 Use Main Plan Gate 0 before broad implementation.
 
@@ -107,7 +110,9 @@ Conservative safe path if pre-capture is not portable:
 - on the first `CaptureEvent::Begin`, emit a candidate and immediately release capture;
 - run one fenced request while the user remains local;
 - store an expiring grant without switching ownership;
-- on the next edge crossing, revalidate grant plus lease, atomically enter remote capture, and commit the same request;
+- if the same edge remains focused, resume that crossing after the grant;
+  otherwise, on the next matching crossing, revalidate grant plus lease,
+  atomically enter remote capture, and commit the same request;
 - if the grant expires first, cancel it and restore/verify server display.
 
 Do not retain current `active_client`/`WaitingForAck` behavior while the TV transaction is pending. Do not buffer keyboard or pointer events for later remote replay.
@@ -117,8 +122,9 @@ capture abstraction has no pre-capture edge notification; all native backends
 surface `CaptureEvent::Begin` after exclusive capture begins, while all expose
 the same asynchronous `release()` operation. The first `Begin` therefore
 releases immediately and creates the fenced request. The grant is armed for a
-second crossing and cannot itself enable capture. This preserves one portable
-state machine across Linux, macOS, and Windows.
+same-focused-edge continuation or a later matching crossing and cannot itself
+enable capture. This preserves one portable state machine across Linux,
+macOS, and Windows.
 
 Exit gate: an automated event-order test and a manual active-backend test prove local clicks, motion, scroll, and keys remain available while pending and after failure.
 
@@ -195,8 +201,8 @@ For return to `SERVER_HOST`, release remote capture first even if the TV daemon 
 ## L4: Capture State-Machine Integration
 
 Status: completed with target/epoch permits, release completion before
-controller preparation, an explicit second-crossing commit authorization
-reply, single-use commit, and delayed-command rejection tests.
+controller preparation, an explicit crossing commit-authorization reply,
+same-edge continuation, single-use commit, and delayed-command rejection tests.
 
 Refactor event ownership before adding network behavior:
 
@@ -206,6 +212,8 @@ Refactor event ownership before adding network behavior:
 - both keyboard and pointer forwarding become enabled by the same state transition.
 - no input event is queued while preparing; events remain local under the selected Gate 0 refinement.
 - remote `Ack` cannot bypass the TV grant because no `Enter` is sent before grant.
+- the receiver centers its native pointer on the current display before
+  acknowledging `Enter`; failed centering withholds `Ack` and fails closed.
 - release bind, incoming-device entry, daemon denial, timeout, and connection failure all cancel the same gate and lease.
 - repeated edge events while preparing attach to or reject against the active request; they do not create new tasks.
 
@@ -213,9 +221,11 @@ Add explicit events between service and capture task, for example candidate, gra
 
 ## L5: Commit, Renewal, and Failure Feedback
 
-Status: completed for source logic and automated tests. Live daemon loss,
-backend permission loss, and physical reconnect timing remain cutover
-acceptance cases.
+Status: completed for source logic, automated tests, native builds, and live
+backend startup. The macOS permission-loss path was observed to fail closed to
+the dummy backend and recovered after Accessibility approval plus LaunchAgent
+restart. Other physical failure timing cases are blocked by the explicit
+normal-use-first acceptance decision.
 
 - At capture commit, revalidate peer capabilities, peer session, request epoch, grant epoch, lease ID, and expiry in one service-loop transition.
 - Enable keyboard and pointer forwarding together and notify the daemon commit endpoint.
@@ -227,11 +237,9 @@ acceptance cases.
 
 ## L6: Configuration and Deployment
 
-Status: generated fenced configuration, exact-revision native build/test
-automation, bounded macOS/Windows log wrappers, and host-specific service
-automation are complete. The current pin still requires macOS/Windows native
-builds; installation, service restart, and peer-reported live readiness
-verification remain blocked pending explicit cutover authorization.
+Status: completed. Generated fenced configuration, exact-revision native
+build/test, bounded macOS/Windows log wrappers, installation, service restart,
+and peer connection verification passed for revision `b90f4f9` on all hosts.
 
 - Replace generated `enter_hook = "curl ..."` authorization with explicit switch-controller configuration understood by the patched lan-mouse build.
 - Remove shell-hook authorization entirely when fenced capture is enabled; no compatibility option is implemented.

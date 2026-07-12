@@ -2,10 +2,11 @@
 
 Parent: [Main fenced switch implementation plan](plan_main_fullscreen_multiview_switch_implementation.md)
 
-Status (2026-07-12): source implementation and automated verification are
-complete through parent commit `2e5c0b0`. Live TV reconnect, signal-loss, and
-latency acceptance remain blocked on the coordinated deployment authorization
-recorded in the main plan.
+Status (2026-07-13): source implementation, automated verification, and live
+deployment are complete through parent commit `97d31e1`. Service startup,
+synchronized readiness, and spoke reconnects were observed. The exhaustive TV
+reconnect, signal-loss, and latency matrix is blocked by the explicit
+normal-use-first acceptance decision recorded in the main plan.
 
 ## Objective
 
@@ -13,7 +14,7 @@ Transform the current four-module Rust daemon into a bounded, testable protocol 
 
 ## Implementation Evidence
 
-- `cargo check --frozen`, all 58 tv-multiview tests, and strict all-target
+- `cargo check --frozen`, all 60 tv-multiview tests, and strict all-target
   clippy pass.
 - One coherent coordinator owns transitions and publishes immutable snapshots;
   ordinary and safety command/effect lanes are independently bounded.
@@ -62,10 +63,10 @@ Do not introduce an abstraction solely to match this tree. Combine files when ow
 
 ## D0: Characterization and Test Seams
 
-Status: partially completed. Source behavior and test seams were captured, but
-the historical subprocess CPU/process/latency workload was not measured before
-replacement. Running that obsolete path against the physical TV requires
-separate explicit authorization and remains blocked.
+Status: completed for retained characterization evidence. Source behavior and
+test seams were captured. The historical subprocess CPU/process/latency
+workload is blocked because it was not measured before replacement; running
+that obsolete path against the physical TV requires separate authorization.
 
 - Add route-level tests for `/health`, `/status`, the fenced enter API, and MultiView routes.
 - Introduce a fakeable TV control seam with a native async trait and generic concrete state, or a typed command handle. Do not use the `async-trait` crate.
@@ -180,11 +181,12 @@ Commit boundary: actor runs against fake effect adapters.
 
 ## D4: Persistent SSAP Transport
 
-Status: implemented and verified for codec/key parsing, scripted registration,
+Status: completed and verified for codec/key parsing, scripted registration,
 subscription, disconnect/reconnect/resubscribe and resync,
 callback-before-response, stale response discard, ping/timeout handling,
-backoff reset, and bounded coordinator integration. Physical-TV timing remains
-a blocked live acceptance case.
+backoff reset, bounded coordinator integration, and deployed synchronized
+startup. Exhaustive physical-TV timing remains blocked by the explicit
+normal-use-first acceptance decision.
 
 Before dependency changes, verify the current LG client-key schema and the authoritative SSAP URI/payloads. Add only necessary dependencies to `Cargo.toml`.
 
@@ -264,10 +266,10 @@ Handlers parse, send one actor command, await one bounded response, and format i
 
 ## D6: Fallback, Signal, Wake, and MultiView Effects
 
-Status: implemented with reducer coverage for local-first release, stale
-observation rejection, readiness loss, duplicate completions, and verified
-fallback intent. Physical signal loss, TV reboot, and Wake-on-LAN timing remain
-live acceptance cases.
+Status: completed with reducer coverage for local-first release, stale and
+transient observation handling, readiness loss, duplicate completions, and
+verified fallback intent. Physical signal loss, TV reboot, and Wake-on-LAN
+timing are blocked by the explicit normal-use-first acceptance decision.
 
 - Always issue the target input command; never use cached observed equality as a no-op.
 - Query active input and signal immediately after each command ack and tag the result with `switch_epoch`.
@@ -281,9 +283,8 @@ live acceptance cases.
 
 ## D7: Observability and Operations
 
-Status: completed for source behavior and static deployment integration.
-Persistent logs from an actual coordinated switch still require the live
-cutover.
+Status: completed for source behavior, deployment integration, and persistent
+live log availability on Linux, macOS, and Windows.
 
 - Emit one structured transition event containing request/switch epochs, old/new phase, command/observed input, owners, lease/grant identity, deadline, latency, and fallback reason.
 - Keep log production non-blocking and bounded. Count dropped records and expose the count in status.

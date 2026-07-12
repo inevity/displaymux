@@ -91,7 +91,7 @@ CaptureFor(host) ==
 VARIABLES
     tv_mode,            \* "fullscreen" | "multiview" | "transitioning"
     tv_input,           \* last TV-observed active input; never set by command intent
-    cursor,             \* cursor location
+    cursor,             \* cursor ownership host, not pixel coordinates
     capture,            \* lan-mouse capture state
     input_owner,         \* atomic keyboard+mouse owner; never split
     ws_state,           \* SSAP WebSocket lifecycle
@@ -1621,10 +1621,18 @@ must provide a request-correlated commit gate:
    then obtains a fresh active-input and signal observation tagged with the
    current switch epoch.
 7. The daemon returns an expiring grant containing request epoch and lease ID.
-   lan-mouse arms it without changing ownership. A matching second crossing
+   lan-mouse arms it without changing ownership. If the pointer is still
+   focused on the same physical edge and the same edge-enter serial is current,
+   the native capture backend resumes that crossing; otherwise the next
+   matching crossing consumes the grant. The resumed or later crossing
    revalidates the peer session and both deadlines, atomically commits
    keyboard+pointer, and reports commit. A stale or late grant is rejected.
-8. Any other result (`waking`, `multiview`, `not_ready`, `busy`, 4xx/5xx,
+8. On the receiving host, `Enter` releases any outgoing capture and moves the
+   native pointer to the center of the display that currently contains it
+   before returning `Ack`. The transmitted edge remains only the return-edge
+   barrier. Centering failure withholds `Ack`, so remote input forwarding
+   cannot begin from an edge coordinate and the enter handshake fails closed.
+9. Any other result (`waking`, `multiview`, `not_ready`, `busy`, 4xx/5xx,
    timeout, native controller task failure, lease loss) keeps keyboard and mouse
    on `SERVER_HOST`.
 
@@ -1638,6 +1646,9 @@ keyboard is sent to a remote host while the pointer remains on the server host,
 or where the pointer is captured remotely while keyboard remains local.
 The formal model therefore keeps `keyboard_owner` and `pointer_owner` separate
 and checks equality as an invariant instead of assuming one owner variable.
+Its abstract `cursor` value records the host that owns the pointer; receiver
+pixel placement is the additional implementation invariant
+`EnterAck => PointerPosition = Center(CurrentDisplay)`.
 
 #### 1. SSAP Lifecycle (persistent wss://)
 

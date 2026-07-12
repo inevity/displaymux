@@ -2,16 +2,18 @@
 
 ## Plan Control
 
-- Status: implementation, automated verification, and native build automation
-  are complete as of 2026-07-12. Native builds of the current pinned revision,
-  production cutover, and live acceptance remain blocked pending explicit
-  authorization for coordinated work on Linux, macOS, and Windows.
+- Status: implementation, automated verification, native builds, and
+  coordinated production deployment are complete as of 2026-07-13. Linux,
+  macOS, and Windows run the same pinned lan-mouse revision. The exhaustive
+  live failure matrix and production percentile measurements are blocked by
+  the explicit normal-use-first acceptance decision; failures encountered in
+  ordinary use will be analyzed from the persistent logs.
 - Design baseline: `fullscreenmultiviewswitchdesign.md` originated at commit
   `319b762`; its living prose and model now describe the implemented protocol.
-- Rust daemon implementation: parent-repository commit `2e5c0b0` plus its
+- Rust daemon implementation: parent-repository commit `97d31e1` plus its
   prerequisite fenced-protocol commits.
 - lan-mouse implementation: clean `../../lan-mouse` commit
-  `c5d7bb4a467ba91d085346dbc85ce7445e400217`.
+  `b90f4f9af7c3b86783fa6dd763b874103f76820f`.
 - Controlling objective: implement the approved design without allowing keyboard and pointer ownership to split, and without claiming server-host fallback before the TV state is freshly observed.
 - Compatibility policy: there is no legacy mutation API, compatibility flag,
   fire-and-forget hook authorization, or mixed-version operation. Old peers and
@@ -31,23 +33,24 @@ Linked child plans:
   registration/subscription/reconnect/resync, grant-pending callback and
   stale-response handling, ping/keepalive timeout, atomic ownership, bounded
   queues, and bounded logging.
-- lan-mouse no-GTK workspace checks and all 42 tests pass (4 input-capture,
-  31 core, 2 logging, 2 CLI-status, and 3 protocol). The Linux production
-  feature check passes. Normal focused clippy passes with the same five
-  pre-existing warnings recorded before this fix.
-- The last complete three-host cache-only release matrix used source
+- lan-mouse no-GTK workspace check/test and Linux production-feature
+  check/test pass. Coverage includes the same-edge continuation, 34 core
+  protocol tests, bounded logging, CLI status, wire behavior, and native
+  macOS/Windows center-coordinate tests. The only local warning is the
+  pre-existing unused `start_service` function.
+- The historical three-host cache-only release matrix used source
   `4425c5789b04025720dce234887e6a2d30919258` and Cargo.lock SHA-256
   `d91c91ed08149293a08eb958281c174a5596788f5160e39de751babd52767c93`:
   Linux ELF SHA-256 `fef56b26610eba4e970460bc94b9b03370ce4eb0cc59a0287f814898d43479e0`,
   macOS Mach-O SHA-256 `6f8c734c0563b50245f339793c97180a04c2dc6039294bac29f96ecb29976bb7`,
   and Windows PE SHA-256 `1B603699A6907FC646362FCB60B7084BF4C0102B369F56F84EA7C6AFB1FC2D6E`.
 - Linux used `/usr/bin/rustc 1.96.0`; macOS and Windows used native rustup
-  `rustc 1.97.0`. That matrix predates the current `c5d7bb4` revision, which now
-  orders backend release before controller preparation, requires a current
-  service commit decision before `Enter`, bypasses ambient HTTP proxies for the
-  local controller, and adds a native HTTP lifecycle test. Its Linux no-GTK
-  checks and tests pass; current macOS and Windows native builds have not run.
-  No cache validation installed a binary or restarted a service.
+  `rustc 1.97.0`. The current `b90f4f9` revision was subsequently tested and
+  release-built natively on all three hosts, installed, and started. It orders
+  backend release before controller preparation, requires a current service
+  commit decision before `Enter`, resumes a still-focused verified edge,
+  centers the receiving pointer before `Ack`, and bypasses ambient HTTP proxies
+  for the local controller.
 - Ansible syntax/task expansion and idempotent template rendering pass. Rendered
   TOML, plist, shell, PKGBUILD, systemd, and Windows PowerShell artifacts pass
   their available native parsers; bounded macOS and Windows rotation wrappers
@@ -130,7 +133,10 @@ The current lan-mouse event arrives after the input backend has begun capture. R
 Before protocol implementation begins, prove one of these safe refinements in the matching `392af44` source:
 
 1. Preferred: add a backend-neutral pre-capture decision point that leaves keyboard and pointer locally usable while the request is pending, then enters capture only after a valid grant.
-2. Conservative baseline: immediately release the first edge capture, perform the fenced TV request while input remains local, arm the returned grant, and commit it on the next edge crossing. This costs a second crossing but satisfies the safety invariant.
+2. Conservative baseline: immediately release the first edge capture, perform
+   the fenced TV request while input remains local, and arm the returned grant.
+   Resume the same crossing only if that exact edge remains focused with the
+   same enter serial; otherwise commit on the next matching crossing.
 
 Keeping an exclusive capture active while waiting, suppressing events, or sending repeated `Enter` packets is not an acceptable interpretation of local ownership. If the preferred path is not implementable across the active Linux backend, select the conservative baseline and record the UX tradeoff in the design before code proceeds.
 
@@ -140,15 +146,18 @@ Gate evidence:
 - A manual backend test proves pointer buttons, motion, scroll, and keyboard remain usable on `SERVER_HOST` while pending and after every denial/failure.
 - Cancellation and timeout release any backend capture without waiting for the TV daemon.
 
-Gate 0 decision (2026-07-11): use the conservative two-crossing refinement.
+Gate 0 decision (2026-07-11, refined 2026-07-13): use the conservative
+release-first refinement with same-edge continuation.
 The current backend-neutral API reports `CaptureEvent::Begin` only after the
 backend has entered exclusive capture, so a portable one-crossing pre-capture
 candidate does not exist. On the first crossing, lan-mouse must emit only a
 candidate, call the existing backend-neutral `capture.release()`, and keep all
-input local while obtaining an expiring grant. Only a matching second crossing
-may revalidate that grant and emit `ProtoEvent::Enter`. This decision remains
-subject to the automated event-order and native-backend verification gates
-below; no backend may buffer input while the grant is pending.
+input local while obtaining an expiring grant. A backend may re-grab and
+synthesize `Begin` only if the original edge is still focused and its enter
+serial is unchanged; otherwise only a later matching crossing may revalidate
+the grant and emit `ProtoEvent::Enter`. This decision remains subject to the
+automated event-order and native-backend verification gates below; no backend
+may buffer input while the grant is pending.
 
 ## Interface Decision Required Before Phase 3
 
@@ -167,11 +176,11 @@ The exact local transport may be HTTP or local IPC, but it must be bounded, auth
 
 ### Phase 0: Baseline and Characterization
 
-Status: partially completed. Source identities, unsafe legacy behavior, test
-seams, and protocol shapes are recorded. The pre-refactor subprocess CPU,
-process-count, and latency workload was not captured before replacement and
-must not be reconstructed or claimed without an explicitly authorized run of
-the historical TV-control path against the physical TV.
+Status: completed for the retained baseline evidence. Source identities,
+unsafe legacy behavior, test seams, and protocol shapes are recorded. The
+pre-refactor subprocess CPU, process-count, and latency workload is blocked:
+it was not captured before replacement and must not be reconstructed or
+claimed without an explicitly authorized historical-path run.
 
 Owner: both child plans.
 
@@ -212,11 +221,12 @@ Exit gate: counterexample tests cover stale observations, stale grants, readines
 
 ### Phase 3: Persistent SSAP Actor
 
-Status: implemented and covered for scripted registration, subscription,
+Status: completed and covered for scripted registration, subscription,
 initial resynchronization, callback-before-response, delayed stale response,
 ping handling, response timeout, bounded coordinator/effect queues, reconnect
 backoff reset, and single-owner state transitions. Physical-TV reconnect and
-resubscription remain Phase 7 live acceptance items.
+resubscription. Physical failure timing remains blocked under the explicit
+normal-use-first acceptance decision.
 
 Owner: `plan_tv_multiview_daemon_refactor.md`.
 
@@ -230,10 +240,11 @@ Exit gate: scripted transport tests prove correlation, reconnect/resubscribe/res
 
 ### Phase 4: lan-mouse Capability, Lease, and Capture Gate
 
-Status: implemented and covered by protocol, lease, release-before-notify,
-second-crossing commit authorization, native controller lifecycle, capture
-permit, and Linux build tests. Manual active-backend input behavior remains
-blocked until the coordinated live cutover is authorized.
+Status: completed and covered by protocol, lease, release-before-notify,
+crossing commit authorization, same-edge continuation, native controller
+lifecycle, capture permit, Linux tests, native spoke builds, and live backend
+startup. Exhaustive manual input scenarios remain blocked by the explicit
+normal-use-first acceptance decision.
 
 Owner: `plan_lan_mouse_atomic_input_gate.md`.
 
@@ -262,12 +273,12 @@ Exit gate: black-box API tests prove status code, body schema, idempotency, stal
 
 ### Phase 6: Coordinated Deployment Cutover
 
-Status: deployment automation is complete. The last full three-host cache build
-passed for historical revision `4425c57`; the current pinned `c5d7bb4` revision
-has passed Linux checks but not current macOS/Windows native builds. Those
-builds and the steps below that install artifacts, replace runtime
-configuration, and restart three hosts remain blocked pending explicit
-authorization.
+Status: completed. Revision `b90f4f9` passed Linux, macOS, and Windows native
+tests and release builds from the pinned bundle, was installed on all three
+hosts, and started with matching peer identity. Windows initialized native
+capture/emulation immediately. macOS failed closed while Accessibility was
+absent, then initialized native capture/emulation after approval and a
+LaunchAgent-only restart.
 
 Owner: main plan.
 
@@ -293,11 +304,11 @@ Never deploy a daemon that can issue grants to the old fire-and-forget hook clie
 
 ### Phase 7: Verification and Legacy Removal
 
-Status: automated Rust tests, static Ansible/template checks, bounded-log tests,
-TLA model checking, and legacy source removal are complete. Native builds of
-the current pin, the physical failure matrix, persistent-log reconstruction
-from live switches, and p50/p95/p99 production timing measurements remain
-blocked on Phase 6.
+Status: completed for automated verification, native builds, deployment,
+persistent logs, TLA model checking, and legacy source removal. The exhaustive
+physical failure matrix and p50/p95/p99 production timing measurements are
+blocked by the explicit normal-use-first acceptance decision; incident traces
+from ordinary use remain the acceptance source.
 
 - Run `cargo check` after every Rust change and focused `cargo test` after every logic change in each affected repository.
 - Run full tests for `tv-multiview`, lan-mouse core, protocol, IPC, capture, and emulation before cutover.
