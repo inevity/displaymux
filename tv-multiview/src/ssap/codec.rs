@@ -1,4 +1,4 @@
-use crate::domain::{Host, TvMode};
+use crate::domain::Host;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use thiserror::Error;
@@ -6,9 +6,9 @@ use thiserror::Error;
 pub const GET_CURRENT_APP: &str = "com.webos.applicationManager/getForegroundAppInfo";
 pub const GET_INPUTS: &str = "tv/getExternalInputList";
 pub const SET_INPUT: &str = "tv/switchInput";
-pub const GET_SYSTEM_SETTINGS: &str = "settings/getSystemSettings";
-pub const SET_SYSTEM_SETTINGS: &str = "settings/setSystemSettings";
-pub const MULTIVIEW_SUBSCRIPTION_ID: &str = "subscribe-multiview";
+pub const CREATE_ALERT: &str = "system.notifications/createAlert";
+pub const CLOSE_ALERT: &str = "system.notifications/closeAlert";
+pub const CURRENT_APP_SUBSCRIPTION_ID: &str = "subscribe-current-app";
 
 const SIGNATURE: &str = concat!(
     "eyJhbGdvcml0aG0iOiJSU0EtU0hBMjU2Iiwia2V5SWQiOiJ0ZXN0LXNpZ25pbm",
@@ -45,13 +45,10 @@ pub fn request(id: &str, uri: &str, payload: Value) -> Value {
 
 pub fn subscription() -> Value {
     json!({
-        "id": MULTIVIEW_SUBSCRIPTION_ID,
+        "id": CURRENT_APP_SUBSCRIPTION_ID,
         "type": "subscribe",
-        "uri": format!("ssap://{GET_SYSTEM_SETTINGS}"),
-        "payload": {
-            "category": "option",
-            "keys": ["multiViewStatus"],
-        }
+        "uri": format!("ssap://{GET_CURRENT_APP}"),
+        "payload": {}
     })
 }
 
@@ -89,18 +86,6 @@ pub fn registered_client_key(message: &Value) -> Result<Option<&str>, CodecError
         Some("response") => Ok(None),
         Some("error") => Err(CodecError::Command(message.to_string())),
         _ => Err(CodecError::UnexpectedRegistration(message.to_string())),
-    }
-}
-
-pub fn parse_multiview_mode(payload: &Value) -> Option<TvMode> {
-    match payload
-        .get("settings")
-        .and_then(|settings| settings.get("multiViewStatus"))
-        .and_then(Value::as_str)
-    {
-        Some("on") => Some(TvMode::Multiview),
-        Some("off") => Some(TvMode::Fullscreen),
-        _ => None,
     }
 }
 
@@ -227,10 +212,12 @@ mod tests {
     }
 
     #[test]
-    fn parses_multiview_subscription() {
+    fn subscribes_to_supported_foreground_app_updates() {
+        let message = subscription();
+        assert_eq!(message["id"], CURRENT_APP_SUBSCRIPTION_ID);
         assert_eq!(
-            parse_multiview_mode(&json!({"settings": {"multiViewStatus": "on"}})),
-            Some(TvMode::Multiview)
+            message["uri"],
+            "ssap://com.webos.applicationManager/getForegroundAppInfo"
         );
     }
 

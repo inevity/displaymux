@@ -199,9 +199,10 @@ async fn run_connected_session<S: SsapSocket>(
     send_json(socket, codec::subscription()).await?;
     let subscription = wait_for_id(
         socket,
-        codec::MULTIVIEW_SUBSCRIPTION_ID,
+        codec::CURRENT_APP_SUBSCRIPTION_ID,
         config.timeouts.command_ms,
         coordinator,
+        &config.inputs,
     )
     .await?;
     let _ = codec::successful_payload(&subscription)?;
@@ -209,14 +210,15 @@ async fn run_connected_session<S: SsapSocket>(
         .notify_safety(Event::TransportSubscribed)
         .await
         .map_err(|_| SsapError::CoordinatorClosed)?;
-    info!(event = "ssap_subscribed", topic = "multiViewStatus");
+    info!(event = "ssap_subscribed", topic = "foregroundApp");
 
     let mut next_id = 1u64;
+    set_multiview(socket, &mut next_id, false, config, coordinator).await?;
     let switch_epoch = coordinator.snapshot().switch_epoch;
-    let (mode, input, signals) = observe(socket, &mut next_id, config, coordinator).await?;
+    let (input, signals) = observe(socket, &mut next_id, config, coordinator).await?;
     coordinator
         .notify_safety(Event::TransportSynchronized {
-            mode,
+            mode: TvMode::Fullscreen,
             input,
             signals,
         })
@@ -240,7 +242,7 @@ async fn run_connected_session<S: SsapSocket>(
             message = socket.read_message() => {
                 let message = message?;
                 if let Some(value) = decode_message(socket, message).await? {
-                    handle_unsolicited(value, coordinator).await?;
+                    handle_unsolicited(value, coordinator, &config.inputs).await?;
                 }
                 last_received = Instant::now();
             }
@@ -279,6 +281,7 @@ async fn execute_effect<S: SsapSocket>(
                 json!({"inputId": config.input_for(target)}),
                 config.timeouts.command_ms,
                 coordinator,
+                &config.inputs,
             )
             .await;
             match result {
@@ -300,8 +303,14 @@ async fn execute_effect<S: SsapSocket>(
             }
         }
         Effect::Observe { switch_epoch } => {
+            let snapshot = coordinator.snapshot();
+            let mode = match snapshot.pending_multiview {
+                Some(true) => TvMode::Multiview,
+                Some(false) => TvMode::Fullscreen,
+                None => snapshot.tv_mode,
+            };
             match observe(socket, next_id, config, coordinator).await {
-                Ok((mode, input, signals)) => coordinator
+                Ok((input, signals)) => coordinator
                     .notify_safety(Event::Observation {
                         switch_epoch,
                         mode,
@@ -326,19 +335,7 @@ async fn execute_effect<S: SsapSocket>(
             enabled,
             switch_epoch,
         } => {
-            let value = if enabled { "on" } else { "off" };
-            let result = request_payload(
-                socket,
-                next_id,
-                codec::SET_SYSTEM_SETTINGS,
-                json!({
-                    "category": "commercial",
-                    "settings": {"splitscreenEnable": value}
-                }),
-                config.timeouts.command_ms,
-                coordinator,
-            )
-            .await;
+            let result = set_multiview(socket, next_id, enabled, config, coordinator).await;
             match result {
                 Ok(_) => coordinator
                     .notify_safety(Event::MultiViewAcknowledged {
@@ -369,22 +366,58 @@ async fn execute_effect<S: SsapSocket>(
     Ok(())
 }
 
+async fn set_multiview<S: SsapSocket>(
+    socket: &mut S,
+    next_id: &mut u64,
+    enabled: bool,
+    config: &DaemonConfig,
+    coordinator: &CoordinatorHandle,
+) -> Result<(), SsapError> {
+    let value = if enabled { "on" } else { "off" };
+    let luna_uri = "luna://com.webos.settingsservice/setSystemSettings";
+    let params = json!({
+        "category": "commercial",
+        "settings": {"splitscreenEnable": value}
+    });
+    let action = json!({"uri": luna_uri, "params": params.clone()});
+    let created = request_payload(
+        socket,
+        next_id,
+        codec::CREATE_ALERT,
+        json!({
+            "message": " ",
+            "buttons": [{"label": "", "onClick": luna_uri, "params": params}],
+            "onclose": action.clone(),
+            "onfail": action,
+        }),
+        config.timeouts.command_ms,
+        coordinator,
+        &config.inputs,
+    )
+    .await?;
+    let alert_id = created
+        .get("alertId")
+        .cloned()
+        .ok_or(codec::CodecError::MissingField("alertId"))?;
+    request_payload(
+        socket,
+        next_id,
+        codec::CLOSE_ALERT,
+        json!({"alertId": alert_id}),
+        config.timeouts.command_ms,
+        coordinator,
+        &config.inputs,
+    )
+    .await?;
+    Ok(())
+}
+
 async fn observe<S: SsapSocket>(
     socket: &mut S,
     next_id: &mut u64,
     config: &DaemonConfig,
     coordinator: &CoordinatorHandle,
-) -> Result<(TvMode, Option<Host>, BTreeMap<Host, bool>), SsapError> {
-    let settings = request_payload(
-        socket,
-        next_id,
-        codec::GET_SYSTEM_SETTINGS,
-        json!({"category": "option", "keys": ["multiViewStatus"]}),
-        config.timeouts.observation_ms,
-        coordinator,
-    )
-    .await?;
-    let mode = codec::parse_multiview_mode(&settings).unwrap_or(TvMode::Fullscreen);
+) -> Result<(Option<Host>, BTreeMap<Host, bool>), SsapError> {
     let current_app = request_payload(
         socket,
         next_id,
@@ -392,6 +425,7 @@ async fn observe<S: SsapSocket>(
         json!({}),
         config.timeouts.observation_ms,
         coordinator,
+        &config.inputs,
     )
     .await?;
     let inputs = request_payload(
@@ -401,10 +435,10 @@ async fn observe<S: SsapSocket>(
         json!({}),
         config.timeouts.observation_ms,
         coordinator,
+        &config.inputs,
     )
     .await?;
     Ok((
-        mode,
         codec::parse_current_input(&current_app, &config.inputs)?,
         codec::parse_signals(&inputs, &config.inputs)?,
     ))
@@ -417,11 +451,12 @@ async fn request_payload<S: SsapSocket>(
     payload: Value,
     timeout_ms: u64,
     coordinator: &CoordinatorHandle,
+    inputs: &BTreeMap<Host, String>,
 ) -> Result<Value, SsapError> {
     let id = format!("request-{}", *next_id);
     *next_id = next_id.saturating_add(1);
     send_json(socket, codec::request(&id, uri, payload)).await?;
-    let response = wait_for_id(socket, &id, timeout_ms, coordinator).await?;
+    let response = wait_for_id(socket, &id, timeout_ms, coordinator, inputs).await?;
     Ok(codec::successful_payload(&response)?.clone())
 }
 
@@ -446,6 +481,7 @@ async fn wait_for_id<S: SsapSocket>(
     expected_id: &str,
     timeout_ms: u64,
     coordinator: &CoordinatorHandle,
+    inputs: &BTreeMap<Host, String>,
 ) -> Result<Value, SsapError> {
     tokio::time::timeout(Duration::from_millis(timeout_ms), async {
         loop {
@@ -453,7 +489,7 @@ async fn wait_for_id<S: SsapSocket>(
             if codec::response_id(&value) == Some(expected_id) {
                 return Ok(value);
             }
-            handle_unsolicited(value, coordinator).await?;
+            handle_unsolicited(value, coordinator, inputs).await?;
         }
     })
     .await
@@ -463,15 +499,16 @@ async fn wait_for_id<S: SsapSocket>(
 async fn handle_unsolicited(
     value: Value,
     coordinator: &CoordinatorHandle,
+    inputs: &BTreeMap<Host, String>,
 ) -> Result<(), SsapError> {
-    if codec::response_id(&value) == Some(codec::MULTIVIEW_SUBSCRIPTION_ID) {
+    if codec::response_id(&value) == Some(codec::CURRENT_APP_SUBSCRIPTION_ID) {
         let payload = codec::successful_payload(&value)?;
-        if let Some(mode) = codec::parse_multiview_mode(payload) {
-            coordinator
-                .notify_safety(Event::SubscriptionObserved { mode, input: None })
-                .await
-                .map_err(|_| SsapError::CoordinatorClosed)?;
-        }
+        let mode = coordinator.snapshot().tv_mode;
+        let input = codec::parse_current_input(payload, inputs)?;
+        coordinator
+            .notify_safety(Event::SubscriptionObserved { mode, input })
+            .await
+            .map_err(|_| SsapError::CoordinatorClosed)?;
     } else {
         debug!(message = %value, "unmatched SSAP message");
     }
@@ -668,29 +705,27 @@ windows = "HDMI_2"
         text(json!({"id": id, "type": "response", "payload": payload}))
     }
 
-    fn synchronized_messages() -> [Message; 5] {
+    fn synchronized_messages() -> [Message; 6] {
         [
             text(json!({
                 "type": "registered",
                 "payload": {"client-key": "test-key"}
             })),
             response(
-                codec::MULTIVIEW_SUBSCRIPTION_ID,
+                codec::CURRENT_APP_SUBSCRIPTION_ID,
                 json!({"subscribed": true}),
             ),
             response(
                 "request-1",
-                json!({
-                    "returnValue": true,
-                    "settings": {"multiViewStatus": "off"}
-                }),
+                json!({"returnValue": true, "alertId": "multiview-reset"}),
             ),
+            response("request-2", json!({"returnValue": true})),
             response(
-                "request-2",
+                "request-3",
                 json!({"returnValue": true, "appId": "com.webos.app.hdmi4"}),
             ),
             response(
-                "request-3",
+                "request-4",
                 json!({
                     "returnValue": true,
                     "devices": [
@@ -773,10 +808,20 @@ windows = "HDMI_2"
             })
             .collect();
         assert_eq!(sent[0]["id"], "register-0");
-        assert_eq!(sent[1]["id"], codec::MULTIVIEW_SUBSCRIPTION_ID);
+        assert_eq!(sent[1]["id"], codec::CURRENT_APP_SUBSCRIPTION_ID);
         assert_eq!(sent[2]["id"], "request-1");
+        assert_eq!(sent[2]["uri"], "ssap://system.notifications/createAlert");
+        assert_eq!(
+            sent[2]["payload"]["onclose"]["uri"],
+            "luna://com.webos.settingsservice/setSystemSettings"
+        );
+        assert_eq!(
+            sent[2]["payload"]["onclose"]["params"]["settings"]["splitscreenEnable"],
+            "off"
+        );
         assert_eq!(sent[3]["id"], "request-2");
         assert_eq!(sent[4]["id"], "request-3");
+        assert_eq!(sent[5]["id"], "request-4");
         coordinator_task.abort();
     }
 
@@ -827,7 +872,7 @@ windows = "HDMI_2"
         ));
         wait_until(|| coordinator.snapshot().ready()).await;
         assert!(second.sent.iter().any(|message| {
-            matches!(message, Message::Text(text) if text.contains(codec::MULTIVIEW_SUBSCRIPTION_ID))
+            matches!(message, Message::Text(text) if text.contains(codec::CURRENT_APP_SUBSCRIPTION_ID))
         }));
         assert_eq!(backoff.failed(), (1_000, 1));
         coordinator_task.abort();
@@ -852,19 +897,25 @@ windows = "HDMI_2"
             .unwrap();
         let mut socket = ScriptedSocket::new([
             response(
-                codec::MULTIVIEW_SUBSCRIPTION_ID,
+                codec::CURRENT_APP_SUBSCRIPTION_ID,
                 json!({
                     "returnValue": true,
-                    "settings": {"multiViewStatus": "on"}
+                    "appId": "com.webos.app.hdmi3"
                 }),
             ),
             response("request-old", json!({"returnValue": true})),
             response("request-current", json!({"returnValue": true, "value": 7})),
         ]);
 
-        let current = wait_for_id(&mut socket, "request-current", 100, &coordinator)
-            .await
-            .unwrap();
+        let current = wait_for_id(
+            &mut socket,
+            "request-current",
+            100,
+            &coordinator,
+            &config.inputs,
+        )
+        .await
+        .unwrap();
         assert_eq!(current["payload"]["value"], 7);
         wait_until(|| coordinator.snapshot().fallback_reason.is_some()).await;
         assert_eq!(
@@ -896,7 +947,7 @@ windows = "HDMI_2"
             sent: Vec::new(),
         };
 
-        let result = wait_for_id(&mut socket, "request-1", 1, &coordinator).await;
+        let result = wait_for_id(&mut socket, "request-1", 1, &coordinator, &config.inputs).await;
         assert!(matches!(result, Err(SsapError::Timeout("response"))));
         coordinator_task.abort();
     }
