@@ -225,7 +225,9 @@ pub fn apply(
                     begin_switch(&mut next, &mut effects, now_ms, timing);
                 } else if matches!(
                     next.phase,
-                    ProtocolPhase::Switching | ProtocolPhase::GrantPending
+                    ProtocolPhase::Switching
+                        | ProtocolPhase::Verifying
+                        | ProtocolPhase::GrantPending
                 ) && !readiness.bundle_ready(lease_session)
                 {
                     begin_fallback(
@@ -331,15 +333,16 @@ pub fn apply(
             if next.switch_epoch != switch_epoch || next.commanded_input != Some(target) {
                 return Ok(Transition { next, effects });
             }
-            if matches!(
-                next.phase,
-                ProtocolPhase::Switching | ProtocolPhase::FallbackCommandPending
-            ) && next.observation_in_flight.is_none()
+            if next.observation_in_flight.is_none()
+                && matches!(
+                    next.phase,
+                    ProtocolPhase::Switching | ProtocolPhase::FallbackCommandPending
+                )
             {
                 next.phase = if next.fallback_required {
                     ProtocolPhase::FallbackVerifying
                 } else {
-                    ProtocolPhase::Switching
+                    ProtocolPhase::Verifying
                 };
                 request_observation(&mut next, &mut effects, now_ms, timing, switch_epoch);
             }
@@ -368,44 +371,45 @@ pub fn apply(
                 if server_display_verified(&next, switch_epoch) {
                     finish_fallback(&mut next);
                 } else {
-                    next.phase = ProtocolPhase::FallbackCommandPending;
-                    next.phase_deadline_ms = Some(now_ms.saturating_add(timing.command_ms));
+                    next.phase = ProtocolPhase::FallbackVerifying;
                 }
             } else if let Some(request) = next.active_request.as_ref() {
                 if request.switch_epoch != Some(switch_epoch) {
                     return validated(next, effects, now_ms);
                 }
                 let target = request.target;
-                if target_display_verified(&next, target, switch_epoch) {
-                    if request.status == RequestStatus::Grant {
-                        return validated(next, effects, now_ms);
-                    }
-                    if target != next.server_host {
-                        let ready = next.peers.get(&target).is_some_and(|peer| {
-                            peer.bundle_ready(request.lease.peer_session_epoch)
-                        });
-                        if !ready || request.lease.expires_at_ms <= now_ms {
-                            begin_fallback(
-                                &mut next,
-                                &mut effects,
-                                now_ms,
-                                timing,
-                                "lease_or_readiness_lost_before_grant",
-                            );
+                let verified = target_display_verified(&next, target, switch_epoch);
+                match next.phase {
+                    ProtocolPhase::Verifying if verified => {
+                        if target != next.server_host {
+                            let ready = next.peers.get(&target).is_some_and(|peer| {
+                                peer.bundle_ready(request.lease.peer_session_epoch)
+                            });
+                            if !ready || request.lease.expires_at_ms <= now_ms {
+                                begin_fallback(
+                                    &mut next,
+                                    &mut effects,
+                                    now_ms,
+                                    timing,
+                                    "lease_or_readiness_lost_before_grant",
+                                );
+                            } else {
+                                issue_grant(&mut next, now_ms, timing);
+                            }
                         } else {
                             issue_grant(&mut next, now_ms, timing);
                         }
-                    } else {
-                        issue_grant(&mut next, now_ms, timing);
                     }
-                } else {
-                    begin_fallback(
-                        &mut next,
-                        &mut effects,
-                        now_ms,
-                        timing,
-                        "target_observation_failed",
-                    );
+                    ProtocolPhase::GrantPending if !verified => {
+                        begin_fallback(
+                            &mut next,
+                            &mut effects,
+                            now_ms,
+                            timing,
+                            "target_observation_failed",
+                        );
+                    }
+                    _ => {}
                 }
             } else if next.phase == ProtocolPhase::RemoteOwned {
                 if let Some(session) = &next.active_session {
@@ -617,15 +621,50 @@ pub fn apply(
             if input.is_some() {
                 next.observed_input = input;
             }
-            let expected_target = next
-                .active_request
-                .as_ref()
-                .map(|request| request.target)
-                .or_else(|| next.active_session.as_ref().map(|session| session.target));
-            if expected_target.is_some()
-                && (mode != TvMode::Fullscreen
-                    || input.is_some_and(|observed| Some(observed) != expected_target))
+            let active_target = next.active_request.as_ref().map(|request| request.target);
+            let session_target = next.active_session.as_ref().map(|session| session.target);
+            let target_mismatch = |target| {
+                mode != TvMode::Fullscreen || input.is_some_and(|observed| observed != target)
+            };
+
+            if next.fallback_required
+                && next.phase == ProtocolPhase::FallbackVerifying
+                && mode == TvMode::Fullscreen
+                && input == Some(next.server_host)
+                && next.observation_in_flight.is_none()
             {
+                let switch_epoch = next.switch_epoch;
+                request_observation_preserving_deadline(
+                    &mut next,
+                    &mut effects,
+                    now_ms,
+                    timing,
+                    switch_epoch,
+                );
+            } else if next.phase == ProtocolPhase::Verifying
+                && active_target
+                    .is_some_and(|target| mode == TvMode::Fullscreen && input == Some(target))
+                && next.observation_in_flight.is_none()
+            {
+                let switch_epoch = next.switch_epoch;
+                request_observation_preserving_deadline(
+                    &mut next,
+                    &mut effects,
+                    now_ms,
+                    timing,
+                    switch_epoch,
+                );
+            } else if next.phase == ProtocolPhase::GrantPending
+                && active_target.is_some_and(target_mismatch)
+            {
+                begin_fallback(
+                    &mut next,
+                    &mut effects,
+                    now_ms,
+                    timing,
+                    "unexpected_tv_subscription",
+                );
+            } else if session_target.is_some_and(target_mismatch) {
                 begin_fallback(
                     &mut next,
                     &mut effects,
@@ -685,6 +724,18 @@ pub fn apply(
                     .expect("remote owned session");
                 request_observation(&mut next, &mut effects, now_ms, timing, epoch);
             } else if next.observation_in_flight.is_some()
+                && next
+                    .phase_deadline_ms
+                    .is_some_and(|deadline| deadline <= now_ms)
+            {
+                begin_fallback(
+                    &mut next,
+                    &mut effects,
+                    now_ms,
+                    timing,
+                    "observation_timeout",
+                );
+            } else if next.phase == ProtocolPhase::Verifying
                 && next
                     .phase_deadline_ms
                     .is_some_and(|deadline| deadline <= now_ms)
@@ -764,6 +815,18 @@ fn request_observation(
     state.observation_in_flight = Some(switch_epoch);
     state.phase_deadline_ms = Some(now_ms.saturating_add(timing.observation_ms));
     effects.push(Effect::Observe { switch_epoch });
+}
+
+fn request_observation_preserving_deadline(
+    state: &mut ProtocolState,
+    effects: &mut Vec<Effect>,
+    now_ms: u64,
+    timing: ProtocolTiming,
+    switch_epoch: u64,
+) {
+    let deadline = state.phase_deadline_ms;
+    request_observation(state, effects, now_ms, timing, switch_epoch);
+    state.phase_deadline_ms = deadline;
 }
 
 fn issue_grant(state: &mut ProtocolState, now_ms: u64, timing: ProtocolTiming) {
@@ -1049,14 +1112,27 @@ mod tests {
         )
     }
 
-    fn remote_owned() -> ProtocolState {
-        let state = ready_peer(&synchronized(), Host::Mac, 11);
-        let switching = create_mac(&state).unwrap().next;
-        let switch_epoch = switching.switch_epoch;
-        let granted = apply(
-            &switching,
+    fn acknowledge_switch(state: &ProtocolState, now_ms: u64) -> ProtocolState {
+        apply(
+            state,
+            Event::CommandAcknowledged {
+                switch_epoch: state.switch_epoch,
+                target: state.commanded_input.expect("commanded target"),
+            },
+            now_ms,
+            TIMING,
+        )
+        .unwrap()
+        .next
+    }
+
+    fn grant_mac(state: &ProtocolState) -> ProtocolState {
+        let switching = create_mac(state).unwrap().next;
+        let verifying = acknowledge_switch(&switching, 11);
+        apply(
+            &verifying,
             Event::Observation {
-                switch_epoch,
+                switch_epoch: verifying.switch_epoch,
                 mode: TvMode::Fullscreen,
                 input: Some(Host::Mac),
                 signals: signals(Host::Mac),
@@ -1065,7 +1141,12 @@ mod tests {
             TIMING,
         )
         .unwrap()
-        .next;
+        .next
+    }
+
+    fn remote_owned() -> ProtocolState {
+        let state = ready_peer(&synchronized(), Host::Mac, 11);
+        let granted = grant_mac(&state);
         let request = granted.active_request.as_ref().unwrap();
         apply(
             &granted,
@@ -1225,10 +1306,11 @@ mod tests {
     #[test]
     fn correct_observation_issues_grant_but_does_not_move_owners() {
         let state = ready_peer(&synchronized(), Host::Mac, 11);
-        let transition = create_mac(&state).unwrap();
-        let epoch = transition.next.switch_epoch;
+        let switching = create_mac(&state).unwrap().next;
+        let verifying = acknowledge_switch(&switching, 11);
+        let epoch = verifying.switch_epoch;
         let observed = apply(
-            &transition.next,
+            &verifying,
             Event::Observation {
                 switch_epoch: epoch,
                 mode: TvMode::Fullscreen,
@@ -1250,12 +1332,13 @@ mod tests {
     }
 
     #[test]
-    fn wrong_or_missing_target_signal_cannot_issue_grant() {
+    fn transient_wrong_or_missing_target_signal_waits_for_convergence() {
         let state = ready_peer(&synchronized(), Host::Mac, 11);
         let switching = create_mac(&state).unwrap().next;
-        let switch_epoch = switching.switch_epoch;
-        let failed = apply(
-            &switching,
+        let verifying = acknowledge_switch(&switching, 11);
+        let switch_epoch = verifying.switch_epoch;
+        let pending = apply(
+            &verifying,
             Event::Observation {
                 switch_epoch,
                 mode: TvMode::Fullscreen,
@@ -1267,11 +1350,82 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(failed.next.keyboard_owner, Host::Linux);
-        assert!(failed.next.active_request.is_none());
+        assert_eq!(pending.next.keyboard_owner, Host::Linux);
+        assert_eq!(pending.next.pointer_owner, Host::Linux);
+        assert_eq!(pending.next.phase, ProtocolPhase::Verifying);
+        assert!(pending.next.active_request.is_some());
+        assert!(!pending.next.fallback_required);
+        assert!(pending.effects.is_empty());
+    }
+
+    #[test]
+    fn target_subscription_reobserves_without_extending_deadline() {
+        let state = ready_peer(&synchronized(), Host::Mac, 11);
+        let switching = create_mac(&state).unwrap().next;
+        let verifying = acknowledge_switch(&switching, 11);
+        let switch_epoch = verifying.switch_epoch;
+        let pending = apply(
+            &verifying,
+            Event::Observation {
+                switch_epoch,
+                mode: TvMode::Fullscreen,
+                input: Some(Host::Linux),
+                signals: signals(Host::Linux),
+            },
+            20,
+            TIMING,
+        )
+        .unwrap()
+        .next;
+        let deadline = pending.phase_deadline_ms;
+
+        let retry = apply(
+            &pending,
+            Event::SubscriptionObserved {
+                mode: TvMode::Fullscreen,
+                input: Some(Host::Mac),
+            },
+            30,
+            TIMING,
+        )
+        .unwrap();
+
+        assert_eq!(retry.effects, vec![Effect::Observe { switch_epoch }]);
+        assert_eq!(retry.next.phase_deadline_ms, deadline);
+        assert_eq!(retry.next.observation_in_flight, Some(switch_epoch));
+    }
+
+    #[test]
+    fn transient_mismatch_falls_back_only_at_observation_deadline() {
+        let state = ready_peer(&synchronized(), Host::Mac, 11);
+        let switching = create_mac(&state).unwrap().next;
+        let verifying = acknowledge_switch(&switching, 11);
+        let pending = apply(
+            &verifying,
+            Event::Observation {
+                switch_epoch: verifying.switch_epoch,
+                mode: TvMode::Fullscreen,
+                input: Some(Host::Linux),
+                signals: signals(Host::Linux),
+            },
+            20,
+            TIMING,
+        )
+        .unwrap()
+        .next;
+
+        let timed_out = apply(
+            &pending,
+            Event::Tick,
+            pending.phase_deadline_ms.unwrap(),
+            TIMING,
+        )
+        .unwrap();
+        assert_eq!(timed_out.next.keyboard_owner, Host::Linux);
+        assert_eq!(timed_out.next.pointer_owner, Host::Linux);
         assert_eq!(
-            failed.next.fallback_reason.as_deref(),
-            Some("target_observation_failed")
+            timed_out.next.fallback_reason.as_deref(),
+            Some("observation_timeout")
         );
     }
 
@@ -1312,9 +1466,10 @@ mod tests {
     fn duplicate_valid_observation_does_not_regenerate_grant() {
         let state = ready_peer(&synchronized(), Host::Mac, 11);
         let switching = create_mac(&state).unwrap().next;
-        let switch_epoch = switching.switch_epoch;
+        let verifying = acknowledge_switch(&switching, 11);
+        let switch_epoch = verifying.switch_epoch;
         let observed = apply(
-            &switching,
+            &verifying,
             Event::Observation {
                 switch_epoch,
                 mode: TvMode::Fullscreen,
@@ -1351,21 +1506,7 @@ mod tests {
     #[test]
     fn commit_moves_keyboard_and_pointer_atomically() {
         let state = ready_peer(&synchronized(), Host::Mac, 11);
-        let transition = create_mac(&state).unwrap();
-        let epoch = transition.next.switch_epoch;
-        let granted = apply(
-            &transition.next,
-            Event::Observation {
-                switch_epoch: epoch,
-                mode: TvMode::Fullscreen,
-                input: Some(Host::Mac),
-                signals: signals(Host::Mac),
-            },
-            20,
-            TIMING,
-        )
-        .unwrap()
-        .next;
+        let granted = grant_mac(&state);
         let request = granted.active_request.as_ref().unwrap();
         let committed = apply(
             &granted,
@@ -1390,21 +1531,7 @@ mod tests {
     #[test]
     fn cancelling_committed_session_releases_input_and_is_idempotent() {
         let state = ready_peer(&synchronized(), Host::Mac, 11);
-        let transition = create_mac(&state).unwrap();
-        let epoch = transition.next.switch_epoch;
-        let granted = apply(
-            &transition.next,
-            Event::Observation {
-                switch_epoch: epoch,
-                mode: TvMode::Fullscreen,
-                input: Some(Host::Mac),
-                signals: signals(Host::Mac),
-            },
-            20,
-            TIMING,
-        )
-        .unwrap()
-        .next;
+        let granted = grant_mac(&state);
         let request = granted.active_request.as_ref().unwrap();
         let committed = apply(
             &granted,
@@ -1464,21 +1591,7 @@ mod tests {
     #[test]
     fn readiness_loss_before_commit_revokes_grant_and_falls_back() {
         let state = ready_peer(&synchronized(), Host::Mac, 11);
-        let transition = create_mac(&state).unwrap();
-        let epoch = transition.next.switch_epoch;
-        let granted = apply(
-            &transition.next,
-            Event::Observation {
-                switch_epoch: epoch,
-                mode: TvMode::Fullscreen,
-                input: Some(Host::Mac),
-                signals: signals(Host::Mac),
-            },
-            20,
-            TIMING,
-        )
-        .unwrap()
-        .next;
+        let granted = grant_mac(&state);
         let lost = apply(
             &granted,
             Event::PeerReadinessUpdated {
@@ -1504,21 +1617,7 @@ mod tests {
     #[test]
     fn disconnect_while_remote_owned_releases_input_before_reconnect() {
         let state = ready_peer(&synchronized(), Host::Mac, 11);
-        let transition = create_mac(&state).unwrap();
-        let epoch = transition.next.switch_epoch;
-        let granted = apply(
-            &transition.next,
-            Event::Observation {
-                switch_epoch: epoch,
-                mode: TvMode::Fullscreen,
-                input: Some(Host::Mac),
-                signals: signals(Host::Mac),
-            },
-            20,
-            TIMING,
-        )
-        .unwrap()
-        .next;
+        let granted = grant_mac(&state);
         let request = granted.active_request.as_ref().unwrap();
         let remote = apply(
             &granted,
@@ -1742,21 +1841,7 @@ mod tests {
     #[test]
     fn unexpected_subscription_while_grant_pending_revokes_grant() {
         let state = ready_peer(&synchronized(), Host::Mac, 11);
-        let switching = create_mac(&state).unwrap().next;
-        let switch_epoch = switching.switch_epoch;
-        let granted = apply(
-            &switching,
-            Event::Observation {
-                switch_epoch,
-                mode: TvMode::Fullscreen,
-                input: Some(Host::Mac),
-                signals: signals(Host::Mac),
-            },
-            20,
-            TIMING,
-        )
-        .unwrap()
-        .next;
+        let granted = grant_mac(&state);
         assert_eq!(granted.phase, ProtocolPhase::GrantPending);
 
         let changed = apply(

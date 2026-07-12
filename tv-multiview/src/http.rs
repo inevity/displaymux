@@ -225,6 +225,7 @@ fn in_flight_operation(state: &ProtocolState) -> Option<&'static str> {
     match state.phase {
         ProtocolPhase::Waking => Some("wake"),
         ProtocolPhase::Switching | ProtocolPhase::FallbackCommandPending => Some("set_input"),
+        ProtocolPhase::Verifying => Some("verify_target"),
         ProtocolPhase::FallbackVerifying => Some("verify_fallback"),
         ProtocolPhase::MultiviewChanging => Some("set_multiview"),
         ProtocolPhase::Starting
@@ -927,6 +928,13 @@ mod tests {
 
         let switch_epoch = handle.snapshot().switch_epoch;
         handle
+            .apply(Event::CommandAcknowledged {
+                switch_epoch,
+                target: Host::Mac,
+            })
+            .await
+            .unwrap();
+        handle
             .apply(Event::Observation {
                 switch_epoch,
                 mode: TvMode::Fullscreen,
@@ -1158,6 +1166,13 @@ mod tests {
         assert_eq!(missing.status(), StatusCode::NOT_FOUND);
 
         let switch_epoch = handle.snapshot().switch_epoch;
+        handle
+            .apply(Event::CommandAcknowledged {
+                switch_epoch,
+                target: Host::Mac,
+            })
+            .await
+            .unwrap();
         handle
             .apply(Event::Observation {
                 switch_epoch,

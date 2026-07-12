@@ -536,8 +536,19 @@ mod tests {
         .unwrap()
         .next;
         let switch_epoch = switching.switch_epoch;
-        let granted = protocol::apply(
+        let verifying = protocol::apply(
             &switching,
+            Event::CommandAcknowledged {
+                switch_epoch,
+                target: Host::Mac,
+            },
+            11,
+            TIMING,
+        )
+        .unwrap()
+        .next;
+        let granted = protocol::apply(
+            &verifying,
             Event::Observation {
                 switch_epoch,
                 mode: TvMode::Fullscreen,

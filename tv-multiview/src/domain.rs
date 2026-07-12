@@ -74,6 +74,7 @@ pub enum ProtocolPhase {
     Idle,
     Waking,
     Switching,
+    Verifying,
     GrantPending,
     RemoteOwned,
     FallbackCommandPending,
