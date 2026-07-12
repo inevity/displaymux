@@ -399,7 +399,6 @@
         mode: "0644"
       vars:
         tv_multiview_binary: "{{ ansible_facts.env.HOME }}/.local/bin/tv-multiview"
-        tv_multiview_config_path: "{{ tv_multiview_config_path }}"
       register: daemon_service_template
 
     - name: Reload systemd user daemon and restart changed services
