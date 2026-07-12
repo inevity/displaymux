@@ -628,6 +628,7 @@ mod tests {
     fn display_center_handles_negative_desktop_coordinates() {
         let center = display_center((-1920.0, 0.0, 0.0, 1080.0));
 
-        assert_eq!(center, CGPoint::new(-960.0, 540.0));
+        assert_eq!(center.x, -960.0);
+        assert_eq!(center.y, 540.0);
     }
 }
