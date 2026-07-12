@@ -17,6 +17,7 @@ use tokio::{
     net::UdpSocket,
     sync::Mutex,
     task::{JoinSet, spawn_local},
+    time::MissedTickBehavior,
 };
 use webrtc_dtls::{
     config::{Config, ExtendedMasterSecretType},
@@ -42,6 +43,7 @@ pub(crate) enum LanMouseConnectionError {
 }
 
 const DEFAULT_CONNECTION_TIMEOUT: Duration = Duration::from_secs(5);
+const CONNECTION_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(1);
 
 async fn connect(
     addr: SocketAddr,
@@ -97,6 +99,7 @@ pub(crate) struct LanMouseConnection {
     client_manager: ClientManager,
     conns: Rc<Mutex<HashMap<SocketAddr, Arc<dyn Conn + Send + Sync>>>>,
     connecting: Rc<Mutex<HashSet<ClientHandle>>>,
+    maintenance_task: tokio::task::JoinHandle<()>,
     recv_rx: Receiver<(ClientHandle, ProtoEvent)>,
     recv_tx: Sender<(ClientHandle, ProtoEvent)>,
     ping_response: Rc<RefCell<HashSet<SocketAddr>>>,
@@ -105,14 +108,26 @@ pub(crate) struct LanMouseConnection {
 impl LanMouseConnection {
     pub(crate) fn new(cert: Certificate, client_manager: ClientManager) -> Self {
         let (recv_tx, recv_rx) = channel();
+        let conns: Rc<Mutex<HashMap<SocketAddr, Arc<dyn Conn + Send + Sync>>>> = Default::default();
+        let connecting: Rc<Mutex<HashSet<ClientHandle>>> = Default::default();
+        let ping_response: Rc<RefCell<HashSet<SocketAddr>>> = Default::default();
+        let maintenance_task = spawn_connection_maintenance(
+            client_manager.clone(),
+            cert.clone(),
+            conns.clone(),
+            connecting.clone(),
+            recv_tx.clone(),
+            ping_response.clone(),
+        );
         Self {
             cert,
             client_manager,
-            conns: Default::default(),
-            connecting: Default::default(),
+            conns,
+            connecting,
+            maintenance_task,
             recv_rx,
             recv_tx,
-            ping_response: Default::default(),
+            ping_response,
         }
     }
 
@@ -148,23 +163,91 @@ impl LanMouseConnection {
             }
         }
 
-        // check if we are already trying to connect
-        let mut connecting = self.connecting.lock().await;
-        if !connecting.contains(&handle) {
-            connecting.insert(handle);
-            // connect in the background
-            spawn_local(connect_to_handle(
-                self.client_manager.clone(),
-                self.cert.clone(),
-                handle,
-                self.conns.clone(),
-                self.connecting.clone(),
-                self.recv_tx.clone(),
-                self.ping_response.clone(),
-            ));
-        }
+        request_connection(
+            self.client_manager.clone(),
+            self.cert.clone(),
+            handle,
+            self.conns.clone(),
+            self.connecting.clone(),
+            self.recv_tx.clone(),
+            self.ping_response.clone(),
+        );
         Err(LanMouseConnectionError::NotConnected)
     }
+}
+
+impl Drop for LanMouseConnection {
+    fn drop(&mut self) {
+        self.maintenance_task.abort();
+    }
+}
+
+fn spawn_connection_maintenance(
+    client_manager: ClientManager,
+    cert: Certificate,
+    conns: Rc<Mutex<HashMap<SocketAddr, Arc<dyn Conn + Send + Sync>>>>,
+    connecting: Rc<Mutex<HashSet<ClientHandle>>>,
+    tx: Sender<(ClientHandle, ProtoEvent)>,
+    ping_response: Rc<RefCell<HashSet<SocketAddr>>>,
+) -> tokio::task::JoinHandle<()> {
+    spawn_local(async move {
+        let mut interval = tokio::time::interval(CONNECTION_MAINTENANCE_INTERVAL);
+        interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            for handle in client_manager.active_clients() {
+                request_connection(
+                    client_manager.clone(),
+                    cert.clone(),
+                    handle,
+                    conns.clone(),
+                    connecting.clone(),
+                    tx.clone(),
+                    ping_response.clone(),
+                );
+            }
+        }
+    })
+}
+
+fn request_connection(
+    client_manager: ClientManager,
+    cert: Certificate,
+    handle: ClientHandle,
+    conns: Rc<Mutex<HashMap<SocketAddr, Arc<dyn Conn + Send + Sync>>>>,
+    connecting: Rc<Mutex<HashSet<ClientHandle>>>,
+    tx: Sender<(ClientHandle, ProtoEvent)>,
+    ping_response: Rc<RefCell<HashSet<SocketAddr>>>,
+) {
+    if client_manager.active_addr(handle).is_some()
+        || !client_manager
+            .get_state(handle)
+            .is_some_and(|(_, state)| state.active)
+    {
+        return;
+    }
+
+    spawn_local(async move {
+        let mut connecting_guard = connecting.lock().await;
+        if !connecting_guard.insert(handle) {
+            return;
+        }
+        drop(connecting_guard);
+
+        if let Err(error) = connect_to_handle(
+            client_manager,
+            cert,
+            handle,
+            conns,
+            connecting,
+            tx,
+            ping_response,
+        )
+        .await
+        {
+            log::debug!("client {handle} connection attempt ended: {error}");
+        }
+    });
 }
 
 async fn connect_to_handle(
@@ -353,4 +436,54 @@ async fn disconnect(
     client_manager.clear_peer_readiness(handle);
     log::info!("active connections: {active:?}");
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lan_mouse_ipc::{ClientConfig, ClientState};
+    use std::collections::HashSet;
+    use tokio::task::LocalSet;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn active_client_starts_connection_without_input_send() {
+        LocalSet::new()
+            .run_until(async {
+                let sink = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+                let sink_addr = sink.local_addr().unwrap();
+                let client_manager = ClientManager::default();
+                let handle = client_manager.add_client();
+                let ip = sink_addr.ip();
+                client_manager.set_config(
+                    handle,
+                    ClientConfig {
+                        fix_ips: vec![ip],
+                        port: sink_addr.port(),
+                        ..Default::default()
+                    },
+                );
+                client_manager.set_state(
+                    handle,
+                    ClientState {
+                        active: true,
+                        ips: HashSet::from([ip]),
+                        ..Default::default()
+                    },
+                );
+                let cert = Certificate::generate_self_signed(["ignored".to_owned()]).unwrap();
+                let connection = LanMouseConnection::new(cert, client_manager);
+
+                tokio::time::timeout(Duration::from_secs(1), async {
+                    loop {
+                        if connection.connecting.lock().await.contains(&handle) {
+                            break;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("active client did not start a readiness connection");
+            })
+            .await;
+    }
 }
