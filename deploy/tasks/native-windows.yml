@@ -1,0 +1,319 @@
+- name: Ensure Windows native build and runtime directories exist
+  ansible.windows.win_file:
+    path: "{{ item }}"
+    state: directory
+  loop:
+    - "{{ win_build_cache }}"
+    - "{{ win_install_dir }}"
+    - "{{ ansible_facts.env.LOCALAPPDATA }}\\lan-mouse"
+    - "{{ ansible_facts.env.LOCALAPPDATA }}\\lan-mouse\\logs"
+
+- name: Validate Windows native build prerequisites
+  ansible.windows.win_shell: |
+    foreach ($command in @("git", "rustup", "pwsh")) {
+      if (-not (Get-Command $command -ErrorAction SilentlyContinue)) {
+        throw "Required command is missing: $command"
+      }
+    }
+    if ($env:PROCESSOR_ARCHITECTURE -ne "AMD64") {
+      throw "Windows native build requires AMD64"
+    }
+  changed_when: false
+
+- name: Install selected Windows Rust toolchain
+  ansible.windows.win_shell: |
+    rustup toolchain install {{ lan_mouse_rust_toolchain }} --profile minimal
+    exit $LASTEXITCODE
+  changed_when: false
+
+- name: Read Windows Rust compiler identity
+  ansible.windows.win_shell: |
+    rustup run {{ lan_mouse_rust_toolchain }} rustc --version
+    exit $LASTEXITCODE
+  register: win_rust_version
+  changed_when: false
+
+- name: Define Windows native build identity
+  ansible.builtin.set_fact:
+    win_build_id: >-
+      {{ lan_mouse_revision }} lock={{ lan_mouse_cargo_lock_sha256 }}
+      rust={{ win_rust_version.stdout | trim }} no-default-features
+
+- name: Locate Windows MSVC x64 Build Tools
+  ansible.windows.win_shell: |
+    $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+    if (-not (Test-Path $vswhere)) { throw "vswhere.exe is missing" }
+    $installation = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+    if (-not $installation) { throw "MSVC x64 Build Tools are missing" }
+    Write-Output $installation
+  register: win_vs_installation
+  changed_when: false
+
+- name: Locate PowerShell 7 for bounded log wrapper
+  ansible.windows.win_shell: |
+    $path = (Get-Command pwsh -ErrorAction Stop).Source
+    Write-Output $path
+  register: win_pwsh
+  changed_when: false
+
+- name: Copy pinned source bundle to Windows
+  ansible.windows.win_copy:
+    src: "{{ source_bundle }}"
+    dest: "{{ win_build_cache }}\\source-{{ lan_mouse_revision[:12] }}.bundle"
+
+- name: Copy locked vendor archive to Windows
+  ansible.windows.win_copy:
+    src: "{{ vendor_archive }}"
+    dest: "{{ win_build_cache }}\\vendor-{{ lan_mouse_revision[:12] }}.zip"
+
+- name: Extract locked Cargo vendor tree on Windows
+  ansible.windows.win_shell: |
+    Expand-Archive -Path "{{ win_build_cache }}\vendor-{{ lan_mouse_revision[:12] }}.zip" -DestinationPath "{{ win_build_cache }}" -Force
+  args:
+    creates: "{{ win_vendor_dir }}"
+
+- name: Clone pinned lan-mouse source on Windows
+  ansible.windows.win_shell: |
+    git clone "{{ win_build_cache }}\source-{{ lan_mouse_revision[:12] }}.bundle" "{{ win_source_dir }}"
+    exit $LASTEXITCODE
+  args:
+    creates: "{{ win_source_dir }}\\.git"
+
+- name: Record source repository origin on Windows
+  ansible.windows.win_shell: |
+    git -C "{{ win_source_dir }}" remote set-url origin "{{ lan_mouse_repo_url }}"
+    exit $LASTEXITCODE
+  changed_when: false
+
+- name: Verify Windows source revision
+  ansible.windows.win_shell: |
+    git -C "{{ win_source_dir }}" rev-parse HEAD
+  register: win_source_revision
+  changed_when: false
+
+- name: Require exact Windows source revision
+  ansible.builtin.assert:
+    that: win_source_revision.stdout | trim == lan_mouse_revision
+
+- name: Ensure checkout-local Cargo config directory exists on Windows
+  ansible.windows.win_file:
+    path: "{{ win_source_dir }}\\.cargo"
+    state: directory
+
+- name: Configure locked offline Cargo source on Windows
+  ansible.windows.win_template:
+    src: templates/cargo-vendor-config.toml.j2
+    dest: "{{ win_source_dir }}\\.cargo\\config.toml"
+  vars:
+    cargo_vendor_path: "{{ win_vendor_dir }}"
+
+- name: Verify Windows offline dependency resolution
+  ansible.windows.win_shell: |
+    $env:RUSTUP_TOOLCHAIN = "{{ lan_mouse_rust_toolchain }}"
+    cargo metadata --frozen --format-version 1 | Out-Null
+    exit $LASTEXITCODE
+  args:
+    chdir: "{{ win_source_dir }}"
+  changed_when: false
+
+- name: Check installed Windows build identity
+  ansible.windows.win_stat:
+    path: "{{ win_installed_build_id }}"
+  register: win_build_id_stat
+
+- name: Read installed Windows build identity
+  ansible.windows.slurp:
+    path: "{{ win_installed_build_id }}"
+  register: win_build_id_content
+  when: win_build_id_stat.stat.exists
+
+- name: Check installed Windows binary
+  ansible.windows.win_stat:
+    path: "{{ win_installed_binary }}"
+  register: win_binary_stat
+
+- name: Decide whether Windows native build is required
+  ansible.builtin.set_fact:
+    win_build_required: >-
+      {{ not win_build_id_stat.stat.exists
+         or not win_binary_stat.stat.exists
+         or (win_build_id_content.content | default('') | b64decode | trim != win_build_id) }}
+
+- name: Build and test pinned lan-mouse natively on Windows
+  when: win_build_required
+  block:
+    - name: Run no-GTK Windows workspace tests
+      ansible.windows.win_shell: |
+        $env:RUSTUP_TOOLCHAIN = "{{ lan_mouse_rust_toolchain }}"
+        $env:CARGO_TARGET_DIR = "{{ win_target_dir }}"
+        $command = "call `"{{ win_vs_installation.stdout | trim }}\Common7\Tools\VsDevCmd.bat`" -arch=x64 -host_arch=x64 >nul && cargo test --frozen --workspace --exclude lan-mouse-gtk --no-default-features"
+        cmd.exe /d /c $command
+        exit $LASTEXITCODE
+      args:
+        chdir: "{{ win_source_dir }}"
+      changed_when: false
+      async: 3600
+      poll: 5
+
+    - name: Build no-GTK Windows release binary
+      ansible.windows.win_shell: |
+        $env:RUSTUP_TOOLCHAIN = "{{ lan_mouse_rust_toolchain }}"
+        $env:CARGO_TARGET_DIR = "{{ win_target_dir }}"
+        $command = "call `"{{ win_vs_installation.stdout | trim }}\Common7\Tools\VsDevCmd.bat`" -arch=x64 -host_arch=x64 >nul && cargo build --frozen --release --bin lan-mouse --no-default-features"
+        cmd.exe /d /c $command
+        exit $LASTEXITCODE
+      args:
+        chdir: "{{ win_source_dir }}"
+      changed_when: true
+      async: 3600
+      poll: 5
+
+    - name: Stop existing lan-mouse scheduled task before binary replacement
+      ansible.windows.win_shell: |
+        schtasks /end /tn LanMouseDaemon 2>$null | Out-Null
+        $expected = [System.IO.Path]::GetFullPath("{{ win_installed_binary }}")
+        $processes = Get-CimInstance Win32_Process -Filter "Name = 'lan-mouse.exe'" |
+          Where-Object { $_.ExecutablePath -and [System.IO.Path]::GetFullPath($_.ExecutablePath) -eq $expected }
+        $processes | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction Stop }
+
+        $deadline = (Get-Date).AddSeconds(10)
+        do {
+          $remaining = Get-CimInstance Win32_Process -Filter "Name = 'lan-mouse.exe'" |
+            Where-Object { $_.ExecutablePath -and [System.IO.Path]::GetFullPath($_.ExecutablePath) -eq $expected }
+          if (-not $remaining) { break }
+          Start-Sleep -Milliseconds 100
+        } while ((Get-Date) -lt $deadline)
+        if ($remaining) { throw "lan-mouse.exe did not stop before replacement" }
+      changed_when: false
+
+    - name: Install only the Windows daemon executable
+      ansible.windows.win_copy:
+        src: "{{ win_target_dir }}\\release\\lan-mouse.exe"
+        dest: "{{ win_installed_binary }}"
+        remote_src: true
+      register: win_binary_install
+
+- name: Add Linux host to Windows hosts file
+  ansible.windows.win_shell: |
+    $hosts = "C:\Windows\System32\drivers\etc\hosts"
+    $line = "{{ hostvars[groups['linux_desktop'][0]].ansible_host }} {{ groups['linux_desktop'][0] }}"
+    $content = Get-Content $hosts -ErrorAction SilentlyContinue
+    if ($content -notcontains $line) {
+      Add-Content $hosts $line
+      Write-Output "created"
+    }
+  register: win_hosts_entry
+  changed_when: "'created' in win_hosts_entry.stdout"
+
+- name: Deploy lan-mouse Windows spoke configuration
+  ansible.windows.win_template:
+    src: templates/spoke-config.toml.j2
+    dest: "{{ ansible_facts.env.LOCALAPPDATA }}\\lan-mouse\\config.toml"
+  vars:
+    spoke_position: "{{ win_spoke_position }}"
+    spoke_host: windows
+  register: win_config
+  no_log: true
+
+- name: Deploy bounded Windows log wrapper
+  ansible.windows.win_template:
+    src: templates/lan-mouse-windows-wrapper.ps1.j2
+    dest: "{{ win_wrapper }}"
+  vars:
+    lan_mouse_windows_binary: "{{ win_installed_binary }}"
+  register: win_wrapper_template
+
+- name: Create scheduled task for bounded-log lan-mouse daemon
+  community.windows.win_scheduled_task:
+    name: LanMouseDaemon
+    description: "Runs lan-mouse in daemon mode at user logon"
+    actions:
+      - path: "{{ win_pwsh.stdout | trim }}"
+        arguments: '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "{{ win_wrapper }}"'
+    triggers:
+      - type: logon
+        user_id: "{{ ansible_user }}"
+    username: "{{ ansible_user }}"
+    logon_type: interactive_token
+    state: present
+    enabled: true
+    run_level: limited
+    allow_demand_start: true
+    disallow_start_if_on_batteries: false
+    stop_if_going_on_batteries: false
+    execution_time_limit: PT0S
+    multiple_instances: 2
+    restart_count: 999
+    restart_interval: PT1M
+  register: win_scheduled_task
+
+- name: Decide whether Windows daemon restart is required
+  ansible.builtin.set_fact:
+    win_runtime_changed: >-
+      {{ win_build_required
+         or win_config.changed
+         or win_wrapper_template.changed
+         or win_scheduled_task.changed }}
+
+- name: Restart Windows lan-mouse when runtime inputs changed
+  ansible.windows.win_shell: |
+    schtasks /end /tn LanMouseDaemon 2>$null
+    Start-Sleep 2
+    schtasks /run /tn LanMouseDaemon
+    exit $LASTEXITCODE
+  when: win_runtime_changed
+  changed_when: true
+
+- name: Ensure Windows lan-mouse is running when inputs are unchanged
+  ansible.windows.win_shell: |
+    $expected = [System.IO.Path]::GetFullPath("{{ win_installed_binary }}")
+    $process = Get-CimInstance Win32_Process -Filter "Name = 'lan-mouse.exe'" |
+      Where-Object { $_.ExecutablePath -and [System.IO.Path]::GetFullPath($_.ExecutablePath) -eq $expected }
+    if (-not $process) {
+      schtasks /run /tn LanMouseDaemon
+      if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      Write-Output "started"
+    }
+  register: win_ensure_running
+  when: not win_runtime_changed
+  changed_when: "'started' in win_ensure_running.stdout"
+
+- name: Wait for Windows lan-mouse process
+  ansible.windows.win_shell: |
+    $expected = [System.IO.Path]::GetFullPath("{{ win_installed_binary }}")
+    $process = Get-CimInstance Win32_Process -Filter "Name = 'lan-mouse.exe'" |
+      Where-Object { $_.ExecutablePath -and [System.IO.Path]::GetFullPath($_.ExecutablePath) -eq $expected }
+    if (-not $process) { throw "lan-mouse.exe is not running" }
+    Write-Output $process.ExecutablePath
+  register: win_process
+  retries: 10
+  delay: 1
+  until: win_process.rc == 0
+  changed_when: false
+
+- name: Verify persistent Windows log files exist
+  ansible.windows.win_stat:
+    path: "{{ ansible_facts.env.LOCALAPPDATA }}\\lan-mouse\\logs\\{{ item }}"
+  loop:
+    - lan-mouse.log
+    - lan-mouse.err.log
+  register: win_logs
+
+- name: Require persistent Windows log sources
+  ansible.builtin.assert:
+    that: win_logs.results | selectattr('stat.exists', 'equalto', true) | list | length == 2
+
+- name: Record installed Windows build identity
+  ansible.windows.win_copy:
+    content: "{{ win_build_id }}\r\n"
+    dest: "{{ win_installed_build_id }}"
+
+- name: Open Windows Firewall for lan-mouse (UDP {{ lan_mouse_port }})
+  ansible.windows.win_shell: |
+    $existing = Get-NetFirewallRule -Name lan-mouse -ErrorAction SilentlyContinue
+    if (-not $existing) {
+      New-NetFirewallRule -Name lan-mouse -DisplayName lan-mouse -Enabled True -Profile Any -Direction Inbound -Protocol UDP -Action Allow -LocalPort {{ lan_mouse_port }} | Out-Null
+      Write-Output "created"
+    }
+  register: win_firewall
+  changed_when: "'created' in win_firewall.stdout"
