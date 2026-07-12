@@ -4,7 +4,7 @@ Parent: [Main fenced switch implementation plan](plan_main_fullscreen_multiview_
 
 Status (2026-07-13): source implementation, automated tests, native builds,
 and coordinated three-host deployment are complete at lan-mouse commit
-`b90f4f9af7c3b86783fa6dd763b874103f76820f`. Linux, macOS, and Windows run the
+`192354206aad01609488633f44b324564fce7ee0`. Linux, macOS, and Windows run the
 same revision. Native capture and emulation backends initialized on both
 spokes after macOS Accessibility approval. The exhaustive live failure matrix
 is blocked by the explicit decision to use the system normally and investigate
@@ -17,10 +17,10 @@ Change lan-mouse from a fire-and-forget TV hook producer into the authority that
 ## Implementation Evidence
 
 - No-GTK workspace check/test and Linux production-feature check/test pass.
-  Coverage includes input-capture queues and same-edge resume, 34 core
+  Coverage includes input-capture queues and same-edge resume, 39 core
   capture/readiness/lease/release/controller tests, bounded logging, CLI
-  status, protocol wire behavior, and native macOS/Windows display-center
-  arithmetic.
+  status, protocol wire behavior, server-role notification classification,
+  and native macOS/Windows display-center arithmetic.
 - The first crossing completes backend release before publishing its candidate.
   A targeted, current, single-use permit then requires a service commit reply
   before a still-focused same-edge continuation or a later matching crossing
@@ -30,10 +30,11 @@ Change lan-mouse from a fire-and-forget TV hook producer into the authority that
   epoch. Unknown, stale, partial, disconnected, or commit-mismatched peers fail
   closed.
 - Native tests and release builds succeeded on Linux, macOS, and Windows for
-  revision `b90f4f9` from one exact git bundle and lockfile vendor archive, and
+  revision `1923542` from one exact git bundle and lockfile vendor archive, and
   that revision is installed on all three hosts. It includes revision fencing,
   release-complete and commit-authorization ordering, same-edge continuation,
-  and receiver-side center-before-ack behavior.
+  receiver-side center-before-ack behavior, native-library server-role failure
+  notifications, and preservation of controller verification causes.
 - lan-mouse log production is non-blocking and bounded to 1,024 records of
   16 KiB, and reports accumulated drops when its persistent sink recovers.
 
@@ -239,7 +240,12 @@ normal-use-first acceptance decision.
 
 Status: completed. Generated fenced configuration, exact-revision native
 build/test, bounded macOS/Windows log wrappers, installation, service restart,
-and peer connection verification passed for revision `b90f4f9` on all hosts.
+and peer connection verification passed for revision `1923542` on all hosts.
+The macOS and Windows task sequences run concurrently under one Ansible
+`strategy: free` play, and their native test/build commands use bounded async
+polling. Each native build links the platform notification implementation into
+lan-mouse; deployment has no notification-command or runtime-package
+prerequisite. `lan_mouse_server_host` selects the sole emitting instance.
 
 - Replace generated `enter_hook = "curl ..."` authorization with explicit switch-controller configuration understood by the patched lan-mouse build.
 - Remove shell-hook authorization entirely when fenced capture is enabled; no compatibility option is implemented.

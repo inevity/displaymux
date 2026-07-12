@@ -1833,6 +1833,33 @@ considered debuggable. Runtime state seen over SSH is not enough; failure
 analysis must be able to reconstruct the previous switch attempt after the
 fact.
 
+**Server-role failure notification invariant:** the host configured as
+`SERVER_HOST` emits one best-effort native system notification when a
+user-visible edge switch is rejected or an active keyboard-pointer gate fails
+closed. Notification ownership follows `local_host == server_host`; it is not
+synonymous with Linux. Normal `Leave`, release-bind, peer-requested return, and
+service-requested release transitions are not failures and remain silent.
+
+The notification names the target, configured fallback host, exact reason
+code, and the most specific evidence available at the failing boundary. Peer
+diagnosis distinguishes no heartbeat (the target may be asleep, stopped, or
+unreachable), revision mismatch, missing readiness session, keyboard backend
+loss, pointer backend loss, and full input-backend loss. Controller diagnosis
+distinguishes timeout/no response, unreachable controller, malformed response,
+and stale/conflicting identity race. A verification timeout preserves the
+specific unmet predicate: fullscreen mode not observed, target input not
+observed, target HDMI signal absent, target signal not observed, or stale
+signal evidence. It must not claim that an OS is asleep when only
+network/heartbeat absence was observed.
+
+Notification delivery is outside the ownership transition. Failure to invoke
+the OS adapter is logged but cannot delay input release, lease invalidation,
+request cancellation, or display fallback. The lan-mouse binary uses a native
+Rust notification library that binds to the platform notification API selected
+by the native build target. Deployment does not install, locate, or launch an
+OS notification command; server-role selection only determines which running
+lan-mouse instance emits the notification.
+
 - Current Linux SERVER_HOST lan-mouse:
   `journalctl --user -u lan-mouse.service`.
 - Current Linux SERVER_HOST tv-multiview:

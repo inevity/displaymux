@@ -11,9 +11,10 @@
 - Design baseline: `fullscreenmultiviewswitchdesign.md` originated at commit
   `319b762`; its living prose and model now describe the implemented protocol.
 - Rust daemon implementation: parent-repository commit `97d31e1` plus its
-  prerequisite fenced-protocol commits.
+  prerequisite fenced-protocol commits and verification-cause commit
+  `d4d08e3`.
 - lan-mouse implementation: clean `../../lan-mouse` commit
-  `b90f4f9af7c3b86783fa6dd763b874103f76820f`.
+  `192354206aad01609488633f44b324564fce7ee0`.
 - Controlling objective: implement the approved design without allowing keyboard and pointer ownership to split, and without claiming server-host fallback before the TV state is freshly observed.
 - Compatibility policy: there is no legacy mutation API, compatibility flag,
   fire-and-forget hook authorization, or mixed-version operation. Old peers and
@@ -25,19 +26,19 @@ Linked child plans:
 - [tv-multiview daemon refactor and protocol implementation](plan_tv_multiview_daemon_refactor.md)
 - [lan-mouse atomic input gate and lease integration](plan_lan_mouse_atomic_input_gate.md)
 
-## Implementation Evidence (2026-07-12)
+## Implementation Evidence (2026-07-13)
 
-- tv-multiview `cargo check --frozen`, all 58 tests, and strict all-target
+- tv-multiview `cargo check`, all 61 tests, and strict all-target
   clippy pass. Coverage includes deadline precedence, lease/signal failure,
   MultiView, typed HTTP conflicts and malformed input, scripted SSAP
   registration/subscription/reconnect/resync, grant-pending callback and
   stale-response handling, ping/keepalive timeout, atomic ownership, bounded
   queues, and bounded logging.
 - lan-mouse no-GTK workspace check/test and Linux production-feature
-  check/test pass. Coverage includes the same-edge continuation, 34 core
-  protocol tests, bounded logging, CLI status, wire behavior, and native
-  macOS/Windows center-coordinate tests. The only local warning is the
-  pre-existing unused `start_service` function.
+  check/test pass. Coverage includes the same-edge continuation, 39 core
+  protocol and server-notification tests, bounded logging, CLI status, wire
+  behavior, and native macOS/Windows center-coordinate tests. The only local
+  warning is the pre-existing unused `start_service` function.
 - The historical three-host cache-only release matrix used source
   `4425c5789b04025720dce234887e6a2d30919258` and Cargo.lock SHA-256
   `d91c91ed08149293a08eb958281c174a5596788f5160e39de751babd52767c93`:
@@ -45,12 +46,15 @@ Linked child plans:
   macOS Mach-O SHA-256 `6f8c734c0563b50245f339793c97180a04c2dc6039294bac29f96ecb29976bb7`,
   and Windows PE SHA-256 `1B603699A6907FC646362FCB60B7084BF4C0102B369F56F84EA7C6AFB1FC2D6E`.
 - Linux used `/usr/bin/rustc 1.96.0`; macOS and Windows used native rustup
-  `rustc 1.97.0`. The current `b90f4f9` revision was subsequently tested and
+  `rustc 1.97.0`. The current `1923542` revision was subsequently tested and
   release-built natively on all three hosts, installed, and started. It orders
   backend release before controller preparation, requires a current service
   commit decision before `Enter`, resumes a still-focused verified edge,
   centers the receiving pointer before `Ack`, and bypasses ambient HTTP proxies
-  for the local controller.
+  for the local controller. The configured server also reports switch failure
+  through a native Rust notification backend with detailed evidence and the
+  controller's predicate-level reason code; notification failure cannot affect
+  fallback and no notification command is installed or launched.
 - Ansible syntax/task expansion and idempotent template rendering pass. Rendered
   TOML, plist, shell, PKGBUILD, systemd, and Windows PowerShell artifacts pass
   their available native parsers; bounded macOS and Windows rotation wrappers
@@ -273,12 +277,15 @@ Exit gate: black-box API tests prove status code, body schema, idempotency, stal
 
 ### Phase 6: Coordinated Deployment Cutover
 
-Status: completed. Revision `b90f4f9` passed Linux, macOS, and Windows native
+Status: completed. Revision `1923542` passed Linux, macOS, and Windows native
 tests and release builds from the pinned bundle, was installed on all three
 hosts, and started with matching peer identity. Windows initialized native
 capture/emulation immediately. macOS failed closed while Accessibility was
 absent, then initialized native capture/emulation after approval and a
-LaunchAgent-only restart.
+LaunchAgent-only restart. macOS and Windows native task sequences executed in
+parallel under one Ansible process. Each target binary contains its native
+notification backend; `lan_mouse_server_host` selects the emitting instance
+without an external notification executable.
 
 Owner: main plan.
 
