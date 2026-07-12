@@ -121,6 +121,7 @@ struct State {
     shortcut_inhibitor: Option<ZwpKeyboardShortcutsInhibitorV1>,
     active_windows: Vec<Arc<Window>>,
     focused: Option<Arc<Window>>,
+    focused_serial: Option<u32>,
     global_list: GlobalList,
     globals: Globals,
     wayland_fd: RawFd,
@@ -331,6 +332,7 @@ impl LayerShellInputCapture {
             shortcut_inhibitor: None,
             active_windows: Vec::new(),
             focused: None,
+            focused_serial: None,
             qh,
             wayland_fd: queue.as_fd().as_raw_fd(),
             read_guard: None,
@@ -508,6 +510,25 @@ impl State {
         }
     }
 
+    fn resume_if_focused(&mut self, pos: Position) -> bool {
+        if !same_focused_edge(self.focused.as_ref().map(|window| window.pos), pos) {
+            return false;
+        }
+        let Some(window) = self.focused.as_ref().cloned() else {
+            return false;
+        };
+        let Some(pointer) = self.pointer.clone() else {
+            return false;
+        };
+        let Some(serial) = self.focused_serial else {
+            return false;
+        };
+        let qh = self.qh.clone();
+        self.grab(&window.surface, &pointer, serial, &qh);
+        self.pending_events.push_back((pos, CaptureEvent::Begin));
+        true
+    }
+
     fn add_client(&mut self, pos: Position) {
         self.active_positions.insert(pos);
         let outputs = get_output_configuration(self, pos);
@@ -545,6 +566,10 @@ impl State {
             self.add_client(pos);
         }
     }
+}
+
+fn same_focused_edge(focused: Option<Position>, requested: Position) -> bool {
+    focused == Some(requested)
 }
 
 impl Inner {
@@ -633,6 +658,13 @@ impl Capture for LayerShellInputCapture {
         let inner = self.0.get_mut();
         inner.state.ungrab();
         Ok(inner.flush_events()?)
+    }
+
+    fn resume_if_focused(&mut self, pos: Position) -> Result<bool, CaptureError> {
+        let inner = self.0.get_mut();
+        let resumed = inner.state.resume_if_focused(pos);
+        inner.flush_events()?;
+        Ok(resumed)
     }
 
     async fn terminate(&mut self) -> Result<(), CaptureError> {
@@ -742,6 +774,7 @@ impl Dispatch<WlPointer, ()> for State {
                 {
                     if let Some(window) = app.active_windows.iter().find(|w| w.surface == surface) {
                         app.focused = Some(window.clone());
+                        app.focused_serial = Some(serial);
                         app.grab(&surface, pointer, serial, qh);
                     } else {
                         return;
@@ -767,6 +800,8 @@ impl Dispatch<WlPointer, ()> for State {
                     log::warn!("compositor released mouse");
                 }
                 app.ungrab();
+                app.focused = None;
+                app.focused_serial = None;
             }
             wl_pointer::Event::Button {
                 serial: _,
@@ -1033,3 +1068,15 @@ delegate_noop!(State: ignore wl_buffer::WlBuffer);
 delegate_noop!(State: ignore WlSurface);
 delegate_noop!(State: ignore ZwpKeyboardShortcutsInhibitorV1);
 delegate_noop!(State: ignore ZwpLockedPointerV1);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resume_requires_the_same_still_focused_edge() {
+        assert!(same_focused_edge(Some(Position::Left), Position::Left));
+        assert!(!same_focused_edge(Some(Position::Left), Position::Right));
+        assert!(!same_focused_edge(None, Position::Left));
+    }
+}

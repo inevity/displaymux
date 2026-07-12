@@ -174,6 +174,14 @@ impl InputCapture {
         self.capture.release().await
     }
 
+    /// Resume capture immediately when the backend can prove the pointer is
+    /// still focused on the same edge. Backends without that proof keep the
+    /// grant armed for the next physical crossing.
+    pub fn resume_if_focused(&mut self, id: CaptureHandle) -> Result<bool, CaptureError> {
+        let pos = *self.id_map.get(&id).expect("no position for this handle");
+        self.capture.resume_if_focused(pos)
+    }
+
     /// Drain and return every key the capture has forwarded as
     /// down-but-not-up. The caller is expected to synthesize key-up
     /// events to the remote peer for each — otherwise the peer
@@ -289,6 +297,12 @@ trait Capture: Stream<Item = Result<(Position, CaptureEvent), CaptureError>> + U
 
     /// release mouse
     async fn release(&mut self) -> Result<(), CaptureError>;
+
+    /// Resume a released capture only when the backend still has authoritative
+    /// focus on the requested edge.
+    fn resume_if_focused(&mut self, _pos: Position) -> Result<bool, CaptureError> {
+        Ok(false)
+    }
 
     /// destroy the input capture
     async fn terminate(&mut self) -> Result<(), CaptureError>;

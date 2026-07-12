@@ -894,7 +894,7 @@ impl Service {
             Duration::from_millis(valid_for_ms),
         );
         log::info!(
-            "armed switch request {} lease epoch {} for second crossing",
+            "armed switch request {} lease epoch {} for focused or next crossing",
             context.lease.request_id,
             context.lease.lease_epoch
         );

@@ -75,6 +75,8 @@ enum CaptureRequest {
     Reenable,
     /// set release bind
     SetReleaseBind(Vec<scancode::Linux>),
+    /// Resume a released edge when the backend still has authoritative focus.
+    ResumeIfFocused(CaptureHandle),
 }
 
 impl Capture {
@@ -156,9 +158,15 @@ impl Capture {
         peer_session_epoch: u64,
         valid_for: Duration,
     ) {
-        self.gate
+        let armed = self
+            .gate
             .borrow_mut()
             .arm(handle, lease_epoch, peer_session_epoch, valid_for);
+        if armed {
+            self.request_tx
+                .send(CaptureRequest::ResumeIfFocused(handle))
+                .expect("channel closed");
+        }
     }
 
     pub(crate) fn disarm(&self, lease_epoch: u64) {
@@ -252,6 +260,7 @@ impl CaptureTask {
                         CaptureRequest::SetReleaseBind(bind) => {
                             self.release_bind.borrow_mut().clone_from(&bind);
                         }
+                        CaptureRequest::ResumeIfFocused(_) => {}
                     },
                     _ = self.cancellation_token.cancelled() => return,
                 }
@@ -384,6 +393,11 @@ impl CaptureTask {
                     }
                     CaptureRequest::SetReleaseBind(bind) => {
                         self.release_bind.borrow_mut().clone_from(&bind);
+                    }
+                    CaptureRequest::ResumeIfFocused(handle) => {
+                        if capture.resume_if_focused(handle)? {
+                            log::info!("resuming still-focused edge for client {handle}");
+                        }
                     }
                 },
                 _ = self.cancellation_token.cancelled() => break,
@@ -586,7 +600,7 @@ impl CaptureGate {
         lease_epoch: u64,
         peer_session_epoch: u64,
         valid_for: Duration,
-    ) {
+    ) -> bool {
         if lease_epoch > self.last_epoch {
             if let Some(expires_at) = Instant::now().checked_add(valid_for) {
                 self.last_epoch = lease_epoch;
@@ -596,8 +610,10 @@ impl CaptureGate {
                     peer_session_epoch,
                     expires_at,
                 });
+                return true;
             }
         }
+        false
     }
 
     fn consume(&mut self, handle: CaptureHandle) -> Option<CapturePermit> {
@@ -710,8 +726,8 @@ mod tests {
     #[test]
     fn delayed_arm_and_disarm_cannot_change_newer_permit() {
         let mut gate = CaptureGate::default();
-        gate.arm(4, 8, 22, Duration::from_secs(1));
-        gate.arm(5, 7, 31, Duration::from_secs(1));
+        assert!(gate.arm(4, 8, 22, Duration::from_secs(1)));
+        assert!(!gate.arm(5, 7, 31, Duration::from_secs(1)));
         gate.disarm(7);
 
         assert_eq!(gate.consume(4).unwrap().lease_epoch, 8);
