@@ -353,6 +353,10 @@ pub(crate) enum SwitchClientError {
 
 impl SwitchClientError {
     pub(crate) fn notification_detail(&self, operation: &str) -> (&'static str, String) {
+        if let Self::Denied { status, reason } = self {
+            return controller_denial_notification(status, reason);
+        }
+
         let code = match self {
             Self::Timeout => "controller_timeout",
             Self::StaleIdentity => "controller_identity_race",
@@ -361,7 +365,7 @@ impl SwitchClientError {
             Self::Cancelled => "controller_cancelled",
             Self::ResponseTooLarge => "controller_response_too_large",
             Self::ProtocolVersion(_) => "controller_protocol_mismatch",
-            Self::Denied { .. } => "controller_denied",
+            Self::Denied { .. } => unreachable!("handled above"),
             Self::Http { .. } => "controller_http_error",
             Self::InvalidBaseUrl => "controller_configuration_invalid",
             Self::Request(_) => "controller_request_failed",
@@ -369,6 +373,42 @@ impl SwitchClientError {
         };
         (code, format!("{operation}: {self}"))
     }
+}
+
+fn controller_denial_notification(status: &str, reason: &str) -> (&'static str, String) {
+    let (code, detail) = match reason {
+        "target_signal_absent" => (
+            "target_signal_absent",
+            "The TV selected the target input, but did not detect an active HDMI signal before verification timed out",
+        ),
+        "target_signal_stale" => (
+            "target_signal_stale",
+            "The TV returned HDMI signal state from an older switch attempt, so ownership was not transferred",
+        ),
+        "target_signal_not_observed" => (
+            "target_signal_not_observed",
+            "The TV did not return HDMI signal state for the target input before verification timed out",
+        ),
+        "target_input_not_observed" => (
+            "target_input_not_observed",
+            "The TV did not confirm that it reached the target input before verification timed out",
+        ),
+        "target_not_fullscreen" => (
+            "target_not_fullscreen",
+            "The TV did not confirm fullscreen mode before verification timed out",
+        ),
+        "target_verification_timeout" | "observation_timeout" => (
+            "target_verification_timeout",
+            "The TV did not confirm fullscreen mode, the target input, and an active HDMI signal before verification timed out",
+        ),
+        _ => {
+            return (
+                "controller_denied",
+                format!("The TV controller ended the request as {status}: {reason}"),
+            );
+        }
+    };
+    (code, detail.to_string())
 }
 
 impl SwitchController {
@@ -914,6 +954,19 @@ mod tests {
             SwitchClientError::StaleIdentity.notification_detail("Switch preparation failed");
         assert_eq!(stale.0, "controller_identity_race");
         assert!(stale.1.contains("stale or conflicting identity"));
+    }
+
+    #[test]
+    fn notification_detail_preserves_controller_verification_cause() {
+        let denied = SwitchClientError::Denied {
+            status: "fallback".to_string(),
+            reason: "target_signal_absent".to_string(),
+        }
+        .notification_detail("TV switch preparation failed");
+
+        assert_eq!(denied.0, "target_signal_absent");
+        assert!(denied.1.contains("did not detect an active HDMI signal"));
+        assert!(!denied.1.contains("TV switch preparation failed"));
     }
     use serde_json::{Value, json};
     use tokio::{

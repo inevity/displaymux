@@ -1,6 +1,6 @@
 use lan_mouse_ipc::SwitchHost;
-use std::io;
-use tokio::{process::Command, task::spawn_local};
+use notify_rust::Notification as NativeNotification;
+use tokio::task::{spawn_blocking, spawn_local};
 
 #[derive(Clone)]
 pub(crate) struct SystemNotifier {
@@ -46,8 +46,9 @@ impl SystemNotifier {
         let notification =
             switch_failure_notification(target, self.server_host, reason, detail.into());
         spawn_local(async move {
-            match send_notification(&notification).await {
-                Ok(()) => log::info!("system notification sent: {}", notification.title),
+            let title = notification.title.clone();
+            match send_notification(notification).await {
+                Ok(()) => log::info!("system notification sent: {title}"),
                 Err(error) => log::warn!("failed to send system notification: {error}"),
             }
         });
@@ -133,78 +134,18 @@ fn describe_reason(reason: &str) -> String {
     }
 }
 
-#[cfg(target_os = "linux")]
-async fn send_notification(notification: &Notification) -> io::Result<()> {
-    let status = Command::new("notify-send")
-        .args([
-            "--app-name=Lan Mouse",
-            "--urgency=critical",
-            "--icon=input-mouse",
-            notification.title.as_str(),
-            notification.body.as_str(),
-        ])
-        .status()
-        .await?;
-    command_result(status)
-}
-
-#[cfg(target_os = "macos")]
-async fn send_notification(notification: &Notification) -> io::Result<()> {
-    let status = Command::new("osascript")
-        .env("LAN_MOUSE_NOTIFICATION_TITLE", &notification.title)
-        .env("LAN_MOUSE_NOTIFICATION_BODY", &notification.body)
-        .args([
-            "-e",
-            "display notification (system attribute \"LAN_MOUSE_NOTIFICATION_BODY\") with title (system attribute \"LAN_MOUSE_NOTIFICATION_TITLE\")",
-        ])
-        .status()
-        .await?;
-    command_result(status)
-}
-
-#[cfg(windows)]
-async fn send_notification(notification: &Notification) -> io::Result<()> {
-    use std::os::windows::process::CommandExt;
-
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    const SCRIPT: &str = r#"
-$ErrorActionPreference = 'Stop'
-[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] > $null
-$template = [Windows.UI.Notifications.ToastTemplateType]::ToastText02
-$xml = [Windows.UI.Notifications.ToastNotificationManager]::GetTemplateContent($template)
-$text = $xml.GetElementsByTagName('text')
-$text.Item(0).AppendChild($xml.CreateTextNode($env:LAN_MOUSE_NOTIFICATION_TITLE)) > $null
-$text.Item(1).AppendChild($xml.CreateTextNode($env:LAN_MOUSE_NOTIFICATION_BODY)) > $null
-$toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
-[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('Lan Mouse').Show($toast)
-"#;
-
-    let status = Command::new("powershell.exe")
-        .creation_flags(CREATE_NO_WINDOW)
-        .env("LAN_MOUSE_NOTIFICATION_TITLE", &notification.title)
-        .env("LAN_MOUSE_NOTIFICATION_BODY", &notification.body)
-        .args(["-NoProfile", "-NonInteractive", "-Command", SCRIPT])
-        .status()
-        .await?;
-    command_result(status)
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
-async fn send_notification(_notification: &Notification) -> io::Result<()> {
-    Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        "system notifications are unsupported on this platform",
-    ))
-}
-
-fn command_result(status: std::process::ExitStatus) -> io::Result<()> {
-    if status.success() {
-        Ok(())
-    } else {
-        Err(io::Error::other(format!(
-            "notification command exited with {status}"
-        )))
-    }
+async fn send_notification(notification: Notification) -> Result<(), String> {
+    spawn_blocking(move || {
+        NativeNotification::new()
+            .summary(&notification.title)
+            .body(&notification.body)
+            .appname("Lan Mouse")
+            .show()
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| format!("notification task failed: {error}"))?
 }
 
 fn host_label(host: SwitchHost) -> &'static str {
