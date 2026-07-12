@@ -781,6 +781,59 @@ windows = "HDMI_2"
     }
 
     #[tokio::test]
+    async fn disconnected_session_resubscribes_and_resynchronizes_on_next_connection() {
+        let config = test_config();
+        let (coordinator, mut effects, coordinator_task) =
+            coordinator::spawn(ProtocolState::new(Host::Linux, 32), timing(&config), 8, 4);
+        let mut backoff = ReconnectBackoff::new(1_000, 60_000);
+        let metrics = RuntimeMetrics::default();
+        let mut first = ScriptedSocket::new(synchronized_messages());
+        assert!(matches!(
+            run_connected_session(
+                &mut first,
+                &config,
+                "test-key",
+                &coordinator,
+                &mut effects,
+                &mut backoff,
+                &metrics,
+            )
+            .await,
+            Err(SsapError::Closed)
+        ));
+        wait_until(|| coordinator.snapshot().ready()).await;
+        coordinator
+            .apply_safety(Event::TransportDisconnected {
+                reason: "test disconnect".to_string(),
+            })
+            .await
+            .unwrap();
+        assert!(!coordinator.snapshot().ready());
+        assert_eq!(backoff.failed(), (1_000, 1));
+
+        let mut second = ScriptedSocket::new(synchronized_messages());
+        assert!(matches!(
+            run_connected_session(
+                &mut second,
+                &config,
+                "test-key",
+                &coordinator,
+                &mut effects,
+                &mut backoff,
+                &metrics,
+            )
+            .await,
+            Err(SsapError::Closed)
+        ));
+        wait_until(|| coordinator.snapshot().ready()).await;
+        assert!(second.sent.iter().any(|message| {
+            matches!(message, Message::Text(text) if text.contains(codec::MULTIVIEW_SUBSCRIPTION_ID))
+        }));
+        assert_eq!(backoff.failed(), (1_000, 1));
+        coordinator_task.abort();
+    }
+
+    #[tokio::test]
     async fn wait_for_id_handles_callback_and_discards_delayed_old_response() {
         let config = test_config();
         let (coordinator, _effects, coordinator_task) =
