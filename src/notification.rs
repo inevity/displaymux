@@ -1,5 +1,5 @@
 use lan_mouse_ipc::SwitchHost;
-use notify_rust::Notification as NativeNotification;
+use notify_rust::{Notification as NativeNotification, Timeout};
 use tokio::task::{spawn_blocking, spawn_local};
 
 #[derive(Clone)]
@@ -12,6 +12,7 @@ pub(crate) struct SystemNotifier {
 struct Notification {
     title: String,
     body: String,
+    timeout: Timeout,
 }
 
 impl SystemNotifier {
@@ -69,6 +70,7 @@ fn switch_failure_notification(
             detail,
             host_label(server_host),
         ),
+        timeout: Timeout::Never,
     }
 }
 
@@ -140,6 +142,7 @@ async fn send_notification(notification: Notification) -> Result<(), String> {
             .summary(&notification.title)
             .body(&notification.body)
             .appname("Lan Mouse")
+            .timeout(notification.timeout)
             .show()
             .map(|_| ())
             .map_err(|error| error.to_string())
@@ -179,5 +182,6 @@ mod tests {
         assert!(notification.body.contains("keyboard and pointer bundle"));
         assert!(notification.body.contains("Input remains on macOS"));
         assert!(notification.body.contains("peer_bundle_not_ready"));
+        assert_eq!(notification.timeout, Timeout::Never);
     }
 }
