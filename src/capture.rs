@@ -1,5 +1,6 @@
 use std::{
     cell::{Cell, RefCell},
+    future::Future,
     rc::Rc,
     time::{Duration, Instant},
 };
@@ -11,6 +12,7 @@ use input_capture::{
 use input_event::{Event, KeyboardEvent, scancode};
 use lan_mouse_proto::ProtoEvent;
 use local_channel::mpsc::{Receiver, Sender, channel};
+use tokio::sync::oneshot;
 use tokio::task::{JoinHandle, spawn_local};
 use tokio_util::sync::CancellationToken;
 
@@ -31,10 +33,17 @@ pub(crate) enum ICaptureEvent {
     CaptureDisabled,
     /// capture disabled
     CaptureEnabled,
-    /// An unarmed outgoing edge was reached and immediately released.
+    /// An unarmed outgoing edge was reached and its backend capture was released.
     CaptureCandidate(CaptureHandle),
-    /// A client was entered with a matching one-shot gate permit.
-    ClientEntered {
+    /// A matching one-shot permit reached the edge and needs a current service decision.
+    CommitRequested {
+        handle: CaptureHandle,
+        lease_epoch: u64,
+        peer_session_epoch: u64,
+        decision: oneshot::Sender<bool>,
+    },
+    /// Capture was released after the service denied or dropped commit authorization.
+    CommitDeniedReleased {
         handle: CaptureHandle,
         lease_epoch: u64,
     },
@@ -415,25 +424,37 @@ impl CaptureTask {
         }
 
         // An outgoing capture may only become active by consuming a current,
-        // one-shot permit. The first crossing is always released immediately.
+        // one-shot permit. The first crossing is released before the service
+        // may start any controller work.
         if event == CaptureEvent::Begin && Some(handle) != self.active_client {
             let permit = self.gate.borrow_mut().consume(handle);
             let Some(permit) = permit else {
-                self.event_tx
-                    .send(ICaptureEvent::CaptureCandidate(handle))
-                    .expect("channel closed");
-                capture.release().await?;
+                release_then_notify(capture.release(), || {
+                    self.event_tx
+                        .send(ICaptureEvent::CaptureCandidate(handle))
+                        .expect("channel closed");
+                })
+                .await?;
                 return Ok(());
             };
+
+            let authorized = request_commit_authorization(&self.event_tx, handle, permit).await;
+            if !authorized {
+                release_then_notify(capture.release(), || {
+                    self.event_tx
+                        .send(ICaptureEvent::CommitDeniedReleased {
+                            handle,
+                            lease_epoch: permit.lease_epoch,
+                        })
+                        .expect("channel closed");
+                })
+                .await?;
+                return Ok(());
+            }
+
             self.state = State::WaitingForAck;
             self.active_client.replace(handle);
             self.active_peer_session_epoch = Some(permit.peer_session_epoch);
-            self.event_tx
-                .send(ICaptureEvent::ClientEntered {
-                    handle,
-                    lease_epoch: permit.lease_epoch,
-                })
-                .expect("channel closed");
         }
 
         if Some(handle) != self.active_client {
@@ -515,6 +536,33 @@ impl CaptureTask {
         }
         Ok(())
     }
+}
+
+async fn request_commit_authorization(
+    event_tx: &Sender<ICaptureEvent>,
+    handle: CaptureHandle,
+    permit: CapturePermit,
+) -> bool {
+    let (decision_tx, decision_rx) = oneshot::channel();
+    event_tx
+        .send(ICaptureEvent::CommitRequested {
+            handle,
+            lease_epoch: permit.lease_epoch,
+            peer_session_epoch: permit.peer_session_epoch,
+            decision: decision_tx,
+        })
+        .expect("channel closed");
+    decision_rx.await.unwrap_or(false)
+}
+
+async fn release_then_notify<F, N, E>(release: F, notify: N) -> Result<(), E>
+where
+    F: Future<Output = Result<(), E>>,
+    N: FnOnce(),
+{
+    release.await?;
+    notify();
+    Ok(())
 }
 
 #[derive(Debug, Default)]
@@ -638,6 +686,7 @@ impl<T> Drop for DropGuard<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{cell::RefCell, rc::Rc};
 
     #[test]
     fn first_crossing_has_no_capture_permit() {
@@ -674,5 +723,78 @@ mod tests {
         gate.arm(4, 8, 22, Duration::ZERO);
 
         assert!(gate.consume(4).is_none());
+    }
+
+    #[tokio::test]
+    async fn release_completes_before_candidate_notification() {
+        let order = Rc::new(RefCell::new(Vec::new()));
+        let release_order = order.clone();
+        let notify_order = order.clone();
+
+        release_then_notify(
+            async move {
+                release_order.borrow_mut().push("released");
+                Ok::<_, ()>(())
+            },
+            move || notify_order.borrow_mut().push("notified"),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(&*order.borrow(), &["released", "notified"]);
+    }
+
+    #[tokio::test]
+    async fn enter_authorization_waits_for_service_commit_decision() {
+        let (event_tx, mut event_rx) = channel();
+        let permit = CapturePermit {
+            handle: 4,
+            lease_epoch: 7,
+            peer_session_epoch: 22,
+            expires_at: Instant::now() + Duration::from_secs(1),
+        };
+
+        let request = request_commit_authorization(&event_tx, 4, permit);
+        let decision = async {
+            let ICaptureEvent::CommitRequested {
+                handle,
+                lease_epoch,
+                peer_session_epoch,
+                decision,
+            } = event_rx.recv().await.unwrap()
+            else {
+                panic!("expected commit request");
+            };
+            assert_eq!(handle, 4);
+            assert_eq!(lease_epoch, 7);
+            assert_eq!(peer_session_epoch, 22);
+            decision.send(true).unwrap();
+        };
+
+        let (authorized, ()) = futures::join!(request, decision);
+        assert!(authorized);
+    }
+
+    #[tokio::test]
+    async fn dropped_commit_decision_fails_closed() {
+        let (event_tx, mut event_rx) = channel();
+        let permit = CapturePermit {
+            handle: 4,
+            lease_epoch: 7,
+            peer_session_epoch: 22,
+            expires_at: Instant::now() + Duration::from_secs(1),
+        };
+
+        let request = request_commit_authorization(&event_tx, 4, permit);
+        let decision = async {
+            let ICaptureEvent::CommitRequested { decision, .. } = event_rx.recv().await.unwrap()
+            else {
+                panic!("expected commit request");
+            };
+            drop(decision);
+        };
+
+        let (authorized, ()) = futures::join!(request, decision);
+        assert!(!authorized);
     }
 }

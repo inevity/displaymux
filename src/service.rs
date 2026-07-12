@@ -510,12 +510,37 @@ impl Service {
             ICaptureEvent::CaptureCandidate(handle) => {
                 self.handle_capture_candidate(handle);
             }
-            ICaptureEvent::ClientEntered {
+            ICaptureEvent::CommitRequested {
+                handle,
+                lease_epoch,
+                peer_session_epoch,
+                decision,
+            } => {
+                let authorized =
+                    self.authorize_client_enter(handle, lease_epoch, peer_session_epoch);
+                if authorized {
+                    self.active_switch_capture = Some((handle, lease_epoch));
+                }
+                if decision.send(authorized).is_err() && authorized {
+                    if let Some(context) = self.bundle_lease.context().cloned() {
+                        self.fail_context(context, "capture_commit_decision_dropped");
+                    }
+                }
+            }
+            ICaptureEvent::CommitDeniedReleased {
                 handle,
                 lease_epoch,
             } => {
-                self.active_switch_capture = Some((handle, lease_epoch));
-                self.handle_client_entered(handle, lease_epoch);
+                if self.active_switch_capture == Some((handle, lease_epoch)) {
+                    self.active_switch_capture = None;
+                }
+                if self.pending_switch_cleanup.is_some() {
+                    self.complete_pending_switch_cleanup();
+                } else if self.bundle_lease.context().is_some_and(|context| {
+                    context.handle == handle && context.lease.lease_epoch == lease_epoch
+                }) {
+                    self.release_gate_after_capture("capture_commit_not_authorized");
+                }
             }
             ICaptureEvent::ClientReleased(handle) => {
                 log::info!("released client {handle} capture");
@@ -893,14 +918,25 @@ impl Service {
         );
     }
 
-    fn handle_client_entered(&mut self, handle: ClientHandle, lease_epoch: u64) {
+    fn authorize_client_enter(
+        &mut self,
+        handle: ClientHandle,
+        lease_epoch: u64,
+        permit_peer_session_epoch: u64,
+    ) -> bool {
         let Some(context) = self.bundle_lease.context().cloned() else {
-            self.capture.release();
-            return;
+            return false;
+        };
+        if context.handle != handle
+            || context.lease.lease_epoch != lease_epoch
+            || context.lease.peer_session_epoch != permit_peer_session_epoch
+        {
+            self.defer_failure_until_capture_release(context, "capture_permit_stale");
+            return false;
         };
         let Some(readiness) = self.peer_readiness(handle) else {
-            self.fail_context(context, "peer_missing_before_commit");
-            return;
+            self.defer_failure_until_capture_release(context, "peer_missing_before_commit");
+            return false;
         };
         let bundle_ready = readiness.online && readiness.keyboard_ready && readiness.pointer_ready;
         match self.bundle_lease.commit(
@@ -913,12 +949,15 @@ impl Service {
             Ok((context, grant)) => {
                 self.reset_switch_deadline();
                 if !self.start_commit_task(context.clone(), grant) {
-                    self.fail_context(context, "commit_task_busy");
+                    self.defer_failure_until_capture_release(context, "commit_task_busy");
+                    return false;
                 }
+                true
             }
             Err(error) => {
                 log::warn!("capture commit rejected locally: {error}");
-                self.fail_context(context, "capture_commit_rejected");
+                self.defer_failure_until_capture_release(context, "capture_commit_rejected");
+                false
             }
         }
     }
@@ -1111,6 +1150,24 @@ impl Service {
         } else {
             self.start_cleanup_task(context, reason);
         }
+    }
+
+    fn defer_failure_until_capture_release(&mut self, context: GateContext, reason: &'static str) {
+        if self
+            .bundle_lease
+            .context()
+            .is_some_and(|current| current.same_identity(&context))
+        {
+            self.bundle_lease.invalidate();
+        }
+        self.capture.disarm(context.lease.lease_epoch);
+        self.cancel_switch_task();
+        self.switch_deadline = None;
+        self.pending_switch_cleanup = Some((context.clone(), reason));
+        log::warn!(
+            "switch request {} failed closed before capture authorization: {reason}",
+            context.lease.request_id
+        );
     }
 
     fn release_gate_after_capture(&mut self, reason: &'static str) {

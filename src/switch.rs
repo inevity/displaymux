@@ -355,6 +355,7 @@ impl SwitchController {
     pub(crate) fn new(config: SwitchControllerConfig) -> Result<Self, SwitchClientError> {
         let http = Client::builder()
             .timeout(Duration::from_millis(config.http_timeout_ms))
+            .no_proxy()
             .build()?;
         Ok(Self {
             config,
@@ -878,6 +879,11 @@ struct RemoteReadiness {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::{Value, json};
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+    };
 
     fn reserve(manager: &mut BundleLeaseManager) -> GateContext {
         manager
@@ -1118,5 +1124,195 @@ mod tests {
         assert_eq!(envelope.protocol_version, PROTOCOL_VERSION);
         assert_eq!(envelope.data.target, SwitchHost::Windows);
         assert_eq!(envelope.data.grant.unwrap().grant_epoch, 9);
+    }
+
+    #[tokio::test]
+    async fn native_controller_runs_fenced_request_lifecycle() {
+        let responses = vec![
+            json!({
+                "protocol_version": 1,
+                "server_now_ms": 1_000,
+                "data": {
+                    "host": "windows",
+                    "readiness": {
+                        "online": true,
+                        "keyboard_ready": true,
+                        "pointer_ready": true,
+                        "session_epoch": 22
+                    }
+                }
+            }),
+            enter_envelope("grant", 5_000, Some(4_000)),
+            enter_envelope("committed", 6_000, Some(4_000)),
+            json!({
+                "protocol_version": 1,
+                "server_now_ms": 1_000,
+                "data": {
+                    "renewed": true,
+                    "renewed_until_ms": 7_000,
+                    "phase": "remote_owned"
+                }
+            }),
+            enter_envelope("cancelled", 7_000, Some(4_000)),
+        ];
+        let (base_url, server) = spawn_http_responses(responses).await;
+        let controller = SwitchController::new(SwitchControllerConfig {
+            url: base_url,
+            token: "test-token".to_string(),
+            local_host: SwitchHost::Linux,
+            server_host: SwitchHost::Linux,
+            http_timeout_ms: 1_000,
+            request_timeout_ms: 2_000,
+            poll_interval_ms: 10,
+            lease_ttl_ms: 5_000,
+            renew_interval_ms: 1_000,
+        })
+        .unwrap();
+        let context = GateContext {
+            handle: 4,
+            target: SwitchHost::Windows,
+            lease: LeaseIdentity {
+                request_id: "request-1".to_string(),
+                lease_id: "lease-1".to_string(),
+                lease_epoch: 3,
+                peer_session_epoch: 22,
+                expires_at_ms: 5_000,
+            },
+        };
+        let readiness = PeerBundleReadiness {
+            online: true,
+            keyboard_ready: true,
+            pointer_ready: true,
+            session_epoch: 22,
+        };
+        let cancellation = CancellationToken::new();
+
+        let prepared = controller
+            .prepare(&context, readiness, &cancellation)
+            .await
+            .unwrap();
+        assert_eq!(prepared.request_epoch, 7);
+        assert_eq!(prepared.grant_epoch, 9);
+        let grant = GrantIdentity {
+            request_epoch: prepared.request_epoch,
+            grant_epoch: prepared.grant_epoch,
+            expires_at_ms: prepared.grant_expires_at_ms,
+        };
+        assert!(
+            controller
+                .commit(&context, &grant, &cancellation)
+                .await
+                .is_ok()
+        );
+        assert!(controller.renew(&context, &cancellation).await.is_ok());
+        controller
+            .cancel(&context, "test_complete", &cancellation)
+            .await
+            .unwrap();
+
+        let requests = server.await.unwrap();
+        let request_lines: Vec<_> = requests
+            .iter()
+            .map(|request| request.lines().next().unwrap())
+            .collect();
+        assert_eq!(
+            request_lines,
+            [
+                "POST /internal/readiness/windows HTTP/1.1",
+                "POST /enter/windows HTTP/1.1",
+                "POST /enter/request/request-1/commit HTTP/1.1",
+                "POST /internal/enter/request/request-1/renew HTTP/1.1",
+                "POST /internal/enter/request/request-1/cancel HTTP/1.1",
+            ]
+        );
+        let create_body: Value = serde_json::from_str(request_body(&requests[1])).unwrap();
+        assert_eq!(create_body["request_id"], "request-1");
+        assert_eq!(create_body["lease_epoch"], 3);
+        assert_eq!(create_body["peer_session_epoch"], 22);
+        assert!(requests.iter().all(|request| {
+            request
+                .to_ascii_lowercase()
+                .contains("authorization: bearer test-token")
+        }));
+    }
+
+    fn enter_envelope(status: &str, lease_expires_at_ms: u64, grant: Option<u64>) -> Value {
+        json!({
+            "protocol_version": 1,
+            "server_now_ms": 1_000,
+            "data": {
+                "request_id": "request-1",
+                "target": "windows",
+                "request_epoch": 7,
+                "lease": {
+                    "lease_id": "lease-1",
+                    "lease_epoch": 3,
+                    "peer_session_epoch": 22,
+                    "expires_at_ms": lease_expires_at_ms
+                },
+                "status": status,
+                "grant": grant.map(|expires_at_ms| json!({
+                    "grant_epoch": 9,
+                    "expires_at_ms": expires_at_ms
+                })),
+                "reason": null
+            }
+        })
+    }
+
+    async fn spawn_http_responses(
+        responses: Vec<Value>,
+    ) -> (Url, tokio::task::JoinHandle<Vec<String>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            for body in responses {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let request = read_http_request(&mut stream).await;
+                requests.push(request);
+                let body = body.to_string();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+                stream.shutdown().await.unwrap();
+            }
+            requests
+        });
+        (Url::parse(&format!("http://{address}/")).unwrap(), task)
+    }
+
+    async fn read_http_request(stream: &mut tokio::net::TcpStream) -> String {
+        let mut request = Vec::new();
+        let mut chunk = [0; 1024];
+        loop {
+            let read = stream.read(&mut chunk).await.unwrap();
+            assert!(read > 0, "connection closed before request completed");
+            request.extend_from_slice(&chunk[..read]);
+            let Some(headers_end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n")
+            else {
+                continue;
+            };
+            let headers_end = headers_end + 4;
+            let headers = String::from_utf8_lossy(&request[..headers_end]);
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().unwrap())
+                })
+                .unwrap_or(0);
+            if request.len() >= headers_end + content_length {
+                return String::from_utf8(request).unwrap();
+            }
+        }
+    }
+
+    fn request_body(request: &str) -> &str {
+        request.split_once("\r\n\r\n").unwrap().1
     }
 }
