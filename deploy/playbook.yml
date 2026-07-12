@@ -10,8 +10,10 @@
 #   ansible-galaxy collection install ansible.windows community.general
 #
 # Manual steps after the first run (also not automatable):
-#   - macOS: grant lan-mouse Accessibility permission once in
-#     System Settings > Privacy & Security > Accessibility.
+#   - macOS: after installing a rebuilt binary, grant lan-mouse Accessibility
+#     permission in System Settings > Privacy & Security > Accessibility.
+#     This native build is ad-hoc signed because no trusted signing identity is
+#     available, so a new binary has a new privacy code requirement.
 #   - macOS: disable lock screen password (Lock Screen > Require
 #     password: Never). Remote input can't unlock macOS.
 
@@ -669,6 +671,18 @@
               - lan-mouse
               - --no-default-features
             chdir: "{{ mac_source_dir }}"
+          changed_when: true
+
+        - name: Sign macOS daemon with a stable launch identifier
+          ansible.builtin.command:
+            argv:
+              - codesign
+              - --force
+              - --sign
+              - '-'
+              - --identifier
+              - com.feschber.lan-mouse
+              - "{{ mac_target_dir }}/release/lan-mouse"
           changed_when: true
 
         - name: Install stable macOS daemon binary
