@@ -2,9 +2,29 @@
 
 Parent: [Main fenced switch implementation plan](plan_main_fullscreen_multiview_switch_implementation.md)
 
+Status (2026-07-12): source implementation and automated verification are
+complete through parent commit `6ec253d`. Live TV reconnect, signal-loss, and
+latency acceptance remain blocked on the coordinated deployment authorization
+recorded in the main plan.
+
 ## Objective
 
 Transform the current four-module Rust daemon into a bounded, testable protocol service with one persistent SSAP owner. Keep mechanical refactoring, correctness fixes, and new behavior in separate commits so regressions can be localized.
+
+## Implementation Evidence
+
+- `cargo check --frozen` and all 36 tv-multiview tests pass.
+- One coherent coordinator owns transitions and publishes immutable snapshots;
+  ordinary and safety command/effect lanes are independently bounded.
+- The persistent SSAP actor owns registration, subscription, request
+  correlation, observations, and reconnect backoff. Successful full
+  synchronization resets the consecutive reconnect state.
+- Typed authenticated create/poll/commit/cancel/renew/readiness/MultiView APIs,
+  `/status`, `/health`, and `/ready` are implemented; legacy mutating GET routes
+  are absent.
+- Structured logging is non-blocking and bounded to 1,024 records of 16 KiB;
+  queue/drop/reconnect metrics and bounded retained-request occupancy are
+  exposed in status and SIGUSR1 state dumps.
 
 ## Current Module Map
 
@@ -39,6 +59,11 @@ Do not introduce an abstraction solely to match this tree. Combine files when ow
 
 ## D0: Characterization and Test Seams
 
+Status: partially completed. Source behavior and test seams were captured, but
+the historical subprocess CPU/process/latency workload was not measured before
+replacement. Running that obsolete path against the physical TV requires
+separate explicit authorization and remains blocked.
+
 - Add route-level tests for `/health`, `/status`, the fenced enter API, and MultiView routes.
 - Introduce a fakeable TV control seam with a native async trait and generic concrete state, or a typed command handle. Do not use the `async-trait` crate.
 - Characterize subprocess success, non-zero exit, spawn failure, and hung-command timeout behavior.
@@ -50,6 +75,9 @@ Verification: `cargo check`; `cargo test`; no endpoint or production default cha
 Commit boundary: tests and injection seams only.
 
 ## D1: Coherent Legacy State Refactor
+
+Status: completed. Production state now has one owner and no legacy mutation
+adapter remains.
 
 - Introduce a single aggregate state value guarded by one synchronization boundary.
 - Move counters and last error into coherent snapshots; keep monotonic counters separate only when their atomic independence is intentional.
@@ -68,6 +96,8 @@ Commit boundaries:
 3. Configuration extraction with identical defaults.
 
 ## D2: Pure Protocol Core
+
+Status: completed with deterministic invariant and counterexample tests.
 
 Define typed state equivalent to the approved model:
 
@@ -123,6 +153,9 @@ Commit boundary: domain and reducer only; no production route uses it yet.
 
 ## D3: Coordinator Actor and Snapshot Publication
 
+Status: completed with bounded ordinary/safety command and effect lanes,
+coherent watch snapshots, and queue-depth status metrics.
+
 - Add a bounded command channel and a cheap cloneable handle for HTTP and lan-mouse callers.
 - The coordinator owns `ProtocolState`; no `Arc<Mutex<ProtocolState>>` is exposed.
 - Use oneshot replies for commands and a watch-style immutable status snapshot for reads.
@@ -143,6 +176,11 @@ Verification:
 Commit boundary: actor runs against fake effect adapters.
 
 ## D4: Persistent SSAP Transport
+
+Status: implemented and verified for codec parsing, key decoding, backoff reset,
+and bounded coordinator integration. The physical TV
+disconnect/resubscribe/resynchronization sequences remain blocked live
+acceptance cases.
 
 Before dependency changes, verify the current LG client-key schema and the authoritative SSAP URI/payloads. Add only necessary dependencies to `Cargo.toml`.
 
@@ -187,6 +225,9 @@ Commit boundaries:
 
 ## D5: Fenced HTTP API
 
+Status: completed and covered by authenticated black-box route tests, including
+typed create/renew/status behavior and absence of legacy GET mutation.
+
 Implement typed serde request/response enums. Do not return mode strings as authorization.
 
 Public routes from the design:
@@ -217,6 +258,11 @@ Handlers parse, send one actor command, await one bounded response, and format i
 
 ## D6: Fallback, Signal, Wake, and MultiView Effects
 
+Status: implemented with reducer coverage for local-first release, stale
+observation rejection, readiness loss, duplicate completions, and verified
+fallback intent. Physical signal loss, TV reboot, and Wake-on-LAN timing remain
+live acceptance cases.
+
 - Always issue the target input command; never use cached observed equality as a no-op.
 - Query active input and signal immediately after each command ack and tag the result with `switch_epoch`.
 - While remote-owned, schedule one monotonic single-flight signal poll. A bad poll arms one fixed fallback deadline; repeats cannot postpone it.
@@ -228,6 +274,10 @@ Handlers parse, send one actor command, await one bounded response, and format i
 - Unexpected subscription state never completes an expected transaction by coincidence.
 
 ## D7: Observability and Operations
+
+Status: completed for source behavior and static deployment integration.
+Persistent logs from an actual coordinated switch still require the live
+cutover.
 
 - Emit one structured transition event containing request/switch epochs, old/new phase, command/observed input, owners, lease/grant identity, deadline, latency, and fallback reason.
 - Keep log production non-blocking and bounded. Count dropped records and expose the count in status.
@@ -263,3 +313,8 @@ Each row must be a reducer test and, where I/O is involved, an actor/API test:
 - All public and internal API schemas are documented and versioned.
 - Every invariant and counterexample above has executable coverage.
 - Live status cannot say ready until registration, subscription, resync, and any required fallback have completed.
+
+Current gate assessment: all source and automated gates above pass. The child
+plan is not live-complete until a deployed three-host run proves reconnect,
+signal/fallback behavior, persistent forensic logs, and measured production
+latencies against the physical TV.

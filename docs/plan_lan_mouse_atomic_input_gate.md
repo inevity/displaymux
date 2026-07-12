@@ -2,13 +2,42 @@
 
 Parent: [Main fenced switch implementation plan](plan_main_fullscreen_multiview_switch_implementation.md)
 
+Status (2026-07-12): source implementation, automated tests, and native build
+automation are complete at lan-mouse commit
+`952a5e9f1d5b2d476f44baa951bdf207080c9898`; the protocol revision passed the
+three-host cache matrix. Installation and active-backend acceptance remain
+blocked on explicit coordinated-cutover authorization.
+
 ## Objective
 
 Change lan-mouse from a fire-and-forget TV hook producer into the authority that reserves, commits, renews, and releases keyboard plus pointer ownership as one bundle. The TV daemon can issue a grant, but only lan-mouse can change the data plane.
 
+## Implementation Evidence
+
+- No-GTK workspace checks and all 38 tests pass: 4 input-capture queue tests,
+  27 core capture/readiness/lease/release tests, 2 bounded-logging tests, 2 CLI
+  status tests, and 3 protocol wire tests. Strict clippy passes for the changed
+  CLI crate. The Linux production-feature check and pre-CLI full test set also
+  pass.
+- The first crossing releases immediately; only a targeted, current,
+  single-use permit can enable the second crossing. Commit validates request,
+  lease, grant, handle, peer session, and deadline as one bundle.
+- Peer readiness names keyboard and pointer capability plus process session
+  epoch. Unknown, stale, partial, disconnected, or commit-mismatched peers fail
+  closed.
+- Native cache-only release builds succeeded on Linux, macOS, and Windows for
+  protocol revision `4425c57` from one exact git bundle and lockfile vendor
+  archive. Their SHA-256 values are recorded in the main plan. Revision
+  `952a5e9` adds only JSON CLI inspection; its macOS full tests passed, and the
+  user stopped further repeated cache-build validation as out of scope.
+- lan-mouse log production is non-blocking and bounded to 1,024 records of
+  16 KiB, and reports accumulated drops when its persistent sink recovers.
+
 ## Verified Current Behavior
 
-The deployed release tag is `main-392af44`, and the clean local source checkout is commit `392af44`.
+At plan creation, the deployed release tag and clean baseline checkout were
+`main-392af44` and commit `392af44`. The evidence below is retained as the
+historical unsafe `InitState`; it is not the current source implementation.
 
 - `src/capture.rs:348-354` sets `WaitingForAck`, installs `active_client`, and emits `ClientEntered` as soon as capture begins.
 - `src/capture.rs:357-368` immediately converts the same event to `ProtoEvent::Enter` and sends it.
@@ -58,6 +87,10 @@ Invariant checks:
 
 ## L0: Capture-Gate Feasibility
 
+Status: conservative two-crossing implementation and automated permit-order
+tests are complete. Manual local click/motion/scroll/key behavior on active
+native backends remains blocked until coordinated live deployment.
+
 Use Main Plan Gate 0 before broad implementation.
 
 Preferred one-crossing path:
@@ -88,6 +121,11 @@ Exit gate: an automated event-order test and a manual active-backend test prove 
 
 ## L1: Capability-Aware Peer Protocol
 
+Status: completed and covered for both/partial/unknown readiness, session
+replacement, disconnect clearing, and wire round trips. Existing event numbers
+remain stable only to avoid protocol misparsing; old peers are never considered
+ready and no legacy authorization behavior exists.
+
 - Add a forward-compatible peer event carrying keyboard readiness, pointer readiness, and peer session epoch.
 - Preserve old event numeric values; older peers may ignore the new event but must not be interpreted as ready.
 - Generate a new session epoch on every spoke process start and emulation backend recreation.
@@ -115,6 +153,9 @@ Tests:
 
 ## L2: Bundle Lease Manager
 
+Status: completed with deterministic reservation, exclusion, expiry, renewal,
+stale-session, and atomic commit tests.
+
 - Implement one hub-local lease manager; it is the authority for reserving both paths.
 - A reservation captures target, daemon client request identity, local request epoch, peer session epoch, and monotonic expiry.
 - Reject partial capability, stale session, existing conflicting lease, or missing active connection before contacting the TV daemon.
@@ -127,6 +168,9 @@ Tests:
 Use one monotonic timer owner rather than one task per lease. Lease IDs must be unpredictable enough to prevent accidental collision, but local correctness depends on epoch and state matching rather than secrecy alone.
 
 ## L3: Native Switch Client
+
+Status: completed. The native bounded client owns create/poll/commit/cancel and
+renewal lifecycles; shell/curl authorization is absent.
 
 Replace shell-command authorization with one bounded native client owned by the service:
 
@@ -145,6 +189,9 @@ For return to `SERVER_HOST`, release remote capture first even if the TV daemon 
 
 ## L4: Capture State-Machine Integration
 
+Status: completed with target/epoch permits, immediate first-crossing release,
+single-use second-crossing commit, and delayed-command rejection tests.
+
 Refactor event ownership before adding network behavior:
 
 - `capture.rs` reports a candidate without installing `active_client` or sending `Enter`.
@@ -160,6 +207,10 @@ Add explicit events between service and capture task, for example candidate, gra
 
 ## L5: Commit, Renewal, and Failure Feedback
 
+Status: completed for source logic and automated tests. Live daemon loss,
+backend permission loss, and physical reconnect timing remain cutover
+acceptance cases.
+
 - At capture commit, revalidate peer capabilities, peer session, request epoch, grant epoch, lease ID, and expiry in one service-loop transition.
 - Enable keyboard and pointer forwarding together and notify the daemon commit endpoint.
 - Treat commit notification failure as unresolved: release capture and request/cause fallback rather than assuming the daemon recorded ownership.
@@ -169,6 +220,11 @@ Add explicit events between service and capture task, for example candidate, gra
 - A stale daemon grant can be logged but cannot alter gate or lease state.
 
 ## L6: Configuration and Deployment
+
+Status: generated fenced configuration, exact-revision native build/test
+automation, bounded macOS/Windows log wrappers, and host-specific service
+automation are complete. Installation, service restart, and peer-reported live
+readiness verification remain blocked pending explicit cutover authorization.
 
 - Replace generated `enter_hook = "curl ..."` authorization with explicit switch-controller configuration understood by the patched lan-mouse build.
 - Remove shell-hook authorization entirely when fenced capture is enabled; no compatibility option is implemented.
@@ -228,13 +284,17 @@ The Ansible implementation must:
 
 Rollout handshake:
 
-- compare peer protocol capability/version before enabling remote clients;
-- all spokes report both capabilities and current session epoch;
-- hub observes readiness but capture gate remains disabled;
-- daemon fenced API is ready and fallback is freshly verified;
-- enable hub gate and daemon grant issuance together;
-- remove legacy hooks only after the new gate is active;
-- fail closed by deactivating remote clients on mixed-version detection.
+- build and test the exact revision on every native host before changing a live
+  service;
+- force input and display to a freshly verified `SERVER_HOST` baseline;
+- replace and restart the daemon plus hub together; old spokes then lack the
+  required capability/session/commit identity and fail closed;
+- replace and restart each spoke from the same pinned revision;
+- require both capabilities, current session epoch, and exact commit identity
+  before that host can receive a bundle lease;
+- confirm generated configuration contains no hook authorization and the daemon
+  exposes no legacy mutation route;
+- fail closed by deactivating remote clients on any mixed-version detection.
 
 ## lan-mouse Test Matrix
 
@@ -263,7 +323,8 @@ Rollout handshake:
 5. Explicit safety fix that prevents pre-grant `Enter`/input emission.
 6. Native daemon client and cancellation/renewal lifecycle.
 7. Coordinated config/deployment templates and persistent Windows logs.
-8. Remove shell authorization path after live cutover verification.
+8. Remove the shell authorization path before deployment; no compatibility
+   implementation is retained during cutover.
 
 Do not combine backend refactoring, protocol wire changes, TV behavior, and deployment changes in one commit.
 
@@ -276,3 +337,8 @@ Do not combine backend refactoring, protocol wire changes, TV behavior, and depl
 - Local release does not depend on the daemon, TV, network, shell, or log sink.
 - Mixed or old versions fail closed.
 - Persistent logs on all three hosts reconstruct create, grant, commit, renewal, release, and fallback using shared identities.
+
+Current gate assessment: source, automated, and native cache-build gates pass.
+The child plan is not live-complete until deployment proves active backend
+behavior, mixed-version fail-closed startup, peer readiness, and correlated
+persistent logs on all three hosts.

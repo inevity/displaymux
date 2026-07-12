@@ -1468,7 +1468,7 @@ TLCFiniteState ==
 \*     request and never treats an uncorrelated daemon retry as permission.
 \* C12 (client commit gate): lan-mouse pauses both input paths, waits/polls for
 \*     a matching grant, validates the lease and epoch, then commits keyboard
-\*     and pointer together. Timeout or hook failure keeps both local.
+\*     and pointer together. Timeout or native client failure keeps both local.
 \* C13 (single SSAP owner): one actor serializes writes, correlates responses,
 \*     and publishes state events. No state mutex is held across an await.
 
@@ -1498,20 +1498,20 @@ not a proof of the unbounded production specification.
 ### Actors
 
 ```
-┌─────────────┐     enter_hook      ┌──────────────┐    persistent wss://      ┌──────┐
-│  lan-mouse  │ ──── curl ────────→ │ tv-multiview  │ ──── SSAP (WebSocket) ─→ │  TV  │
-│   (hub)     │                     │   daemon      │                          │ G4   │
-└─────────────┘                     │  (Rust)       │ ←── subscribe callback ── │      │
-                                    └──────────────┘                          └──────┘
-                                           │
-                                           │ HTTP API (axum)
-                                           ▼
-                                    ┌──────────────┐
-                                    │  External     │
-                                    │  triggers     │
-                                    │ (multiView   │
-                                    │  toggle)     │
-                                    └──────────────┘
+┌──────────────┐  DTLS readiness/release  ┌─────────────┐  authenticated HTTP  ┌──────────────┐
+│ mac/windows  │ ←───────────────────────→ │ lan-mouse   │ ───────────────────→ │ tv-multiview │
+│ spokes       │                           │ hub/server  │  request/poll/commit │ daemon (Rust)│
+└──────────────┘                           └─────────────┘                      └──────┬───────┘
+                                                                                     │
+                                                        persistent SSAP WebSocket     │
+                                                                                     ▼
+                                                                               ┌──────────┐
+                                                                               │ LG TV G4 │
+                                                                               └──────────┘
+```
+
+External MultiView triggers use the same authenticated axum API but never enter
+the cursor-driven grant path.
 
 The Rust daemon holds one persistent wss:// connection to the TV for its
 entire lifetime. No subprocess-per-command. No repeated TLS handshakes.
@@ -1526,7 +1526,6 @@ One dedicated SSAP actor owns the socket, request IDs, response correlation,
 subscription callbacks, and a bounded command queue. HTTP handlers send
 messages to that actor and never read/write the WebSocket directly. No shared
 state lock may be held while awaiting SSAP I/O or lan-mouse commit.
-```
 
 ### API Endpoints
 
@@ -1535,6 +1534,9 @@ state lock may be held while awaiting SSAP I/O or lan-mouse commit.
 | POST | `/enter/{target}` | Create one fenced enter request; reserve both input paths before issuing `set_input()`. | Typed JSON: request ID, epoch, state, deadline |
 | GET | `/enter/request/{id}` | Poll a waking or switching request without creating a second switch. | Typed JSON: pending, grant, denied, or fallback |
 | POST | `/enter/request/{id}/commit` | Acknowledge that lan-mouse atomically committed the matching keyboard+pointer grant. | Typed JSON commit result |
+| POST | `/internal/enter/request/{id}/cancel` | Invalidate one request/lease and begin verified fallback when required. | Typed JSON request state |
+| POST | `/internal/enter/request/{id}/renew` | Renew the current active-session lease after identity and readiness checks. | Typed JSON renewal deadline |
+| POST | `/internal/readiness/{host}` | Publish named-host online, keyboard, pointer, and session-epoch readiness. | Typed JSON readiness state |
 | POST | `/multiview/on` | Enable multiView through the serialized SSAP actor. | Typed JSON command result |
 | POST | `/multiview/off` | Disable multiView, release input locally, then verify fullscreen `SERVER_HOST`. | Typed JSON command result |
 | GET | `/status` | Health, protocol phase, command/observation epochs, owners, lease, and signal status. | JSON |
@@ -1606,8 +1608,9 @@ The TV switch daemon cannot enforce the protocol by itself. The lan-mouse side
 must provide a request-correlated commit gate:
 
 1. Pointer crosses the screen edge.
-2. lan-mouse pauses remote capture and sends no keyboard, pointer-motion,
-   pointer-button, or scroll events to the target yet.
+2. Because native backends report the edge after exclusive capture begins,
+   lan-mouse immediately releases that first crossing. It sends no keyboard,
+   pointer-motion, pointer-button, or scroll events to the target.
 3. lan-mouse creates one `/enter/{target}` request and stores its request ID,
    epoch, and deadline. `409 busy` never means allow.
 4. If the request is waking, lan-mouse keeps both input paths local and polls
@@ -1618,14 +1621,16 @@ must provide a request-correlated commit gate:
    then obtains a fresh active-input and signal observation tagged with the
    current switch epoch.
 7. The daemon returns an expiring grant containing request epoch and lease ID.
-   lan-mouse revalidates both, atomically commits keyboard+pointer, and reports
-   commit. A stale or late grant is rejected.
+   lan-mouse arms it without changing ownership. A matching second crossing
+   revalidates the peer session and both deadlines, atomically commits
+   keyboard+pointer, and reports commit. A stale or late grant is rejected.
 8. Any other result (`waking`, `multiview`, `not_ready`, `busy`, 4xx/5xx,
-   timeout, hook crash, lease loss) keeps keyboard and mouse on `SERVER_HOST`.
+   timeout, native controller task failure, lease loss) keeps keyboard and mouse
+   on `SERVER_HOST`.
 
-This is a hard contract. An asynchronous best-effort `enter_hook` that starts
-after capture has already begun, or a daemon-side auto-retry with no matching
-client request, does not satisfy C10.
+This is a hard contract. The removed asynchronous `enter_hook` path could start
+only after capture had already begun and therefore could not satisfy C10. A
+daemon-side auto-retry with no matching native client request is equally invalid.
 
 Input ownership is atomic: keyboard, pointer motion, pointer buttons, and
 scroll events are switched together. The design must never allow a state where
@@ -1665,7 +1670,7 @@ Only fatal local configuration, invalid credentials, or an unrecoverable
 protocol incompatibility exits for systemd restart. The counter resets only
 after registration, subscription, and initial state synchronization succeed.
 
-#### 2. Enter Hook Logic
+#### 2. Native Enter Protocol Logic
 
 ```
 POST /enter/{target}:                                 [both owners on SERVER_HOST]
@@ -1713,6 +1718,25 @@ Wake-on-LAN and preserves the original request ID/epoch. lan-mouse polls that
 request while keeping both owners local. Readiness advances the same request;
 the daemon cannot perform an uncorrelated auto-switch after returning `202`.
 Wake timeout or cancellation invalidates the request and every later response.
+
+#### 2a. Clock Domains and Return-to-Server Release
+
+Daemon deadlines are absolute only inside the daemon's monotonic clock domain;
+lan-mouse never compares them directly with its own process-relative clock. Each
+typed response carries `server_now_ms`. The client computes
+`remaining = remote_deadline - server_now_ms` and anchors that duration at the
+local request-start instant. Network and processing time therefore make the
+local deadline conservatively earlier, never later. Zero, negative, overflowed,
+or missing remaining time fails closed.
+
+Returning from a spoke to `SERVER_HOST` does not create a competing
+`/enter/SERVER_HOST` transaction. The spoke sends an epoch-tagged
+`ReleaseRequest` to the hub and repeats the current epoch on heartbeat until the
+hub returns the matching `ReleaseAck`. The hub releases capture first, then
+cancels/cleans up the active daemon request; that cancellation drives the one
+verified display fallback transaction. A stale acknowledgement cannot clear a
+newer release request, and daemon unavailability cannot prevent local input
+release.
 
 #### 3. Failure Recovery Paths
 
@@ -1802,13 +1826,17 @@ fact.
   `journalctl --user -u lan-mouse.service`.
 - Current Linux SERVER_HOST tv-multiview:
   `journalctl --user -u tv-multiview.service`.
+- Current Linux SERVER_HOST peer state: `lan-mouse list --json` exposes each
+  configured target's online state, keyboard/pointer readiness, process session
+  epoch, and peer build identity from the hub's local IPC snapshot.
 - macOS lan-mouse: `~/Library/Logs/lan-mouse.log` and
-  `~/Library/Logs/lan-mouse.err.log`.
+  `~/Library/Logs/lan-mouse.err.log`, each with five 10 MiB backups managed by
+  the launch wrapper.
 - Windows lan-mouse: the scheduled task must redirect stdout and stderr to
-  fixed files under `%LOCALAPPDATA%\lan-mouse\`, for example
-  `%LOCALAPPDATA%\lan-mouse\lan-mouse.log` and
-  `%LOCALAPPDATA%\lan-mouse\lan-mouse.err.log`. The deploy must not rely on
-  transient console output or an unverified Event Log source.
+  `%LOCALAPPDATA%\lan-mouse\logs\lan-mouse.log` and
+  `%LOCALAPPDATA%\lan-mouse\logs\lan-mouse.err.log`, each with five 10 MiB
+  backups. The deploy must not rely on transient console output or an
+  unverified Event Log source.
 
 **Structured JSON logging (stdout, one object per line):**
 ```json
@@ -1832,7 +1860,18 @@ reservation/grant identity, observation age, command latency, and fallback
 reason. The logging sink is bounded and non-blocking; rotation or a stalled
 file sink must not block the SSAP actor or input-release path.
 
-**`/status` response:**
+The production implementation makes that bound concrete in both Rust
+processes: at most 1,024 records of at most 16 KiB each may wait for the log
+worker (a maximum queued payload of 16 MiB). Producers use non-blocking sends.
+An oversized record, a full queue, or a failed sink write increments the
+drop count instead of delaying protocol or input service work. tv-multiview
+exposes its queue depth, capacity, record bound, and drop count in `/status`.
+lan-mouse reports the cumulative dropped-record count to its persistent sink
+after that sink accepts writes again. The macOS and Windows wrappers keep one
+writer open per stream and rotate only at the configured 10 MiB boundary, so
+the wrapper does not reopen and restat each file for every log line.
+
+**`/status` `data` payload (the API envelope also carries `server_now_ms`):**
 ```json
 {
   "mode": "fullscreen",
@@ -1855,13 +1894,53 @@ file sink must not block the SSAP actor or input-release path.
   "reservation_target": null,
   "grant_epoch": null,
   "input_signal": {"linux": true, "mac": false, "windows": true},
+  "signal_observations": {
+    "linux": {"present": true, "switch_epoch": 88, "observed_at_ms": 3599000}
+  },
   "remote_online": {"mac": false, "windows": true},
+  "peer_readiness": {
+    "windows": {
+      "online": true,
+      "keyboard_ready": true,
+      "pointer_ready": true,
+      "session_epoch": 17,
+      "observed_at_ms": 3599500
+    }
+  },
   "uptime_seconds": 3600,
   "reconnect_total": 0,
   "switch_count": {"linux": 12, "mac": 8, "windows": 5},
-  "last_error": null
+  "last_error": null,
+  "dropped_logs": 0,
+  "request_history_len": 4,
+  "retained_request_limit": 32,
+  "queues": {
+    "ordinary_commands": {"depth": 0, "capacity": 64},
+    "safety_commands": {"depth": 0, "capacity": 16},
+    "ordinary_effects": {"depth": 0, "capacity": 64},
+    "safety_effects": {"depth": 0, "capacity": 16}
+  },
+  "runtime": {
+    "log_queue_depth": 0,
+    "log_queue_capacity": 1024,
+    "log_record_max_bytes": 16384,
+    "dropped_logs": 0,
+    "reconnect_consecutive": 0,
+    "reconnect_backoff_ms": 0,
+    "retry_alert": false
+  },
+  "observation_age_ms": 1000,
+  "deadline_remaining_ms": null,
+  "in_flight_operation": null
 }
 ```
+
+The retry alert becomes true after the configured consecutive reconnect
+threshold (initially ten) and resets only after registration, subscription,
+and initial synchronization all succeed. It is diagnostic state, never a
+process-exit or false-readiness condition. Request history is retained in a
+fixed oldest-evicted ring (initially 32 entries) so duplicate create, commit,
+and cancellation identities remain deterministic without unbounded memory.
 
 #### 7. systemd Integration
 
@@ -1881,6 +1960,15 @@ Transient TV/network failures are handled inside the daemon and do not cause
 process exit. `Restart=on-failure` is reserved for fatal local errors or an
 unexpected crash. Persistent logs require rotation on every platform.
 
+Linux, macOS, and Windows build the same immutable lan-mouse git revision from
+one git bundle and resolve dependencies from a Cargo vendor archive keyed by the
+verified `Cargo.lock` SHA-256. Linux preserves all configured non-GTK input
+backends; macOS and Windows use their target-native backends with
+`--no-default-features`. A host records the revision, lock hash, toolchain
+selector, selected compiler's exact `rustc --version` output, and feature set
+only after native tests and installation succeed. Every checkout is also
+required to match the bundle's exact pinned head before a build can start.
+
 #### 8. Performance and Deadlock Constraints
 
 - One SSAP actor owns the socket and serializes commands. The queue is bounded;
@@ -1895,9 +1983,9 @@ unexpected crash. Persistent logs require rotation on every platform.
 - A pending enter request owns one bundle lease and one TV command slot. New
   requests receive `409 busy`; they do not allocate unbounded tasks or queue
   duplicate TV commands.
-- Wake/request polling is implemented by native lan-mouse integration or one
-  bounded helper lifecycle. It must not spawn a new `curl` process on every
-  poll tick; process-spawn cost and cancellation are measured separately.
+- Wake/request polling is implemented by one bounded native lan-mouse task. It
+  never spawns `curl` or another process per poll; cancellation is tied to the
+  capture gate and request epoch.
 - The 5-second switch, 60-second wake, 10-second poll, ping-miss, and reconnect
   values are initial candidates, not correctness constants. Production values
   require recorded p50/p95/p99 command, observation, wake, and disconnect data
@@ -1917,7 +2005,7 @@ unexpected crash. Persistent logs require rotation on every platform.
 - lan-mouse starts the request synchronously, then polls the same request ID
   while capture remains paused; a daemon-side delayed switch is never implicit
 - TV subscription needs persistent WebSocket — lan-mouse is event-driven
-- HTTP API is universal: any OS, any enter_hook
+- The authenticated typed HTTP API is usable by the native client on every OS
 - Separate crash domain: daemon death doesn't crash lan-mouse
 
 ### ADR-002: Shared LG_Buddy key file
@@ -1933,7 +2021,7 @@ unexpected crash. Persistent logs require rotation on every platform.
 ### ADR-003: MultiView toggle is standalone, not cursor-driven
 
 **Decision:** `/multiview/on` and `/multiview/off` are independent HTTP endpoints —
-NOT embedded in `enter_hook` parameters.
+not encoded in cursor-enter request parameters.
 
 **Rationale:**
 - `splitscreenEnable` only toggles mode on/off — cannot select which inputs

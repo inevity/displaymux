@@ -1446,7 +1446,7 @@ TLCFiniteState ==
 \*     request and never treats an uncorrelated daemon retry as permission.
 \* C12 (client commit gate): lan-mouse pauses both input paths, waits/polls for
 \*     a matching grant, validates the lease and epoch, then commits keyboard
-\*     and pointer together. Timeout or hook failure keeps both local.
+\*     and pointer together. Timeout or native client failure keeps both local.
 \* C13 (single SSAP owner): one actor serializes writes, correlates responses,
 \*     and publishes state events. No state mutex is held across an await.
 

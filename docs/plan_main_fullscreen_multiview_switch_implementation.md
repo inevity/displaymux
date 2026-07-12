@@ -2,10 +2,17 @@
 
 ## Plan Control
 
-- Status: in progress; Phase 0 characterization and capture-boundary work started on 2026-07-11.
-- Design baseline: `fullscreenmultiviewswitchdesign.md` at commit `319b762`.
-- Rust daemon baseline: current clean `tv-multiview` crate at commit `319b762`.
-- lan-mouse baseline: local clean checkout `../../lan-mouse` at commit `392af44`, matching `lan_mouse_release_tag: main-392af44`.
+- Status: implementation, automated verification, native build automation, and
+  the protocol-revision three-host cache matrix are complete as of 2026-07-12.
+  Production cutover and live acceptance remain blocked pending explicit
+  authorization for the coordinated install/restart on Linux, macOS, and
+  Windows.
+- Design baseline: `fullscreenmultiviewswitchdesign.md` originated at commit
+  `319b762`; its living prose and model now describe the implemented protocol.
+- Rust daemon implementation: parent-repository commit `6ec253d` plus its
+  prerequisite fenced-protocol commits.
+- lan-mouse implementation: clean `../../lan-mouse` commit
+  `952a5e9f1d5b2d476f44baa951bdf207080c9898`.
 - Controlling objective: implement the approved design without allowing keyboard and pointer ownership to split, and without claiming server-host fallback before the TV state is freshly observed.
 - Compatibility policy: there is no legacy mutation API, compatibility flag,
   fire-and-forget hook authorization, or mixed-version operation. Old peers and
@@ -16,6 +23,33 @@ Linked child plans:
 
 - [tv-multiview daemon refactor and protocol implementation](plan_tv_multiview_daemon_refactor.md)
 - [lan-mouse atomic input gate and lease integration](plan_lan_mouse_atomic_input_gate.md)
+
+## Implementation Evidence (2026-07-12)
+
+- tv-multiview `cargo check --frozen` and all 36 tests pass. The suite covers
+  atomic ownership, stale/duplicate completion, readiness loss, disconnect
+  release, bounded queues/logging, typed/authenticated HTTP, SSAP codecs, and
+  reconnect-backoff reset.
+- lan-mouse no-GTK workspace checks and all 38 tests pass (4 input-capture,
+  27 core, 2 logging, 2 CLI-status, and 3 protocol). Strict clippy passes for
+  the changed CLI crate. The Linux production-feature check and full pre-CLI
+  protocol test set also passed.
+- The last complete three-host cache-only release matrix used source
+  `4425c5789b04025720dce234887e6a2d30919258` and Cargo.lock SHA-256
+  `d91c91ed08149293a08eb958281c174a5596788f5160e39de751babd52767c93`:
+  Linux ELF SHA-256 `fef56b26610eba4e970460bc94b9b03370ce4eb0cc59a0287f814898d43479e0`,
+  macOS Mach-O SHA-256 `6f8c734c0563b50245f339793c97180a04c2dc6039294bac29f96ecb29976bb7`,
+  and Windows PE SHA-256 `1B603699A6907FC646362FCB60B7084BF4C0102B369F56F84EA7C6AFB1FC2D6E`.
+- Linux used `/usr/bin/rustc 1.96.0`; macOS and Windows used native rustup
+  `rustc 1.97.0`. The current `952a5e9` revision adds only the machine-readable
+  CLI status surface and lock dependency declarations; its no-GTK checks and
+  tests pass, and its macOS full test run passed before the user stopped further
+  deployment-focused cache builds. No cache validation installed a binary or
+  restarted a service.
+- Ansible syntax/task expansion and idempotent template rendering pass. Rendered
+  TOML, plist, shell, PKGBUILD, systemd, and Windows PowerShell artifacts pass
+  their available native parsers; bounded macOS and Windows rotation wrappers
+  also passed temporary-file runtime tests on their respective hosts.
 
 ## TLA Planning Frame
 
@@ -131,6 +165,12 @@ The exact local transport may be HTTP or local IPC, but it must be bounded, auth
 
 ### Phase 0: Baseline and Characterization
 
+Status: partially completed. Source identities, unsafe legacy behavior, test
+seams, and protocol shapes are recorded. The pre-refactor subprocess CPU,
+process-count, and latency workload was not captured before replacement and
+must not be reconstructed or claimed without an explicitly authorized run of
+the historical TV-control path against the physical TV.
+
 Owner: both child plans.
 
 - Record current crate and lan-mouse commit IDs in test output and deployment metadata.
@@ -142,6 +182,8 @@ Owner: both child plans.
 Exit gate: tests describe current behavior, known unsafe behavior is named rather than encoded as desired behavior, and no production behavior has changed.
 
 ### Phase 1: Mechanical Daemon Refactor
+
+Status: completed and verified in the current tv-multiview implementation.
 
 Owner: `plan_tv_multiview_daemon_refactor.md`.
 
@@ -155,6 +197,8 @@ Exit gate: state/reducer tests pass, status snapshots are coherent, no lock is h
 
 ### Phase 2: Pure Protocol Reducer
 
+Status: completed and covered by deterministic reducer tests.
+
 Owner: `plan_tv_multiview_daemon_refactor.md`.
 
 - Implement design variables as typed state: commanded versus observed input, protocol phase, request/switch/verified/grant epochs, fallback intent, owners, signal observations, deadlines, and readiness.
@@ -165,6 +209,11 @@ Owner: `plan_tv_multiview_daemon_refactor.md`.
 Exit gate: counterexample tests cover stale observations, stale grants, readiness loss, disconnect races, fallback deferral, unexpected callbacks, and timer rearm/livelock.
 
 ### Phase 3: Persistent SSAP Actor
+
+Status: implemented and covered for codec parsing, bounded coordinator/effect
+queues, reconnect backoff reset, and single-owner state transitions. The full
+live disconnect/resubscribe/resynchronization matrix remains a Phase 7 live
+acceptance item.
 
 Owner: `plan_tv_multiview_daemon_refactor.md`.
 
@@ -178,6 +227,10 @@ Exit gate: scripted transport tests prove correlation, reconnect/resubscribe/res
 
 ### Phase 4: lan-mouse Capability, Lease, and Capture Gate
 
+Status: implemented and covered by protocol, lease, capture-permit, release,
+and native build tests. Manual active-backend input behavior remains blocked
+until the coordinated live cutover is authorized.
+
 Owner: `plan_lan_mouse_atomic_input_gate.md`.
 
 - Extend peer protocol and IPC state with keyboard readiness, pointer readiness, and a session epoch. Missing fields mean false.
@@ -189,6 +242,9 @@ Owner: `plan_lan_mouse_atomic_input_gate.md`.
 Exit gate: unit/integration tests prove both capabilities move together and all pre-grant, timeout, disconnect, and restart paths remain local.
 
 ### Phase 5: Fenced HTTP and MultiView Protocol
+
+Status: completed and verified by reducer and black-box HTTP tests; no legacy
+mutating GET route or shell authorization path is retained.
 
 Owner: daemon child plan with lan-mouse integration tests.
 
@@ -202,23 +258,40 @@ Exit gate: black-box API tests prove status code, body schema, idempotency, stal
 
 ### Phase 6: Coordinated Deployment Cutover
 
+Status: deployment automation is complete and the protocol revision passed the
+full three-host cache build. Further repeated cache validation was explicitly
+stopped as out of scope. The steps below that install artifacts, replace runtime
+configuration, and restart three hosts remain blocked pending explicit
+authorization for that disruptive action.
+
 Owner: main plan.
 
-Cutover order is intentionally fail-closed:
+Cutover order is intentionally fail-closed and contains no legacy/observe-only
+compatibility mode:
 
-1. Add persistent Windows stdout/stderr files and rotation; verify Linux journal and macOS LaunchAgent logs.
-2. Deploy capability-reporting lan-mouse builds to both spokes. Keep old capture behavior disabled from using the new protocol.
-3. Deploy the new daemon with fenced endpoints available but remote grant issuance disabled.
-4. Deploy the new hub with capture gate in observe-only mode; verify per-host keyboard and pointer readiness and session epochs.
-5. Force the TV and input to verified `SERVER_HOST` baseline.
-6. Enable fenced switching on the daemon and hub in one maintenance action.
-7. Deploy generated configs without `enter_hook = curl ...`; no legacy mutating
-   route is present in the daemon binary.
-8. Run the failure matrix before restoring unattended startup.
+1. Build and test the exact pinned revision in each native-host cache; verify
+   bounded persistent log paths before changing a live process.
+2. Release any remote capture and force the TV plus input to a freshly observed
+   `SERVER_HOST` baseline.
+3. Install and restart the new daemon and hub together on `SERVER_HOST`. Until
+   each spoke is replaced, missing capability/session/commit identity makes it
+   ineligible for a lease.
+4. Install and restart the macOS and Windows spokes from the same pinned
+   revision. Require both capabilities, current session epoch, and exact commit
+   identity before enabling each remote target.
+5. Verify generated configs contain no `enter_hook` authorization and verify
+   the daemon binary exposes no legacy mutating route.
+6. Confirm correlated persistent logs and a freshly verified server fallback,
+   then run the failure matrix before restoring unattended startup.
 
 Never deploy a daemon that can issue grants to the old fire-and-forget hook client. Never roll back only one side of the protocol.
 
 ### Phase 7: Verification and Legacy Removal
+
+Status: automated Rust tests, native builds, static Ansible/template checks,
+bounded-log tests, TLA model checking, and legacy source removal are complete.
+The physical failure matrix, persistent-log reconstruction from live switches,
+and p50/p95/p99 production timing measurements are blocked on Phase 6 cutover.
 
 - Run `cargo check` after every Rust change and focused `cargo test` after every logic change in each affected repository.
 - Run full tests for `tv-multiview`, lan-mouse core, protocol, IPC, capture, and emulation before cutover.
@@ -275,3 +348,9 @@ The objective is complete only when:
 - all failures converge to local input plus freshly verified server display or an honest `fallback_deferred` state;
 - deployment and rollback are repeatable across Linux, macOS, and Windows;
 - the obsolete plans are marked historical or removed in a separate reviewed cleanup, and no compatibility path remains in production code.
+
+Current completion assessment: implementation criteria are satisfied by source
+and automated evidence, but the objective is not production-complete. The live
+cutover, native active-backend behavior, physical TV failure matrix, forensic
+log reconstruction, and production percentile measurements remain blocked on
+explicit approval to install and restart the coordinated three-host system.
