@@ -20,7 +20,10 @@
     that:
       - ansible_facts.architecture == 'x86_64'
       - mac_rustup.stat.exists
-    fail_msg: "macOS requires Intel Xcode tools and /usr/local/bin/rustup"
+      - lan_mouse_macos_build_profile in ['debug', 'release']
+    fail_msg: >-
+      macOS requires Intel Xcode tools, /usr/local/bin/rustup, and a
+      lan_mouse_macos_build_profile of debug or release
 
 - name: Install selected macOS Rust toolchain
   ansible.builtin.command:
@@ -33,11 +36,17 @@
   register: mac_rust_version
   changed_when: false
 
+- name: Select macOS Cargo build profile
+  ansible.builtin.set_fact:
+    mac_cargo_profile: "{{ 'dev' if lan_mouse_macos_build_profile == 'debug' else 'release' }}"
+    mac_target_profile_dir: "{{ 'debug' if lan_mouse_macos_build_profile == 'debug' else 'release' }}"
+
 - name: Define macOS native build identity
   ansible.builtin.set_fact:
     mac_build_id: >-
       {{ lan_mouse_revision }} lock={{ lan_mouse_cargo_lock_sha256 }}
       rust={{ mac_rust_version.stdout | trim }} no-default-features
+      profile={{ lan_mouse_macos_build_profile }}
 
 - name: Locate selected macOS Cargo binary
   ansible.builtin.command:
@@ -146,13 +155,14 @@
       async: 3600
       poll: 5
 
-    - name: Build no-GTK macOS release binary
+    - name: Build no-GTK macOS binary
       ansible.builtin.command:
         argv:
           - "{{ mac_cargo.stdout | trim }}"
           - build
           - --frozen
-          - --release
+          - --profile
+          - "{{ mac_cargo_profile }}"
           - --bin
           - lan-mouse
           - --no-default-features
@@ -170,12 +180,12 @@
           - '-'
           - --identifier
           - com.feschber.lan-mouse
-          - "{{ mac_target_dir }}/release/lan-mouse"
+          - "{{ mac_target_dir }}/{{ mac_target_profile_dir }}/lan-mouse"
       changed_when: true
 
     - name: Install stable macOS daemon binary
       ansible.builtin.copy:
-        src: "{{ mac_target_dir }}/release/lan-mouse"
+        src: "{{ mac_target_dir }}/{{ mac_target_profile_dir }}/lan-mouse"
         dest: "{{ mac_installed_binary }}"
         remote_src: true
         mode: "0755"
