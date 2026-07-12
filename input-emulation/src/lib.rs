@@ -160,6 +160,10 @@ impl InputEmulation {
         }
     }
 
+    pub fn center_pointer(&mut self, handle: EmulationHandle) -> Result<(), EmulationError> {
+        self.emulation.center_pointer(handle)
+    }
+
     pub fn poll_error(&mut self, cx: &mut Context<'_>) -> Poll<EmulationError> {
         self.emulation.poll_error(cx)
     }
@@ -248,6 +252,10 @@ trait Emulation: Send {
     async fn create(&mut self, handle: EmulationHandle);
     async fn destroy(&mut self, handle: EmulationHandle);
     async fn terminate(&mut self);
+
+    fn center_pointer(&mut self, _handle: EmulationHandle) -> Result<(), EmulationError> {
+        Ok(())
+    }
 
     fn poll_error(&mut self, _cx: &mut Context<'_>) -> Poll<EmulationError> {
         Poll::Pending

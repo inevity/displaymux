@@ -12,6 +12,10 @@ use std::{
     time::Duration,
 };
 use tokio::{sync::mpsc, task::AbortHandle};
+use windows::Win32::Foundation::{POINT, RECT};
+use windows::Win32::Graphics::Gdi::{
+    GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromPoint,
+};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     INPUT, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE,
     MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN,
@@ -21,7 +25,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     INPUT_0, KEYEVENTF_EXTENDEDKEY, MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, SendInput,
 };
-use windows::Win32::UI::WindowsAndMessaging::{XBUTTON1, XBUTTON2};
+use windows::Win32::UI::WindowsAndMessaging::{GetCursorPos, SetCursorPos, XBUTTON1, XBUTTON2};
 
 use super::{Emulation, EmulationHandle};
 
@@ -91,11 +95,40 @@ impl Emulation for WindowsEmulation {
 
     async fn terminate(&mut self) {}
 
+    fn center_pointer(&mut self, _handle: EmulationHandle) -> Result<(), EmulationError> {
+        let mut cursor = POINT::default();
+        unsafe { GetCursorPos(&mut cursor) }.map_err(windows_io_error)?;
+
+        let monitor = unsafe { MonitorFromPoint(cursor, MONITOR_DEFAULTTONEAREST) };
+        let mut info = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        if !unsafe { GetMonitorInfoW(monitor, &mut info) }.as_bool() {
+            return Err(io::Error::last_os_error().into());
+        }
+
+        let center = rect_center(info.rcMonitor);
+        unsafe { SetCursorPos(center.x, center.y) }.map_err(windows_io_error)?;
+        Ok(())
+    }
+
     fn poll_error(&mut self, cx: &mut Context<'_>) -> Poll<EmulationError> {
         match self.error_rx.poll_recv(cx) {
             Poll::Ready(Some(error)) => Poll::Ready(error),
             Poll::Ready(None) | Poll::Pending => Poll::Pending,
         }
+    }
+}
+
+fn windows_io_error(error: windows::core::Error) -> EmulationError {
+    io::Error::other(error.to_string()).into()
+}
+
+fn rect_center(rect: RECT) -> POINT {
+    POINT {
+        x: rect.left + (rect.right - rect.left) / 2,
+        y: rect.top + (rect.bottom - rect.top) / 2,
     }
 }
 
@@ -254,4 +287,21 @@ fn linux_keycode_to_windows_scancode(linux_keycode: u32) -> Option<u16> {
     };
     log::trace!("windows code: {windows_scancode:?}");
     Some(windows_scancode as u16)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn monitor_center_handles_negative_desktop_coordinates() {
+        let center = rect_center(RECT {
+            left: -1920,
+            top: 0,
+            right: 0,
+            bottom: 1080,
+        });
+
+        assert_eq!(center, POINT { x: -960, y: 540 });
+    }
 }

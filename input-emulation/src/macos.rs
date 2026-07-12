@@ -3,7 +3,7 @@ use async_trait::async_trait;
 use bitflags::bitflags;
 use core_graphics::base::CGFloat;
 use core_graphics::display::{
-    CGDirectDisplayID, CGDisplayBounds, CGGetDisplaysWithRect, CGPoint, CGRect, CGSize,
+    CGDirectDisplayID, CGDisplay, CGDisplayBounds, CGGetDisplaysWithRect, CGPoint, CGRect, CGSize,
 };
 use core_graphics::event::{
     CGEvent, CGEventFlags, CGEventTapLocation, CGEventType, CGKeyCode, CGMouseButton, EventField,
@@ -17,6 +17,7 @@ use input_event::{
 use keycode::{KeyMap, KeyMapping};
 use std::cell::Cell;
 use std::collections::HashSet;
+use std::io;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -250,6 +251,11 @@ fn get_display_bounds(display: CGDirectDisplayID) -> (CGFloat, CGFloat, CGFloat,
         let max_y = bounds.origin.y + bounds.size.height;
         (min_x as f64, min_y as f64, max_x as f64, max_y as f64)
     }
+}
+
+fn display_center(bounds: (CGFloat, CGFloat, CGFloat, CGFloat)) -> CGPoint {
+    let (min_x, min_y, max_x, max_y) = bounds;
+    CGPoint::new(min_x + (max_x - min_x) / 2.0, min_y + (max_y - min_y) / 2.0)
 }
 
 fn clamp_to_screen_space(
@@ -516,6 +522,19 @@ impl Emulation for MacOSEmulation {
         Ok(())
     }
 
+    fn center_pointer(&mut self, _handle: EmulationHandle) -> Result<(), EmulationError> {
+        let location = self
+            .get_mouse_location()
+            .ok_or_else(|| io::Error::other("could not read mouse location"))?;
+        let display = get_display_at_point(location.x, location.y)
+            .ok_or_else(|| io::Error::other("could not find display containing mouse"))?;
+        let center = display_center(get_display_bounds(display));
+
+        CGDisplay::warp_mouse_cursor_position(center)
+            .map_err(|error| io::Error::other(format!("could not center mouse: {error:?}")))?;
+        Ok(())
+    }
+
     async fn create(&mut self, _handle: EmulationHandle) {}
 
     async fn destroy(&mut self, _handle: EmulationHandle) {}
@@ -598,5 +617,17 @@ bitflags! {
         const Mod3Mask = (1<<5);
         const Mod4Mask = (1<<6);
         const Mod5Mask = (1<<7);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn display_center_handles_negative_desktop_coordinates() {
+        let center = display_center((-1920.0, 0.0, 0.0, 1080.0));
+
+        assert_eq!(center, CGPoint::new(-960.0, 540.0));
     }
 }

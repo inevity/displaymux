@@ -14,6 +14,7 @@ use std::{
 };
 use tokio::{
     select,
+    sync::oneshot,
     task::{JoinHandle, spawn_local},
 };
 
@@ -196,6 +197,10 @@ impl ListenTask {
                                 if let Some(fingerprint) = self.listener.get_certificate_fingerprint(addr).await {
                                     log::info!("releasing capture: {addr} entered this device");
                                     self.event_tx.send(EmulationEvent::ReleaseNotify).expect("channel closed");
+                                    if !self.emulation_proxy.center_pointer(addr).await {
+                                        log::warn!("not acknowledging enter from {addr}: pointer centering failed");
+                                        continue;
+                                    }
                                     self.listener.reply(addr, ProtoEvent::Ack(0)).await;
                                     self.event_tx.send(EmulationEvent::Entered{addr, pos: to_ipc_pos(pos), fingerprint}).expect("channel closed");
                                 }
@@ -308,6 +313,7 @@ pub(crate) struct EmulationProxy {
 
 enum ProxyRequest {
     Input(Event, SocketAddr),
+    CenterPointer(SocketAddr, oneshot::Sender<bool>),
     Remove(SocketAddr),
     Terminate,
     Reenable,
@@ -385,6 +391,17 @@ impl EmulationProxy {
         }
     }
 
+    async fn center_pointer(&self, addr: SocketAddr) -> bool {
+        if !self.control_ready() {
+            return false;
+        }
+        let (result_tx, result_rx) = oneshot::channel();
+        self.request_tx
+            .send(ProxyRequest::CenterPointer(addr, result_tx))
+            .expect("channel closed");
+        result_rx.await.unwrap_or(false)
+    }
+
     fn remove(&self, addr: SocketAddr) {
         self.request_tx
             .send(ProxyRequest::Remove(addr))
@@ -431,6 +448,9 @@ impl EmulationTask {
                     ProxyRequest::Reenable => break,
                     ProxyRequest::Terminate => return,
                     ProxyRequest::Input(..) => { /* emulation inactive => ignore */ }
+                    ProxyRequest::CenterPointer(_, result_tx) => {
+                        let _ = result_tx.send(false);
+                    }
                     ProxyRequest::Remove(..) => { /* emulation inactive => ignore */ }
                 }
             }
@@ -503,18 +523,21 @@ impl EmulationTask {
                 }
                 e = self.request_rx.recv() => match e.expect("channel closed") {
                     ProxyRequest::Input(event, addr) => {
-                        let handle = match self.handles.get(&addr) {
-                            Some(&handle) => handle,
-                            None => {
-                                let handle = self.next_id;
-                                self.next_id += 1;
-                                emulation.create(handle).await;
-                                self.handles.insert(addr, handle);
-                                handle
-                            }
-                        };
+                        let handle = self.handle_for_addr(emulation, addr).await;
                         emulation.consume(event, handle).await?;
                     },
+                    ProxyRequest::CenterPointer(addr, result_tx) => {
+                        let handle = self.handle_for_addr(emulation, addr).await;
+                        match emulation.center_pointer(handle) {
+                            Ok(()) => {
+                                let _ = result_tx.send(true);
+                            }
+                            Err(error) => {
+                                let _ = result_tx.send(false);
+                                return Err(error.into());
+                            }
+                        }
+                    }
                     ProxyRequest::Remove(addr) => {
                         if let Some(handle) = self.handles.remove(&addr) {
                             emulation.destroy(handle).await;
@@ -523,6 +546,23 @@ impl EmulationTask {
                     ProxyRequest::Terminate => break Ok(()),
                     ProxyRequest::Reenable => continue,
                 },
+            }
+        }
+    }
+
+    async fn handle_for_addr(
+        &mut self,
+        emulation: &mut InputEmulation,
+        addr: SocketAddr,
+    ) -> EmulationHandle {
+        match self.handles.get(&addr) {
+            Some(&handle) => handle,
+            None => {
+                let handle = self.next_id;
+                self.next_id += 1;
+                emulation.create(handle).await;
+                self.handles.insert(addr, handle);
+                handle
             }
         }
     }
@@ -547,6 +587,9 @@ async fn wait_for_termination(rx: &mut Receiver<ProxyRequest>) {
         match rx.recv().await.expect("channel closed") {
             ProxyRequest::Terminate => return,
             ProxyRequest::Input(_, _) => continue,
+            ProxyRequest::CenterPointer(_, result_tx) => {
+                let _ = result_tx.send(false);
+            }
             ProxyRequest::Remove(_) => continue,
             ProxyRequest::Reenable => continue,
         }
