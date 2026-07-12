@@ -322,7 +322,7 @@
         dest: "{{ ansible_facts.env.HOME }}/.local/bin/tv-multiview"
         mode: "0755"
         remote_src: false
-      register: tv_multiview_binary
+      register: tv_multiview_binary_install
 
     - name: Ensure lingering is enabled (so user services survive without an active login)
       become: true
@@ -406,7 +406,7 @@
         linux_build_required
         or hub_config_template.changed
         or lm_service_template.changed
-        or tv_multiview_binary.changed
+        or tv_multiview_binary_install.changed
         or daemon_config_template.changed
         or daemon_service_template.changed
       block:
