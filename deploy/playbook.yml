@@ -953,8 +953,21 @@
           changed_when: true
 
         - name: Stop existing lan-mouse scheduled task before binary replacement
-          ansible.windows.win_shell: schtasks /end /tn LanMouseDaemon
-          failed_when: false
+          ansible.windows.win_shell: |
+            schtasks /end /tn LanMouseDaemon 2>$null | Out-Null
+            $expected = [System.IO.Path]::GetFullPath("{{ win_installed_binary }}")
+            $processes = Get-CimInstance Win32_Process -Filter "Name = 'lan-mouse.exe'" |
+              Where-Object { $_.ExecutablePath -and [System.IO.Path]::GetFullPath($_.ExecutablePath) -eq $expected }
+            $processes | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction Stop }
+
+            $deadline = (Get-Date).AddSeconds(10)
+            do {
+              $remaining = Get-CimInstance Win32_Process -Filter "Name = 'lan-mouse.exe'" |
+                Where-Object { $_.ExecutablePath -and [System.IO.Path]::GetFullPath($_.ExecutablePath) -eq $expected }
+              if (-not $remaining) { break }
+              Start-Sleep -Milliseconds 100
+            } while ((Get-Date) -lt $deadline)
+            if ($remaining) { throw "lan-mouse.exe did not stop before replacement" }
           changed_when: false
 
         - name: Install only the Windows daemon executable
