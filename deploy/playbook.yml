@@ -260,6 +260,11 @@
     - name: Build, test, and install pinned lan-mouse on Linux
       when: linux_build_required
       block:
+        - name: Remove stale makepkg VCS source clone
+          ansible.builtin.file:
+            path: "{{ ansible_facts.env.HOME }}/.cache/lan-mouse-pkgbuild/lan-mouse"
+            state: absent
+
         - name: Build and test package as the desktop user
           ansible.builtin.command:
             argv: [makepkg, --force, --noconfirm, --check, --cleanbuild]
