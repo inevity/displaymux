@@ -1,12 +1,13 @@
 use clap::{Args, Parser, Subcommand};
 use futures::StreamExt;
+use serde::Serialize;
 
 use std::{net::IpAddr, time::Duration};
 use thiserror::Error;
 
 use lan_mouse_ipc::{
-    ClientHandle, ConnectionError, FrontendEvent, FrontendRequest, IpcError, Position, SwitchHost,
-    connect_async,
+    ClientConfig, ClientHandle, ClientState, ConnectionError, FrontendEvent, FrontendRequest,
+    IpcError, Position, SwitchHost, connect_async,
 };
 
 #[derive(Debug, Error)]
@@ -16,6 +17,8 @@ pub enum CliError {
     ServiceNotRunning(#[from] ConnectionError),
     #[error("error communicating with service: {0}")]
     Ipc(#[from] IpcError),
+    #[error("error serializing service status: {0}")]
+    Json(#[from] serde_json::Error),
 }
 
 #[derive(Parser, Clone, Debug, PartialEq, Eq)]
@@ -48,7 +51,11 @@ enum CliSubcommand {
     /// deactivate a client
     Deactivate { id: ClientHandle },
     /// list configured clients
-    List,
+    List {
+        /// emit one JSON array for deployment and diagnostics
+        #[arg(long)]
+        json: bool,
+    },
     /// change hostname
     SetHost {
         id: ClientHandle,
@@ -78,6 +85,41 @@ enum CliSubcommand {
     RemoveAuthorizedKey { sha256_fingerprint: String },
     /// save configuration to file
     SaveConfig,
+}
+
+#[derive(Debug, Serialize)]
+struct ClientStatus {
+    id: ClientHandle,
+    hostname: Option<String>,
+    port: u16,
+    position: Position,
+    switch_target: Option<SwitchHost>,
+    active: bool,
+    alive: bool,
+    keyboard_ready: bool,
+    pointer_ready: bool,
+    peer_session_epoch: u64,
+    peer_commit: Option<String>,
+}
+
+impl ClientStatus {
+    fn from_client(id: ClientHandle, config: ClientConfig, state: ClientState) -> Self {
+        Self {
+            id,
+            hostname: config.hostname,
+            port: config.port,
+            position: config.pos,
+            switch_target: config.switch_target,
+            active: state.active,
+            alive: state.alive,
+            keyboard_ready: state.keyboard_ready,
+            pointer_ready: state.pointer_ready,
+            peer_session_epoch: state.peer_session_epoch,
+            peer_commit: state
+                .peer_commit
+                .map(|commit| String::from_utf8_lossy(&commit).into_owned()),
+        }
+    }
 }
 
 pub async fn run(args: CliArgs) -> Result<(), CliError> {
@@ -122,19 +164,29 @@ async fn execute(cmd: CliSubcommand) -> Result<(), CliError> {
         CliSubcommand::Deactivate { id } => {
             tx.request(FrontendRequest::Activate(id, false)).await?
         }
-        CliSubcommand::List => {
+        CliSubcommand::List { json } => {
             tx.request(FrontendRequest::Enumerate()).await?;
             while let Some(e) = rx.next().await {
                 if let FrontendEvent::Enumerate(clients) = e? {
-                    for (handle, config, state) in clients {
-                        let host = config.hostname.unwrap_or("unknown".to_owned());
-                        let port = config.port;
-                        let pos = config.pos;
-                        let active = state.active;
-                        let ips = state.ips;
-                        println!(
-                            "id {handle}: {host}:{port} ({pos}) active: {active}, ips: {ips:?}"
-                        );
+                    if json {
+                        let clients = clients
+                            .into_iter()
+                            .map(|(handle, config, state)| {
+                                ClientStatus::from_client(handle, config, state)
+                            })
+                            .collect::<Vec<_>>();
+                        println!("{}", serde_json::to_string(&clients)?);
+                    } else {
+                        for (handle, config, state) in clients {
+                            let host = config.hostname.unwrap_or("unknown".to_owned());
+                            let port = config.port;
+                            let pos = config.pos;
+                            let active = state.active;
+                            let ips = state.ips;
+                            println!(
+                                "id {handle}: {host}:{port} ({pos}) active: {active}, ips: {ips:?}"
+                            );
+                        }
                     }
                     break;
                 }
@@ -176,4 +228,43 @@ async fn execute(cmd: CliSubcommand) -> Result<(), CliError> {
         CliSubcommand::SaveConfig => tx.request(FrontendRequest::SaveConfiguration).await?,
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn list_json_flag_is_explicit() {
+        let args = CliArgs::try_parse_from(["lan-mouse-cli", "list", "--json"]).unwrap();
+        assert_eq!(args.command, CliSubcommand::List { json: true });
+    }
+
+    #[test]
+    fn client_status_serializes_bundle_readiness_identity() {
+        let config = ClientConfig {
+            hostname: Some("mac".to_string()),
+            switch_target: Some(SwitchHost::Mac),
+            ..ClientConfig::default()
+        };
+        let state = ClientState {
+            active: true,
+            alive: true,
+            keyboard_ready: true,
+            pointer_ready: true,
+            peer_session_epoch: 17,
+            peer_commit: Some(*b"4425c578"),
+            ..ClientState::default()
+        };
+
+        let status = ClientStatus::from_client(3, config, state);
+        let json = serde_json::to_value(status).unwrap();
+        assert_eq!(json["id"], 3);
+        assert_eq!(json["switch_target"], "mac");
+        assert_eq!(json["alive"], true);
+        assert_eq!(json["keyboard_ready"], true);
+        assert_eq!(json["pointer_ready"], true);
+        assert_eq!(json["peer_session_epoch"], 17);
+        assert_eq!(json["peer_commit"], "4425c578");
+    }
 }
