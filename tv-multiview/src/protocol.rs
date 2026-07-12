@@ -617,10 +617,14 @@ pub fn apply(
             if input.is_some() {
                 next.observed_input = input;
             }
-            let expected_remote = next.active_session.as_ref().map(|session| session.target);
-            if expected_remote.is_some()
+            let expected_target = next
+                .active_request
+                .as_ref()
+                .map(|request| request.target)
+                .or_else(|| next.active_session.as_ref().map(|session| session.target));
+            if expected_target.is_some()
                 && (mode != TvMode::Fullscreen
-                    || input.is_some_and(|observed| Some(observed) != expected_remote))
+                    || input.is_some_and(|observed| Some(observed) != expected_target))
             {
                 begin_fallback(
                     &mut next,
@@ -1246,6 +1250,32 @@ mod tests {
     }
 
     #[test]
+    fn wrong_or_missing_target_signal_cannot_issue_grant() {
+        let state = ready_peer(&synchronized(), Host::Mac, 11);
+        let switching = create_mac(&state).unwrap().next;
+        let switch_epoch = switching.switch_epoch;
+        let failed = apply(
+            &switching,
+            Event::Observation {
+                switch_epoch,
+                mode: TvMode::Fullscreen,
+                input: Some(Host::Mac),
+                signals: signals(Host::Linux),
+            },
+            20,
+            TIMING,
+        )
+        .unwrap();
+
+        assert_eq!(failed.next.keyboard_owner, Host::Linux);
+        assert!(failed.next.active_request.is_none());
+        assert_eq!(
+            failed.next.fallback_reason.as_deref(),
+            Some("target_observation_failed")
+        );
+    }
+
+    #[test]
     fn duplicate_command_ack_does_not_queue_second_observation() {
         let state = ready_peer(&synchronized(), Host::Mac, 11);
         let switching = create_mac(&state).unwrap().next;
@@ -1563,6 +1593,37 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_current_commit_is_idempotent_and_stale_identity_is_rejected() {
+        let remote = remote_owned();
+        let committed = remote.request_history.back().unwrap();
+        let grant = committed.grant.as_ref().unwrap();
+        let event = Event::Commit {
+            request_id: committed.request_id.clone(),
+            request_epoch: committed.request_epoch,
+            grant_epoch: grant.grant_epoch,
+            lease_id: committed.lease.lease_id.clone(),
+            lease_epoch: committed.lease.lease_epoch,
+        };
+        let duplicate = apply(&remote, event, 40, TIMING).unwrap();
+        assert_eq!(duplicate.next, remote);
+        assert!(duplicate.effects.is_empty());
+
+        let stale = apply(
+            &remote,
+            Event::Commit {
+                request_id: committed.request_id.clone(),
+                request_epoch: committed.request_epoch,
+                grant_epoch: grant.grant_epoch + 1,
+                lease_id: committed.lease.lease_id.clone(),
+                lease_epoch: committed.lease.lease_epoch,
+            },
+            40,
+            TIMING,
+        );
+        assert_eq!(stale.unwrap_err(), ProtocolError::StaleIdentity);
+    }
+
+    #[test]
     fn active_lease_expiry_releases_both_inputs_before_fallback_io() {
         let remote = remote_owned();
         let deadline = remote.active_session.as_ref().unwrap().renewed_until_ms;
@@ -1676,6 +1737,75 @@ mod tests {
             changed.next.fallback_reason.as_deref(),
             Some("unexpected_tv_subscription")
         );
+    }
+
+    #[test]
+    fn unexpected_subscription_while_grant_pending_revokes_grant() {
+        let state = ready_peer(&synchronized(), Host::Mac, 11);
+        let switching = create_mac(&state).unwrap().next;
+        let switch_epoch = switching.switch_epoch;
+        let granted = apply(
+            &switching,
+            Event::Observation {
+                switch_epoch,
+                mode: TvMode::Fullscreen,
+                input: Some(Host::Mac),
+                signals: signals(Host::Mac),
+            },
+            20,
+            TIMING,
+        )
+        .unwrap()
+        .next;
+        assert_eq!(granted.phase, ProtocolPhase::GrantPending);
+
+        let changed = apply(
+            &granted,
+            Event::SubscriptionObserved {
+                mode: TvMode::Multiview,
+                input: None,
+            },
+            21,
+            TIMING,
+        )
+        .unwrap();
+        assert_eq!(changed.next.keyboard_owner, Host::Linux);
+        assert!(changed.next.active_request.is_none());
+        assert_eq!(
+            changed.next.fallback_reason.as_deref(),
+            Some("unexpected_tv_subscription")
+        );
+    }
+
+    #[test]
+    fn transport_disconnect_during_fallback_remains_local_and_deferred() {
+        let state = ready_peer(&synchronized(), Host::Mac, 11);
+        let switching = create_mac(&state).unwrap().next;
+        let fallback = apply(
+            &switching,
+            Event::CommandFailed {
+                switch_epoch: switching.switch_epoch,
+                reason: "switch failed".to_string(),
+            },
+            11,
+            TIMING,
+        )
+        .unwrap()
+        .next;
+        let disconnected = apply(
+            &fallback,
+            Event::TransportDisconnected {
+                reason: "socket closed".to_string(),
+            },
+            12,
+            TIMING,
+        )
+        .unwrap();
+
+        assert_eq!(disconnected.next.keyboard_owner, Host::Linux);
+        assert_eq!(disconnected.next.pointer_owner, Host::Linux);
+        assert_eq!(disconnected.next.phase, ProtocolPhase::FallbackDeferred);
+        assert!(disconnected.effects.is_empty());
     }
 
     #[test]

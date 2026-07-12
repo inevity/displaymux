@@ -620,9 +620,12 @@ mod tests {
         }
 
         async fn read_message(&mut self) -> Result<Message, SsapError> {
+            if matches!(self.incoming.front(), Some(ReadStep::Pending)) {
+                return pending().await;
+            }
             match self.incoming.pop_front() {
                 Some(ReadStep::Message(message)) => Ok(message),
-                Some(ReadStep::Pending) => pending().await,
+                Some(ReadStep::Pending) => unreachable!("pending step handled above"),
                 None => Err(SsapError::Closed),
             }
         }
@@ -665,6 +668,41 @@ windows = "HDMI_2"
         text(json!({"id": id, "type": "response", "payload": payload}))
     }
 
+    fn synchronized_messages() -> [Message; 5] {
+        [
+            text(json!({
+                "type": "registered",
+                "payload": {"client-key": "test-key"}
+            })),
+            response(
+                codec::MULTIVIEW_SUBSCRIPTION_ID,
+                json!({"subscribed": true}),
+            ),
+            response(
+                "request-1",
+                json!({
+                    "returnValue": true,
+                    "settings": {"multiViewStatus": "off"}
+                }),
+            ),
+            response(
+                "request-2",
+                json!({"returnValue": true, "appId": "com.webos.app.hdmi4"}),
+            ),
+            response(
+                "request-3",
+                json!({
+                    "returnValue": true,
+                    "devices": [
+                        {"id": "HDMI_2", "hdmiSignalExist": false},
+                        {"id": "HDMI_3", "hdmiSignalExist": false},
+                        {"id": "HDMI_4", "hdmiSignalExist": true}
+                    ]
+                }),
+            ),
+        ]
+    }
+
     async fn wait_until(mut condition: impl FnMut() -> bool) {
         tokio::time::timeout(Duration::from_millis(100), async {
             while !condition() {
@@ -705,38 +743,7 @@ windows = "HDMI_2"
         let config = test_config();
         let (coordinator, mut effects, coordinator_task) =
             coordinator::spawn(ProtocolState::new(Host::Linux, 32), timing(&config), 8, 4);
-        let mut socket = ScriptedSocket::new([
-            text(json!({
-                "type": "registered",
-                "payload": {"client-key": "test-key"}
-            })),
-            response(
-                codec::MULTIVIEW_SUBSCRIPTION_ID,
-                json!({"subscribed": true}),
-            ),
-            response(
-                "request-1",
-                json!({
-                    "returnValue": true,
-                    "settings": {"multiViewStatus": "off"}
-                }),
-            ),
-            response(
-                "request-2",
-                json!({"returnValue": true, "appId": "com.webos.app.hdmi4"}),
-            ),
-            response(
-                "request-3",
-                json!({
-                    "returnValue": true,
-                    "devices": [
-                        {"id": "HDMI_2", "hdmiSignalExist": false},
-                        {"id": "HDMI_3", "hdmiSignalExist": false},
-                        {"id": "HDMI_4", "hdmiSignalExist": true}
-                    ]
-                }),
-            ),
-        ]);
+        let mut socket = ScriptedSocket::new(synchronized_messages());
         let mut backoff = ReconnectBackoff::new(1_000, 60_000);
         assert_eq!(backoff.failed(), (1_000, 1));
         let result = run_connected_session(
@@ -838,6 +845,43 @@ windows = "HDMI_2"
 
         let result = wait_for_id(&mut socket, "request-1", 1, &coordinator).await;
         assert!(matches!(result, Err(SsapError::Timeout("response"))));
+        coordinator_task.abort();
+    }
+
+    #[tokio::test]
+    async fn keepalive_timeout_terminates_silent_synchronized_session() {
+        let mut config = test_config();
+        config.timeouts.keepalive_ms = 1;
+        config.timeouts.keepalive_timeout_ms = 2;
+        let (coordinator, mut effects, coordinator_task) =
+            coordinator::spawn(ProtocolState::new(Host::Linux, 32), timing(&config), 8, 4);
+        let mut incoming: VecDeque<_> = synchronized_messages()
+            .into_iter()
+            .map(ReadStep::Message)
+            .collect();
+        incoming.push_back(ReadStep::Pending);
+        let mut socket = ScriptedSocket {
+            incoming,
+            sent: Vec::new(),
+        };
+        let mut backoff = ReconnectBackoff::new(1_000, 60_000);
+
+        let result = run_connected_session(
+            &mut socket,
+            &config,
+            "test-key",
+            &coordinator,
+            &mut effects,
+            &mut backoff,
+            &RuntimeMetrics::default(),
+        )
+        .await;
+
+        assert!(matches!(result, Err(SsapError::Timeout("keepalive"))));
+        assert!(socket
+            .sent
+            .iter()
+            .any(|message| matches!(message, Message::Ping(_))));
         coordinator_task.abort();
     }
 }
