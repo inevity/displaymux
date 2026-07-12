@@ -728,25 +728,15 @@ pub fn apply(
                     .phase_deadline_ms
                     .is_some_and(|deadline| deadline <= now_ms)
             {
-                begin_fallback(
-                    &mut next,
-                    &mut effects,
-                    now_ms,
-                    timing,
-                    "observation_timeout",
-                );
+                let reason = verification_timeout_reason(&next);
+                begin_fallback(&mut next, &mut effects, now_ms, timing, reason);
             } else if next.phase == ProtocolPhase::Verifying
                 && next
                     .phase_deadline_ms
                     .is_some_and(|deadline| deadline <= now_ms)
             {
-                begin_fallback(
-                    &mut next,
-                    &mut effects,
-                    now_ms,
-                    timing,
-                    "observation_timeout",
-                );
+                let reason = verification_timeout_reason(&next);
+                begin_fallback(&mut next, &mut effects, now_ms, timing, reason);
             } else if (matches!(
                 next.phase,
                 ProtocolPhase::FallbackCommandPending | ProtocolPhase::FallbackVerifying
@@ -954,6 +944,43 @@ fn target_display_verified(state: &ProtocolState, target: Host, switch_epoch: u6
             .input_signal
             .get(&target)
             .is_some_and(|signal| signal.present && signal.switch_epoch == switch_epoch)
+}
+
+fn target_verification_failure_reason(
+    state: &ProtocolState,
+    target: Host,
+    switch_epoch: u64,
+) -> &'static str {
+    if state.tv_mode != TvMode::Fullscreen {
+        "target_not_fullscreen"
+    } else if state.observed_input != Some(target) {
+        "target_input_not_observed"
+    } else {
+        match state.input_signal.get(&target) {
+            Some(signal) if signal.switch_epoch == switch_epoch && !signal.present => {
+                "target_signal_absent"
+            }
+            Some(signal) if signal.switch_epoch != switch_epoch => "target_signal_stale",
+            _ => "target_signal_not_observed",
+        }
+    }
+}
+
+fn verification_timeout_reason(state: &ProtocolState) -> &'static str {
+    if state.phase != ProtocolPhase::Verifying {
+        return "observation_timeout";
+    }
+    state
+        .active_request
+        .as_ref()
+        .map(|request| {
+            target_verification_failure_reason(
+                state,
+                request.target,
+                request.switch_epoch.unwrap_or(state.switch_epoch),
+            )
+        })
+        .unwrap_or("target_verification_timeout")
 }
 
 fn server_display_verified(state: &ProtocolState, switch_epoch: u64) -> bool {
@@ -1393,6 +1420,12 @@ mod tests {
         assert_eq!(retry.effects, vec![Effect::Observe { switch_epoch }]);
         assert_eq!(retry.next.phase_deadline_ms, deadline);
         assert_eq!(retry.next.observation_in_flight, Some(switch_epoch));
+
+        let timed_out = apply(&retry.next, Event::Tick, deadline.unwrap(), TIMING).unwrap();
+        assert_eq!(
+            timed_out.next.fallback_reason.as_deref(),
+            Some("target_signal_absent")
+        );
     }
 
     #[test]
@@ -1425,8 +1458,43 @@ mod tests {
         assert_eq!(timed_out.next.pointer_owner, Host::Linux);
         assert_eq!(
             timed_out.next.fallback_reason.as_deref(),
-            Some("observation_timeout")
+            Some("target_input_not_observed")
         );
+    }
+
+    #[test]
+    fn target_signal_absence_is_reported_at_verification_deadline() {
+        let state = ready_peer(&synchronized(), Host::Mac, 11);
+        let switching = create_mac(&state).unwrap().next;
+        let verifying = acknowledge_switch(&switching, 11);
+        let pending = apply(
+            &verifying,
+            Event::Observation {
+                switch_epoch: verifying.switch_epoch,
+                mode: TvMode::Fullscreen,
+                input: Some(Host::Mac),
+                signals: signals(Host::Linux),
+            },
+            20,
+            TIMING,
+        )
+        .unwrap()
+        .next;
+
+        let timed_out = apply(
+            &pending,
+            Event::Tick,
+            pending.phase_deadline_ms.unwrap(),
+            TIMING,
+        )
+        .unwrap();
+
+        assert_eq!(
+            timed_out.next.fallback_reason.as_deref(),
+            Some("target_signal_absent")
+        );
+        assert_eq!(timed_out.next.keyboard_owner, Host::Linux);
+        assert_eq!(timed_out.next.pointer_owner, Host::Linux);
     }
 
     #[test]
