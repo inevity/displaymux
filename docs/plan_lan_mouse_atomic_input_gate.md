@@ -4,9 +4,10 @@ Parent: [Main fenced switch implementation plan](plan_main_fullscreen_multiview_
 
 Status (2026-07-12): source implementation, automated tests, and native build
 automation are complete at lan-mouse commit
-`952a5e9f1d5b2d476f44baa951bdf207080c9898`; the protocol revision passed the
-three-host cache matrix. Installation and active-backend acceptance remain
-blocked on explicit coordinated-cutover authorization.
+`c5d7bb4a467ba91d085346dbc85ce7445e400217`. Its Linux no-GTK checks pass; the
+last three-host cache matrix predates this revision. Current macOS/Windows
+native builds, installation, and active-backend acceptance remain blocked on
+explicit coordinated-host authorization.
 
 ## Objective
 
@@ -14,22 +15,23 @@ Change lan-mouse from a fire-and-forget TV hook producer into the authority that
 
 ## Implementation Evidence
 
-- No-GTK workspace checks and all 38 tests pass: 4 input-capture queue tests,
-  27 core capture/readiness/lease/release tests, 2 bounded-logging tests, 2 CLI
-  status tests, and 3 protocol wire tests. Strict clippy passes for the changed
-  CLI crate. The Linux production-feature check and pre-CLI full test set also
-  pass.
-- The first crossing releases immediately; only a targeted, current,
-  single-use permit can enable the second crossing. Commit validates request,
-  lease, grant, handle, peer session, and deadline as one bundle.
+- No-GTK workspace checks and all 42 tests pass: 4 input-capture queue tests,
+  31 core capture/readiness/lease/release/controller tests, 2 bounded-logging
+  tests, 2 CLI status tests, and 3 protocol wire tests. The Linux production
+  feature check also passes.
+- The first crossing completes backend release before publishing its candidate.
+  A targeted, current, single-use permit then requires a service commit reply
+  before the second crossing can emit `Enter`. Commit validates request, lease,
+  grant, handle, peer session, and deadline as one bundle.
 - Peer readiness names keyboard and pointer capability plus process session
   epoch. Unknown, stale, partial, disconnected, or commit-mismatched peers fail
   closed.
 - Native cache-only release builds succeeded on Linux, macOS, and Windows for
   protocol revision `4425c57` from one exact git bundle and lockfile vendor
-  archive. Their SHA-256 values are recorded in the main plan. Revision
-  `952a5e9` adds only JSON CLI inspection; its macOS full tests passed, and the
-  user stopped further repeated cache-build validation as out of scope.
+  archive. Their SHA-256 values are recorded in the main plan. Current revision
+  `c5d7bb4` adds later status/revision fencing plus release-complete and commit
+  authorization ordering fixes; current macOS/Windows native builds are still
+  required before cutover.
 - lan-mouse log production is non-blocking and bounded to 1,024 records of
   16 KiB, and reports accumulated drops when its persistent sink recovers.
 
@@ -87,9 +89,10 @@ Invariant checks:
 
 ## L0: Capture-Gate Feasibility
 
-Status: conservative two-crossing implementation and automated permit-order
-tests are complete. Manual local click/motion/scroll/key behavior on active
-native backends remains blocked until coordinated live deployment.
+Status: conservative two-crossing implementation, release-before-notify,
+commit-decision, dropped-decision, and permit-order tests are complete. Manual
+local click/motion/scroll/key behavior on active native backends remains blocked
+until coordinated live deployment.
 
 Use Main Plan Gate 0 before broad implementation.
 
@@ -170,7 +173,9 @@ Use one monotonic timer owner rather than one task per lease. Lease IDs must be 
 ## L3: Native Switch Client
 
 Status: completed. The native bounded client owns create/poll/commit/cancel and
-renewal lifecycles; shell/curl authorization is absent.
+renewal lifecycles; a local HTTP lifecycle test covers every operation, ambient
+proxies are bypassed for the controller boundary, and shell/curl authorization
+is absent.
 
 Replace shell-command authorization with one bounded native client owned by the service:
 
@@ -189,8 +194,9 @@ For return to `SERVER_HOST`, release remote capture first even if the TV daemon 
 
 ## L4: Capture State-Machine Integration
 
-Status: completed with target/epoch permits, immediate first-crossing release,
-single-use second-crossing commit, and delayed-command rejection tests.
+Status: completed with target/epoch permits, release completion before
+controller preparation, an explicit second-crossing commit authorization
+reply, single-use commit, and delayed-command rejection tests.
 
 Refactor event ownership before adding network behavior:
 
@@ -223,8 +229,9 @@ acceptance cases.
 
 Status: generated fenced configuration, exact-revision native build/test
 automation, bounded macOS/Windows log wrappers, and host-specific service
-automation are complete. Installation, service restart, and peer-reported live
-readiness verification remain blocked pending explicit cutover authorization.
+automation are complete. The current pin still requires macOS/Windows native
+builds; installation, service restart, and peer-reported live readiness
+verification remain blocked pending explicit cutover authorization.
 
 - Replace generated `enter_hook = "curl ..."` authorization with explicit switch-controller configuration understood by the patched lan-mouse build.
 - Remove shell-hook authorization entirely when fenced capture is enabled; no compatibility option is implemented.

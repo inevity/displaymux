@@ -2,17 +2,16 @@
 
 ## Plan Control
 
-- Status: implementation, automated verification, native build automation, and
-  the protocol-revision three-host cache matrix are complete as of 2026-07-12.
-  Production cutover and live acceptance remain blocked pending explicit
-  authorization for the coordinated install/restart on Linux, macOS, and
-  Windows.
+- Status: implementation, automated verification, and native build automation
+  are complete as of 2026-07-12. Native builds of the current pinned revision,
+  production cutover, and live acceptance remain blocked pending explicit
+  authorization for coordinated work on Linux, macOS, and Windows.
 - Design baseline: `fullscreenmultiviewswitchdesign.md` originated at commit
   `319b762`; its living prose and model now describe the implemented protocol.
-- Rust daemon implementation: parent-repository commit `6ec253d` plus its
+- Rust daemon implementation: parent-repository commit `2e5c0b0` plus its
   prerequisite fenced-protocol commits.
 - lan-mouse implementation: clean `../../lan-mouse` commit
-  `952a5e9f1d5b2d476f44baa951bdf207080c9898`.
+  `c5d7bb4a467ba91d085346dbc85ce7445e400217`.
 - Controlling objective: implement the approved design without allowing keyboard and pointer ownership to split, and without claiming server-host fallback before the TV state is freshly observed.
 - Compatibility policy: there is no legacy mutation API, compatibility flag,
   fire-and-forget hook authorization, or mixed-version operation. Old peers and
@@ -26,14 +25,16 @@ Linked child plans:
 
 ## Implementation Evidence (2026-07-12)
 
-- tv-multiview `cargo check --frozen` and all 36 tests pass. The suite covers
-  atomic ownership, stale/duplicate completion, readiness loss, disconnect
-  release, bounded queues/logging, typed/authenticated HTTP, SSAP codecs, and
-  reconnect-backoff reset.
-- lan-mouse no-GTK workspace checks and all 38 tests pass (4 input-capture,
-  27 core, 2 logging, 2 CLI-status, and 3 protocol). Strict clippy passes for
-  the changed CLI crate. The Linux production-feature check and full pre-CLI
-  protocol test set also passed.
+- tv-multiview `cargo check --frozen`, all 58 tests, and strict all-target
+  clippy pass. Coverage includes deadline precedence, lease/signal failure,
+  MultiView, typed HTTP conflicts and malformed input, scripted SSAP
+  registration/subscription/reconnect/resync, grant-pending callback and
+  stale-response handling, ping/keepalive timeout, atomic ownership, bounded
+  queues, and bounded logging.
+- lan-mouse no-GTK workspace checks and all 42 tests pass (4 input-capture,
+  31 core, 2 logging, 2 CLI-status, and 3 protocol). The Linux production
+  feature check passes. Normal focused clippy passes with the same five
+  pre-existing warnings recorded before this fix.
 - The last complete three-host cache-only release matrix used source
   `4425c5789b04025720dce234887e6a2d30919258` and Cargo.lock SHA-256
   `d91c91ed08149293a08eb958281c174a5596788f5160e39de751babd52767c93`:
@@ -41,11 +42,12 @@ Linked child plans:
   macOS Mach-O SHA-256 `6f8c734c0563b50245f339793c97180a04c2dc6039294bac29f96ecb29976bb7`,
   and Windows PE SHA-256 `1B603699A6907FC646362FCB60B7084BF4C0102B369F56F84EA7C6AFB1FC2D6E`.
 - Linux used `/usr/bin/rustc 1.96.0`; macOS and Windows used native rustup
-  `rustc 1.97.0`. The current `952a5e9` revision adds only the machine-readable
-  CLI status surface and lock dependency declarations; its no-GTK checks and
-  tests pass, and its macOS full test run passed before the user stopped further
-  deployment-focused cache builds. No cache validation installed a binary or
-  restarted a service.
+  `rustc 1.97.0`. That matrix predates the current `c5d7bb4` revision, which now
+  orders backend release before controller preparation, requires a current
+  service commit decision before `Enter`, bypasses ambient HTTP proxies for the
+  local controller, and adds a native HTTP lifecycle test. Its Linux no-GTK
+  checks and tests pass; current macOS and Windows native builds have not run.
+  No cache validation installed a binary or restarted a service.
 - Ansible syntax/task expansion and idempotent template rendering pass. Rendered
   TOML, plist, shell, PKGBUILD, systemd, and Windows PowerShell artifacts pass
   their available native parsers; bounded macOS and Windows rotation wrappers
@@ -86,9 +88,9 @@ Plan ==
 
 No later action may start by assuming an earlier gate passed. Each phase has an explicit verification and rollback state.
 
-## Current InitState Evidence
+## Historical InitState Evidence
 
-The current code is not a partial implementation of the new protocol; it implements an older protocol with different safety semantics.
+The pre-refactor code implemented an older protocol with different safety semantics. This table is retained as the historical `InitState`, not as a description of current source.
 
 | Area | Current evidence | Consequence |
 |---|---|---|
@@ -210,10 +212,11 @@ Exit gate: counterexample tests cover stale observations, stale grants, readines
 
 ### Phase 3: Persistent SSAP Actor
 
-Status: implemented and covered for codec parsing, bounded coordinator/effect
-queues, reconnect backoff reset, and single-owner state transitions. The full
-live disconnect/resubscribe/resynchronization matrix remains a Phase 7 live
-acceptance item.
+Status: implemented and covered for scripted registration, subscription,
+initial resynchronization, callback-before-response, delayed stale response,
+ping handling, response timeout, bounded coordinator/effect queues, reconnect
+backoff reset, and single-owner state transitions. Physical-TV reconnect and
+resubscription remain Phase 7 live acceptance items.
 
 Owner: `plan_tv_multiview_daemon_refactor.md`.
 
@@ -227,9 +230,10 @@ Exit gate: scripted transport tests prove correlation, reconnect/resubscribe/res
 
 ### Phase 4: lan-mouse Capability, Lease, and Capture Gate
 
-Status: implemented and covered by protocol, lease, capture-permit, release,
-and native build tests. Manual active-backend input behavior remains blocked
-until the coordinated live cutover is authorized.
+Status: implemented and covered by protocol, lease, release-before-notify,
+second-crossing commit authorization, native controller lifecycle, capture
+permit, and Linux build tests. Manual active-backend input behavior remains
+blocked until the coordinated live cutover is authorized.
 
 Owner: `plan_lan_mouse_atomic_input_gate.md`.
 
@@ -258,11 +262,12 @@ Exit gate: black-box API tests prove status code, body schema, idempotency, stal
 
 ### Phase 6: Coordinated Deployment Cutover
 
-Status: deployment automation is complete and the protocol revision passed the
-full three-host cache build. Further repeated cache validation was explicitly
-stopped as out of scope. The steps below that install artifacts, replace runtime
+Status: deployment automation is complete. The last full three-host cache build
+passed for historical revision `4425c57`; the current pinned `c5d7bb4` revision
+has passed Linux checks but not current macOS/Windows native builds. Those
+builds and the steps below that install artifacts, replace runtime
 configuration, and restart three hosts remain blocked pending explicit
-authorization for that disruptive action.
+authorization.
 
 Owner: main plan.
 
@@ -288,10 +293,11 @@ Never deploy a daemon that can issue grants to the old fire-and-forget hook clie
 
 ### Phase 7: Verification and Legacy Removal
 
-Status: automated Rust tests, native builds, static Ansible/template checks,
-bounded-log tests, TLA model checking, and legacy source removal are complete.
-The physical failure matrix, persistent-log reconstruction from live switches,
-and p50/p95/p99 production timing measurements are blocked on Phase 6 cutover.
+Status: automated Rust tests, static Ansible/template checks, bounded-log tests,
+TLA model checking, and legacy source removal are complete. Native builds of
+the current pin, the physical failure matrix, persistent-log reconstruction
+from live switches, and p50/p95/p99 production timing measurements remain
+blocked on Phase 6.
 
 - Run `cargo check` after every Rust change and focused `cargo test` after every logic change in each affected repository.
 - Run full tests for `tv-multiview`, lan-mouse core, protocol, IPC, capture, and emulation before cutover.
@@ -349,8 +355,8 @@ The objective is complete only when:
 - deployment and rollback are repeatable across Linux, macOS, and Windows;
 - the obsolete plans are marked historical or removed in a separate reviewed cleanup, and no compatibility path remains in production code.
 
-Current completion assessment: implementation criteria are satisfied by source
-and automated evidence, but the objective is not production-complete. The live
-cutover, native active-backend behavior, physical TV failure matrix, forensic
-log reconstruction, and production percentile measurements remain blocked on
-explicit approval to install and restart the coordinated three-host system.
+Current completion assessment: source-level implementation and automated test
+criteria are satisfied, but the objective is not production-complete. Exact-pin
+macOS/Windows builds, the live cutover, native active-backend behavior, physical
+TV failure matrix, forensic log reconstruction, and production percentile
+measurements remain blocked on explicit coordinated-host authorization.

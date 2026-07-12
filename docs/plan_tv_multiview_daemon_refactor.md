@@ -3,7 +3,7 @@
 Parent: [Main fenced switch implementation plan](plan_main_fullscreen_multiview_switch_implementation.md)
 
 Status (2026-07-12): source implementation and automated verification are
-complete through parent commit `6ec253d`. Live TV reconnect, signal-loss, and
+complete through parent commit `2e5c0b0`. Live TV reconnect, signal-loss, and
 latency acceptance remain blocked on the coordinated deployment authorization
 recorded in the main plan.
 
@@ -13,12 +13,15 @@ Transform the current four-module Rust daemon into a bounded, testable protocol 
 
 ## Implementation Evidence
 
-- `cargo check --frozen` and all 36 tv-multiview tests pass.
+- `cargo check --frozen`, all 58 tv-multiview tests, and strict all-target
+  clippy pass.
 - One coherent coordinator owns transitions and publishes immutable snapshots;
   ordinary and safety command/effect lanes are independently bounded.
 - The persistent SSAP actor owns registration, subscription, request
-  correlation, observations, and reconnect backoff. Successful full
-  synchronization resets the consecutive reconnect state.
+  correlation, observations, and reconnect backoff. Scripted sockets verify
+  registration/subscription/reconnect/resync, grant-pending callback and stale
+  response ordering, ping/keepalive timeout, and successful reconnect-state
+  reset.
 - Typed authenticated create/poll/commit/cancel/renew/readiness/MultiView APIs,
   `/status`, `/health`, and `/ready` are implemented; legacy mutating GET routes
   are absent.
@@ -177,10 +180,11 @@ Commit boundary: actor runs against fake effect adapters.
 
 ## D4: Persistent SSAP Transport
 
-Status: implemented and verified for codec parsing, key decoding, backoff reset,
-and bounded coordinator integration. The physical TV
-disconnect/resubscribe/resynchronization sequences remain blocked live
-acceptance cases.
+Status: implemented and verified for codec/key parsing, scripted registration,
+subscription, disconnect/reconnect/resubscribe and resync,
+callback-before-response, stale response discard, ping/timeout handling,
+backoff reset, and bounded coordinator integration. Physical-TV timing remains
+a blocked live acceptance case.
 
 Before dependency changes, verify the current LG client-key schema and the authoritative SSAP URI/payloads. Add only necessary dependencies to `Cargo.toml`.
 
@@ -226,7 +230,9 @@ Commit boundaries:
 ## D5: Fenced HTTP API
 
 Status: completed and covered by authenticated black-box route tests, including
-typed create/renew/status behavior and absence of legacy GET mutation.
+typed create/poll/commit/cancel/renew/readiness/MultiView behavior, malformed
+input, idempotency, busy/stale conflicts, status, and absence of legacy GET
+mutation.
 
 Implement typed serde request/response enums. Do not return mode strings as authorization.
 
