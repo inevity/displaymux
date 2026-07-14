@@ -42,6 +42,8 @@ pub type CaptureHandle = u64;
 pub enum CaptureEvent {
     /// capture on this capture handle is now active
     Begin,
+    /// the local pointer moved back inside after a released edge entry
+    EdgeRetreated,
     /// input event coming from capture handle
     Input(Event),
 }
@@ -50,6 +52,7 @@ impl Display for CaptureEvent {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             CaptureEvent::Begin => write!(f, "begin capture"),
+            CaptureEvent::EdgeRetreated => write!(f, "edge retreated"),
             CaptureEvent::Input(e) => write!(f, "{e}"),
         }
     }
@@ -177,9 +180,9 @@ impl InputCapture {
     /// Resume capture immediately when the backend can prove the pointer is
     /// still focused on the same edge. Backends without that proof keep the
     /// grant armed for the next physical crossing.
-    pub fn resume_if_focused(&mut self, id: CaptureHandle) -> Result<bool, CaptureError> {
+    pub async fn resume_if_focused(&mut self, id: CaptureHandle) -> Result<bool, CaptureError> {
         let pos = *self.id_map.get(&id).expect("no position for this handle");
-        self.capture.resume_if_focused(pos)
+        self.capture.resume_if_focused(pos).await
     }
 
     /// Drain and return every key the capture has forwarded as
@@ -300,9 +303,7 @@ trait Capture: Stream<Item = Result<(Position, CaptureEvent), CaptureError>> + U
 
     /// Resume a released capture only when the backend still has authoritative
     /// focus on the requested edge.
-    fn resume_if_focused(&mut self, _pos: Position) -> Result<bool, CaptureError> {
-        Ok(false)
-    }
+    async fn resume_if_focused(&mut self, pos: Position) -> Result<bool, CaptureError>;
 
     /// destroy the input capture
     async fn terminate(&mut self) -> Result<(), CaptureError>;

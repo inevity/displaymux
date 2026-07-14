@@ -34,10 +34,13 @@ use input_event::{
 use super::{CaptureEvent, Position, display_util};
 use crate::event_queue::{EventQueue, PushOutcome};
 
+const EDGE_REARM_DISTANCE: i32 = 3;
+
 pub(crate) struct EventThread {
     event_queue: Arc<EventQueue>,
     request_buffer: Arc<Mutex<Vec<ClientUpdate>>>,
     release_waiters: Arc<Mutex<Vec<oneshot::Sender<()>>>>,
+    resume_requests: Arc<Mutex<Vec<(Position, oneshot::Sender<bool>)>>>,
     thread: Option<thread::JoinHandle<()>>,
     thread_id: u32,
 }
@@ -46,15 +49,18 @@ impl EventThread {
     pub(crate) fn new(event_queue: Arc<EventQueue>) -> Self {
         let request_buffer = Default::default();
         let release_waiters = Default::default();
+        let resume_requests = Default::default();
         let (thread, thread_id) = start(
             event_queue.clone(),
             Arc::clone(&request_buffer),
             Arc::clone(&release_waiters),
+            Arc::clone(&resume_requests),
         );
         Self {
             event_queue,
             request_buffer,
             release_waiters,
+            resume_requests,
             thread: Some(thread),
             thread_id,
         }
@@ -65,6 +71,16 @@ impl EventThread {
         self.release_waiters.lock().unwrap().push(completion_tx);
         self.signal(RequestType::Release);
         let _ = completion_rx.await;
+    }
+
+    pub(crate) async fn resume_if_focused(&self, pos: Position) -> bool {
+        let (completion_tx, completion_rx) = oneshot::channel();
+        self.resume_requests
+            .lock()
+            .unwrap()
+            .push((pos, completion_tx));
+        self.signal(RequestType::ResumeIfFocused);
+        completion_rx.await.unwrap_or(false)
     }
 
     pub(crate) fn create(&self, pos: Position) {
@@ -104,7 +120,8 @@ impl Drop for EventThread {
 enum RequestType {
     ClientUpdate = 0,
     Release = 1,
-    Exit = 2,
+    ResumeIfFocused = 2,
+    Exit = 3,
 }
 
 enum ClientUpdate {
@@ -121,6 +138,8 @@ thread_local! {
     static CLIENTS: RefCell<HashSet<Position>> = RefCell::new(HashSet::new());
     /// currently active client
     static ACTIVE_CLIENT: Cell<Option<Position>> = const { Cell::new(None) };
+    /// released edge blocked until the pointer moves inward again
+    static REARM_CLIENT: Cell<Option<Position>> = const { Cell::new(None) };
     /// input event queue
     static EVENT_QUEUE: RefCell<Option<Arc<EventQueue>>> = const { RefCell::new(None) };
     /// position of barrier entry
@@ -147,13 +166,21 @@ fn start(
     event_queue: Arc<EventQueue>,
     request_buffer: Arc<Mutex<Vec<ClientUpdate>>>,
     release_waiters: Arc<Mutex<Vec<oneshot::Sender<()>>>>,
+    resume_requests: Arc<Mutex<Vec<(Position, oneshot::Sender<bool>)>>>,
 ) -> (thread::JoinHandle<()>, u32) {
     /* condition variable to wait for thead id */
     let thread_id = Arc::new((Condvar::new(), Mutex::new(None)));
     let thread_id_ = Arc::clone(&thread_id);
 
-    let msg_thread =
-        thread::spawn(|| start_routine(thread_id_, event_queue, request_buffer, release_waiters));
+    let msg_thread = thread::spawn(|| {
+        start_routine(
+            thread_id_,
+            event_queue,
+            request_buffer,
+            release_waiters,
+            resume_requests,
+        )
+    });
 
     /* wait for thread to set its id */
     let (cond, thread_id) = &*thread_id;
@@ -169,6 +196,7 @@ fn start_routine(
     event_queue: Arc<EventQueue>,
     request_buffer: Arc<Mutex<Vec<ClientUpdate>>>,
     release_waiters: Arc<Mutex<Vec<oneshot::Sender<()>>>>,
+    resume_requests: Arc<Mutex<Vec<(Position, oneshot::Sender<bool>)>>>,
 ) {
     EVENT_QUEUE.replace(Some(event_queue));
     /* communicate thread id */
@@ -239,7 +267,9 @@ fn start_routine(
             match msg.wParam.0 {
                 x if x == RequestType::Exit as usize => break,
                 x if x == RequestType::Release as usize => {
-                    ACTIVE_CLIENT.take();
+                    if let Some(pos) = ACTIVE_CLIENT.take() {
+                        REARM_CLIENT.replace(Some(pos));
+                    }
                     let waiters = release_waiters
                         .lock()
                         .unwrap()
@@ -247,6 +277,23 @@ fn start_routine(
                         .collect::<Vec<_>>();
                     for waiter in waiters {
                         let _ = waiter.send(());
+                    }
+                }
+                x if x == RequestType::ResumeIfFocused as usize => {
+                    let requests = resume_requests
+                        .lock()
+                        .unwrap()
+                        .drain(..)
+                        .collect::<Vec<_>>();
+                    for (pos, completion) in requests {
+                        let resumed = ACTIVE_CLIENT.get().is_none()
+                            && REARM_CLIENT.get() == Some(pos)
+                            && send_event(pos, CaptureEvent::Begin) == PushOutcome::Queued;
+                        if resumed {
+                            ACTIVE_CLIENT.replace(Some(pos));
+                            REARM_CLIENT.take();
+                        }
+                        let _ = completion.send(resumed);
                     }
                 }
                 x if x == RequestType::ClientUpdate as usize => {
@@ -292,6 +339,15 @@ fn check_client_activation(wparam: WPARAM, lparam: LPARAM) -> bool {
         return ret;
     }
 
+    if let Some(pos) = REARM_CLIENT.get() {
+        if edge_retreat_observed(pos, ENTRY_POINT.get(), prev_pos, curr_pos)
+            && send_event(pos, CaptureEvent::EdgeRetreated) == PushOutcome::Queued
+        {
+            REARM_CLIENT.take();
+        }
+        return false;
+    }
+
     /* check if a client was activated */
     let entered = DISPLAYS.with_borrow_mut(|(displays, generation)| {
         update_display_regions(displays, generation);
@@ -323,6 +379,20 @@ fn check_client_activation(wparam: WPARAM, lparam: LPARAM) -> bool {
     }
 
     ret
+}
+
+fn edge_retreat_observed(
+    position: Position,
+    entry: (i32, i32),
+    previous: (i32, i32),
+    current: (i32, i32),
+) -> bool {
+    match position {
+        Position::Left => current.0 >= entry.0 + EDGE_REARM_DISTANCE && current.0 > previous.0,
+        Position::Right => current.0 <= entry.0 - EDGE_REARM_DISTANCE && current.0 < previous.0,
+        Position::Top => current.1 >= entry.1 + EDGE_REARM_DISTANCE && current.1 > previous.1,
+        Position::Bottom => current.1 <= entry.1 - EDGE_REARM_DISTANCE && current.1 < previous.1,
+    }
 }
 
 unsafe extern "system" fn mouse_proc(ncode: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
@@ -469,6 +539,9 @@ fn update_clients(request: ClientUpdate) {
                     let _ = ACTIVE_CLIENT.take();
                 }
             }
+            if REARM_CLIENT.get() == Some(pos) {
+                REARM_CLIENT.take();
+            }
             CLIENTS.with_borrow_mut(|clients| clients.remove(&pos));
         }
     }
@@ -585,5 +658,34 @@ fn to_mouse_event(wparam: WPARAM, lparam: LPARAM) -> Option<PointerEvent> {
             log::warn!("unknown mouse event: {w:?}");
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn edge_rearm_requires_inward_motion_beyond_the_rearm_zone() {
+        let entry = (99, 50);
+
+        assert!(!edge_retreat_observed(
+            Position::Right,
+            entry,
+            (99, 50),
+            (98, 50),
+        ));
+        assert!(edge_retreat_observed(
+            Position::Right,
+            entry,
+            (98, 50),
+            (96, 50),
+        ));
+        assert!(!edge_retreat_observed(
+            Position::Right,
+            entry,
+            (95, 50),
+            (96, 50),
+        ));
     }
 }

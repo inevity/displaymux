@@ -34,6 +34,10 @@ impl Capture for WindowsInputCapture {
         Ok(())
     }
 
+    async fn resume_if_focused(&mut self, pos: Position) -> Result<bool, CaptureError> {
+        Ok(self.event_thread.resume_if_focused(pos).await)
+    }
+
     async fn terminate(&mut self) -> Result<(), CaptureError> {
         Ok(())
     }

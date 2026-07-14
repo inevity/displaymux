@@ -47,6 +47,8 @@ struct Bounds {
     ymax: f64,
 }
 
+const EDGE_REARM_DISTANCE: f64 = 3.0;
+
 fn covering_bounds(rectangles: impl IntoIterator<Item = (f64, f64, f64, f64)>) -> Option<Bounds> {
     let mut rectangles = rectangles.into_iter();
     let (xmin, ymin, width, height) = rectangles.next()?;
@@ -65,6 +67,21 @@ fn covering_bounds(rectangles: impl IntoIterator<Item = (f64, f64, f64, f64)>) -
     Some(bounds)
 }
 
+fn edge_retreat_observed(
+    bounds: &Bounds,
+    position: Position,
+    location: CGPoint,
+    relative_x: f64,
+    relative_y: f64,
+) -> bool {
+    match position {
+        Position::Left => relative_x > 0.0 && location.x >= bounds.xmin + EDGE_REARM_DISTANCE,
+        Position::Right => relative_x < 0.0 && location.x <= bounds.xmax - EDGE_REARM_DISTANCE,
+        Position::Top => relative_y > 0.0 && location.y >= bounds.ymin + EDGE_REARM_DISTANCE,
+        Position::Bottom => relative_y < 0.0 && location.y <= bounds.ymax - EDGE_REARM_DISTANCE,
+    }
+}
+
 #[derive(Debug)]
 struct InputCaptureState {
     /// active capture positions
@@ -73,6 +90,8 @@ struct InputCaptureState {
     current_pos: Option<Position>,
     /// position where the cursor was captured
     enter_position: Option<CGPoint>,
+    /// released edge waiting for authoritative inward pointer motion
+    rearm_pos: Option<Position>,
     /// bounds of the input capture area
     bounds: Bounds,
     /// current state of modifier keys
@@ -82,6 +101,7 @@ struct InputCaptureState {
 #[derive(Debug)]
 enum ProducerEvent {
     Release(oneshot::Sender<bool>),
+    ResumeIfFocused(Position, oneshot::Sender<bool>),
     Create(Position),
     Destroy(Position),
     Grab(Position),
@@ -95,6 +115,7 @@ impl InputCaptureState {
             active_clients: Lazy::new(HashSet::new),
             current_pos: None,
             enter_position: None,
+            rearm_pos: None,
             bounds: Bounds::default(),
             modifier_state: Default::default(),
         };
@@ -118,6 +139,13 @@ impl InputCaptureState {
             }
         }
         None
+    }
+
+    fn retreated_from_edge(&self, event: &CGEvent, position: Position) -> bool {
+        let location = event.location();
+        let relative_x = event.get_double_value_field(EventField::MOUSE_EVENT_DELTA_X);
+        let relative_y = event.get_double_value_field(EventField::MOUSE_EVENT_DELTA_Y);
+        edge_retreat_observed(&self.bounds, position, location, relative_x, relative_y)
     }
 
     // Get the max bounds of all displays
@@ -172,24 +200,53 @@ impl InputCaptureState {
     async fn handle_producer_event(
         &mut self,
         producer_event: ProducerEvent,
+        event_tx: &Sender<(Position, CaptureEvent)>,
     ) -> Result<(), CaptureError> {
         log::debug!("handling event: {producer_event:?}");
         match producer_event {
             ProducerEvent::Release(completion) => {
-                let result = if self.current_pos.is_some() {
+                let released_pos = self.current_pos;
+                let result = if released_pos.is_some() {
                     let result = self.show_cursor();
                     self.current_pos = None;
                     result
                 } else {
                     Ok(())
                 };
+                if result.is_ok() && released_pos.is_some() {
+                    self.rearm_pos = released_pos;
+                }
                 let _ = completion.send(result.is_ok());
+                result?;
+            }
+            ProducerEvent::ResumeIfFocused(pos, completion) => {
+                let result = if self.current_pos.is_none() && self.rearm_pos == Some(pos) {
+                    self.hide_cursor()?;
+                    self.current_pos = Some(pos);
+                    self.rearm_pos = None;
+                    match event_tx.try_send((pos, CaptureEvent::Begin)) {
+                        Ok(()) => Ok(true),
+                        Err(error) => {
+                            log::error!(
+                                "failed to queue resumed capture for {pos}: {error}; staying local"
+                            );
+                            self.show_cursor()?;
+                            self.current_pos = None;
+                            self.rearm_pos = Some(pos);
+                            Err(CaptureError::CriticalQueueOverflow)
+                        }
+                    }
+                } else {
+                    Ok(false)
+                };
+                let _ = completion.send(result.as_ref().copied().unwrap_or(false));
                 result?;
             }
             ProducerEvent::Grab(pos) => {
                 if self.current_pos.is_none() {
                     self.hide_cursor()?;
                     self.current_pos = Some(pos);
+                    self.rearm_pos = None;
                 }
             }
             ProducerEvent::Create(p) => {
@@ -203,6 +260,9 @@ impl InputCaptureState {
                     };
                 }
                 self.active_clients.remove(&p);
+                if self.rearm_pos == Some(p) {
+                    self.rearm_pos = None;
+                }
             }
             ProducerEvent::EventTapDisabled => {
                 // Tap death can happen mid-capture (TCC Accessibility
@@ -213,9 +273,11 @@ impl InputCaptureState {
                     self.show_cursor()?;
                     self.current_pos = None;
                 }
+                self.rearm_pos = None;
                 return Err(CaptureError::EventTapDisabled);
             }
             ProducerEvent::DisplayReconfigured => {
+                self.rearm_pos = None;
                 // The macOS display configuration changed — a monitor
                 // was plugged in/out, the resolution changed, the
                 // arrangement was rearranged, etc. Re-fetch the
@@ -549,8 +611,13 @@ fn create_event_tap<'a>(
                 state.reset_cursor().unwrap_or_else(|e| log::warn!("{e}"));
             }
         } else if matches!(event_type, CGEventType::MouseMoved) {
-            // Did we cross a barrier?
-            if let Some(new_pos) = state.crossed(cg_ev) {
+            if let Some(rearm_pos) = state.rearm_pos {
+                if state.retreated_from_edge(cg_ev, rearm_pos) {
+                    state.rearm_pos = None;
+                    let _ = event_tx.blocking_send((rearm_pos, CaptureEvent::EdgeRetreated));
+                }
+            } else if let Some(new_pos) = state.crossed(cg_ev) {
+                // Did we cross a barrier?
                 capture_position = Some(new_pos);
                 state
                     .start_capture(cg_ev, new_pos)
@@ -702,6 +769,7 @@ impl MacOSInputCapture {
 
         let state = Arc::new(Mutex::new(InputCaptureState::new()?));
         let (event_tx, event_rx) = mpsc::channel(32);
+        let producer_event_tx = event_tx.clone();
         let (notify_tx, mut notify_rx) = mpsc::unbounded_channel();
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
         let (tap_exit_tx, mut tap_exit_rx) = oneshot::channel();
@@ -734,7 +802,7 @@ impl MacOSInputCapture {
                             break;
                         };
                         let mut state = state.lock().await;
-                        state.handle_producer_event(producer_event).await.unwrap_or_else(|e| {
+                        state.handle_producer_event(producer_event, &producer_event_tx).await.unwrap_or_else(|e| {
                             log::error!("Failed to handle producer event: {e}");
                         })
                     }
@@ -821,6 +889,14 @@ impl Capture for MacOSInputCapture {
         }
     }
 
+    async fn resume_if_focused(&mut self, pos: Position) -> Result<bool, CaptureError> {
+        let (completion_tx, completion_rx) = oneshot::channel();
+        self.notify_tx
+            .send(ProducerEvent::ResumeIfFocused(pos, completion_tx))
+            .map_err(|_| CaptureError::EventTapDisabled)?;
+        Ok(completion_rx.await.unwrap_or(false))
+    }
+
     async fn terminate(&mut self) -> Result<(), CaptureError> {
         Ok(())
     }
@@ -900,6 +976,38 @@ mod tests {
         assert_eq!(current.ymin, -2160.0);
         assert_eq!(current.xmax, 1631.0);
         assert_eq!(current.ymax, 800.0);
+    }
+
+    #[test]
+    fn edge_rearm_requires_inward_motion_beyond_the_rearm_zone() {
+        let bounds = Bounds {
+            xmin: 0.0,
+            xmax: 100.0,
+            ymin: 0.0,
+            ymax: 100.0,
+        };
+
+        assert!(!edge_retreat_observed(
+            &bounds,
+            Position::Right,
+            CGPoint::new(98.0, 50.0),
+            -1.0,
+            0.0,
+        ));
+        assert!(edge_retreat_observed(
+            &bounds,
+            Position::Right,
+            CGPoint::new(97.0, 50.0),
+            -1.0,
+            0.0,
+        ));
+        assert!(!edge_retreat_observed(
+            &bounds,
+            Position::Right,
+            CGPoint::new(97.0, 50.0),
+            1.0,
+            0.0,
+        ));
     }
 }
 

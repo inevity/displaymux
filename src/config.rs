@@ -82,6 +82,7 @@ struct SwitchControllerToml {
     http_timeout_ms: u64,
     request_timeout_ms: u64,
     poll_interval_ms: u64,
+    edge_double_tap_ms: u64,
     lease_ttl_ms: u64,
     renew_interval_ms: u64,
 }
@@ -95,6 +96,7 @@ pub(crate) struct SwitchControllerConfig {
     pub(crate) http_timeout_ms: u64,
     pub(crate) request_timeout_ms: u64,
     pub(crate) poll_interval_ms: u64,
+    pub(crate) edge_double_tap_ms: u64,
     pub(crate) lease_ttl_ms: u64,
     pub(crate) renew_interval_ms: u64,
 }
@@ -128,6 +130,7 @@ impl TryFrom<SwitchControllerToml> for SwitchControllerConfig {
         if config.http_timeout_ms == 0
             || config.request_timeout_ms == 0
             || config.poll_interval_ms == 0
+            || config.edge_double_tap_ms == 0
             || config.lease_ttl_ms == 0
             || config.renew_interval_ms == 0
         {
@@ -164,6 +167,7 @@ impl TryFrom<SwitchControllerToml> for SwitchControllerConfig {
             http_timeout_ms: config.http_timeout_ms,
             request_timeout_ms: config.request_timeout_ms,
             poll_interval_ms: config.poll_interval_ms,
+            edge_double_tap_ms: config.edge_double_tap_ms,
             lease_ttl_ms: config.lease_ttl_ms,
             renew_interval_ms: config.renew_interval_ms,
         })
@@ -720,6 +724,7 @@ mod tests {
             http_timeout_ms: 500,
             request_timeout_ms: 2_000,
             poll_interval_ms: 100,
+            edge_double_tap_ms: 500,
             lease_ttl_ms: 5_000,
             renew_interval_ms: 1_000,
         }
@@ -737,6 +742,17 @@ mod tests {
     fn rejects_lease_that_can_expire_before_request_deadline() {
         let mut config = controller_toml();
         config.lease_ttl_ms = config.request_timeout_ms;
+
+        assert!(matches!(
+            SwitchControllerConfig::try_from(config),
+            Err(ConfigError::SwitchController(_))
+        ));
+    }
+
+    #[test]
+    fn rejects_disabled_edge_intent_deadline() {
+        let mut config = controller_toml();
+        config.edge_double_tap_ms = 0;
 
         assert!(matches!(
             SwitchControllerConfig::try_from(config),

@@ -36,6 +36,94 @@ pub(crate) struct GateContext {
     pub(crate) lease: LeaseIdentity,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct EdgeIntentKey {
+    pub(crate) handle: ClientHandle,
+    pub(crate) target: SwitchHost,
+    pub(crate) peer_session_epoch: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum EdgeIntentDecision {
+    Primed,
+    AwaitingRetreat,
+    Confirmed,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct EdgeIntent {
+    key: EdgeIntentKey,
+    rearmed: bool,
+    expires_at: Instant,
+}
+
+pub(crate) struct EdgeIntentGate {
+    valid_for: Duration,
+    intent: Option<EdgeIntent>,
+}
+
+impl EdgeIntentGate {
+    pub(crate) fn new(valid_for: Duration) -> Self {
+        Self {
+            valid_for,
+            intent: None,
+        }
+    }
+
+    pub(crate) fn candidate(&mut self, key: EdgeIntentKey, now: Instant) -> EdgeIntentDecision {
+        self.expire(now);
+        if let Some(intent) = self.intent {
+            if intent.key == key {
+                if intent.rearmed {
+                    self.intent = None;
+                    return EdgeIntentDecision::Confirmed;
+                }
+                return EdgeIntentDecision::AwaitingRetreat;
+            }
+        }
+
+        self.intent = now
+            .checked_add(self.valid_for)
+            .map(|expires_at| EdgeIntent {
+                key,
+                rearmed: false,
+                expires_at,
+            });
+        EdgeIntentDecision::Primed
+    }
+
+    pub(crate) fn retreat(&mut self, handle: ClientHandle, now: Instant) -> bool {
+        self.expire(now);
+        let Some(intent) = self.intent.as_mut() else {
+            return false;
+        };
+        if intent.key.handle != handle {
+            return false;
+        }
+        intent.rearmed = true;
+        true
+    }
+
+    pub(crate) fn remove(&mut self, handle: ClientHandle) {
+        if self
+            .intent
+            .is_some_and(|intent| intent.key.handle == handle)
+        {
+            self.intent = None;
+        }
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.intent = None;
+    }
+
+    fn expire(&mut self, now: Instant) {
+        if self.intent.is_some_and(|intent| intent.expires_at <= now) {
+            self.intent = None;
+        }
+    }
+}
+
 impl GateContext {
     pub(crate) fn same_identity(&self, other: &Self) -> bool {
         self.handle == other.handle
@@ -434,6 +522,10 @@ impl SwitchController {
 
     pub(crate) fn lease_ttl_ms(&self) -> u64 {
         self.config.lease_ttl_ms
+    }
+
+    pub(crate) fn edge_double_tap_timeout(&self) -> Duration {
+        Duration::from_millis(self.config.edge_double_tap_ms)
     }
 
     pub(crate) fn renew_interval(&self) -> Duration {
@@ -968,6 +1060,56 @@ mod tests {
         assert!(denied.1.contains("did not detect an active HDMI signal"));
         assert!(!denied.1.contains("TV switch preparation failed"));
     }
+
+    fn edge_key(handle: ClientHandle, session_epoch: u64) -> EdgeIntentKey {
+        EdgeIntentKey {
+            handle,
+            target: SwitchHost::Mac,
+            peer_session_epoch: session_epoch,
+        }
+    }
+
+    #[test]
+    fn edge_intent_requires_retreat_before_matching_second_entry() {
+        let now = Instant::now();
+        let mut gate = EdgeIntentGate::new(Duration::from_millis(500));
+        let key = edge_key(4, 22);
+
+        assert_eq!(gate.candidate(key, now), EdgeIntentDecision::Primed);
+        assert_eq!(
+            gate.candidate(key, now),
+            EdgeIntentDecision::AwaitingRetreat
+        );
+        assert!(gate.retreat(4, now));
+        assert_eq!(gate.candidate(key, now), EdgeIntentDecision::Confirmed);
+        assert_eq!(gate.candidate(key, now), EdgeIntentDecision::Primed);
+    }
+
+    #[test]
+    fn stale_or_different_edge_intent_cannot_confirm() {
+        let now = Instant::now();
+        let mut gate = EdgeIntentGate::new(Duration::from_millis(10));
+
+        assert_eq!(
+            gate.candidate(edge_key(4, 22), now),
+            EdgeIntentDecision::Primed
+        );
+        assert!(!gate.retreat(5, now));
+        assert!(gate.retreat(4, now));
+        assert_eq!(
+            gate.candidate(edge_key(4, 23), now),
+            EdgeIntentDecision::Primed
+        );
+        assert!(gate.retreat(4, now));
+        assert_eq!(
+            gate.candidate(
+                edge_key(4, 23),
+                now.checked_add(Duration::from_millis(10)).unwrap(),
+            ),
+            EdgeIntentDecision::Primed
+        );
+    }
+
     use serde_json::{Value, json};
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
@@ -1253,6 +1395,7 @@ mod tests {
             http_timeout_ms: 1_000,
             request_timeout_ms: 2_000,
             poll_interval_ms: 10,
+            edge_double_tap_ms: 500,
             lease_ttl_ms: 5_000,
             renew_interval_ms: 1_000,
         })

@@ -503,7 +503,6 @@ async fn release_capture(
         .expect("compositor did not report cursor position!");
     log::debug!("client entered @ ({x}, {y})");
     let (dx, dy) = match current_pos {
-        // offset cursor position to not enter again immediately
         Position::Left => (1., 0.),
         Position::Right => (-1., 0.),
         Position::Top => (0., 1.),
@@ -612,6 +611,10 @@ impl LanMouseInputCapture for LibeiInputCapture {
         completion_rx
             .await
             .map_err(|_| CaptureError::ReleaseIncomplete)
+    }
+
+    async fn resume_if_focused(&mut self, _pos: Position) -> Result<bool, CaptureError> {
+        Ok(false)
     }
 
     async fn terminate(&mut self) -> Result<(), CaptureError> {

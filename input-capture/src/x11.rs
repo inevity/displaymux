@@ -27,6 +27,10 @@ impl Capture for X11InputCapture {
         Ok(())
     }
 
+    async fn resume_if_focused(&mut self, _pos: Position) -> Result<bool, CaptureError> {
+        Ok(false)
+    }
+
     async fn terminate(&mut self) -> Result<(), CaptureError> {
         Ok(())
     }

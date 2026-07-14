@@ -35,6 +35,8 @@ pub(crate) enum ICaptureEvent {
     CaptureEnabled,
     /// An unarmed outgoing edge was reached and its backend capture was released.
     CaptureCandidate(CaptureHandle),
+    /// The native backend proved that the pointer retreated from a released edge.
+    EdgeRetreated(CaptureHandle),
     /// A matching one-shot permit reached the edge and needs a current service decision.
     CommitRequested {
         handle: CaptureHandle,
@@ -449,7 +451,7 @@ impl CaptureTask {
                         self.release_bind.borrow_mut().clone_from(&bind);
                     }
                     CaptureRequest::ResumeIfFocused(handle) => {
-                        if capture.resume_if_focused(handle)? {
+                        if capture.resume_if_focused(handle).await? {
                             log::info!("resuming still-focused edge for client {handle}");
                         }
                     }
@@ -467,6 +469,13 @@ impl CaptureTask {
     ) -> Result<(), CaptureError> {
         let (handle, event) = event;
         log::trace!("({handle}): {event:?}");
+
+        if event == CaptureEvent::EdgeRetreated {
+            self.event_tx
+                .send(ICaptureEvent::EdgeRetreated(handle))
+                .expect("channel closed");
+            return Ok(());
+        }
 
         if capture.keys_pressed(&self.release_bind.borrow()) {
             log::info!("releasing capture: release-bind pressed");
@@ -536,6 +545,7 @@ impl CaptureTask {
 
         let event = match event {
             CaptureEvent::Begin => ProtoEvent::Enter(opposite_pos),
+            CaptureEvent::EdgeRetreated => unreachable!("retreat handled before capture routing"),
             CaptureEvent::Input(e) => match self.state {
                 // connection not acknowledged, repeat `Enter` event
                 State::WaitingForAck => ProtoEvent::Enter(opposite_pos),

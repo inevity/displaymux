@@ -9,8 +9,9 @@ use crate::{
     listen::{LanMouseListener, ListenerCreationError},
     notification::SystemNotifier,
     switch::{
-        BundleLeaseManager, GateContext, GateError, GrantIdentity, PeerBundleReadiness,
-        PreparedGrant, SwitchClientError, SwitchController,
+        BundleLeaseManager, EdgeIntentDecision, EdgeIntentGate, EdgeIntentKey, GateContext,
+        GateError, GrantIdentity, PeerBundleReadiness, PreparedGrant, SwitchClientError,
+        SwitchController,
     },
 };
 use futures::StreamExt;
@@ -25,7 +26,7 @@ use std::{
     net::{IpAddr, SocketAddr},
     pin::Pin,
     sync::{Arc, RwLock},
-    time::Duration,
+    time::{Duration, Instant},
 };
 use thiserror::Error;
 use tokio::{
@@ -55,6 +56,12 @@ async fn wait_for_switch_deadline(deadline: &mut Option<Pin<Box<Sleep>>>) {
         Some(deadline) => deadline.as_mut().await,
         None => futures::future::pending().await,
     }
+}
+
+fn server_edge_intent_gate(controller: Option<&SwitchController>) -> Option<EdgeIntentGate> {
+    controller
+        .filter(|controller| controller.local_host() == controller.server_host())
+        .map(|controller| EdgeIntentGate::new(controller.edge_double_tap_timeout()))
 }
 
 pub struct Service {
@@ -90,6 +97,7 @@ pub struct Service {
     incoming_conn_info: HashMap<ClientHandle, Incoming>,
     next_trigger_handle: u64,
     bundle_lease: BundleLeaseManager,
+    edge_intent_gate: Option<EdgeIntentGate>,
     switch_controller: Option<SwitchController>,
     system_notifier: SystemNotifier,
     switch_deadline: Option<Pin<Box<Sleep>>>,
@@ -154,6 +162,7 @@ impl Service {
                 SystemNotifier::new(controller.local_host(), controller.server_host())
             })
             .unwrap_or_else(SystemNotifier::disabled);
+        let edge_intent_gate = server_edge_intent_gate(switch_controller.as_ref());
         let (switch_event_tx, switch_event_rx) = mpsc::channel(1);
         let client_manager = ClientManager::default();
         for client in config.clients() {
@@ -201,6 +210,7 @@ impl Service {
             incoming_conns: Default::default(),
             next_trigger_handle: 0,
             bundle_lease: Default::default(),
+            edge_intent_gate,
             switch_controller,
             system_notifier,
             switch_deadline: None,
@@ -362,6 +372,7 @@ impl Service {
                 None
             }
         };
+        self.edge_intent_gate = server_edge_intent_gate(self.switch_controller.as_ref());
         self.system_notifier = self
             .switch_controller
             .as_ref()
@@ -495,6 +506,9 @@ impl Service {
             }
             ICaptureEvent::CaptureDisabled => {
                 self.capture_status = Status::Disabled;
+                if let Some(gate) = self.edge_intent_gate.as_mut() {
+                    gate.clear();
+                }
                 self.notify_frontend(FrontendEvent::CaptureStatus(self.capture_status));
                 self.active_switch_capture = None;
                 if self.pending_switch_cleanup.is_some() {
@@ -509,6 +523,15 @@ impl Service {
             }
             ICaptureEvent::CaptureCandidate(handle) => {
                 self.handle_capture_candidate(handle);
+            }
+            ICaptureEvent::EdgeRetreated(handle) => {
+                if self
+                    .edge_intent_gate
+                    .as_mut()
+                    .is_some_and(|gate| gate.retreat(handle, Instant::now()))
+                {
+                    log::debug!("edge intent rearmed for client {handle}");
+                }
             }
             ICaptureEvent::CommitRequested {
                 handle,
@@ -643,7 +666,32 @@ impl Service {
             log::debug!("capture candidate {handle} rejected: controller operation is active");
             return;
         }
-        let Some(readiness) = self.peer_readiness(handle) else {
+        let readiness = self.peer_readiness(handle);
+        if let Some(gate) = self.edge_intent_gate.as_mut() {
+            let key = EdgeIntentKey {
+                handle,
+                target,
+                peer_session_epoch: readiness.map_or(0, |readiness| readiness.session_epoch),
+            };
+            match gate.candidate(key, Instant::now()) {
+                EdgeIntentDecision::Primed => {
+                    log::info!(
+                        "edge intent primed for client {handle} target {target}; move away and cross again"
+                    );
+                    return;
+                }
+                EdgeIntentDecision::AwaitingRetreat => {
+                    log::debug!(
+                        "edge intent for client {handle} ignored until native retreat evidence"
+                    );
+                    return;
+                }
+                EdgeIntentDecision::Confirmed => {
+                    log::info!("edge intent confirmed for client {handle} target {target}");
+                }
+            }
+        }
+        let Some(readiness) = readiness else {
             log::warn!("capture candidate {handle} rejected: client does not exist");
             self.system_notifier
                 .switch_failed(Some(target), "peer_missing");
@@ -1452,6 +1500,9 @@ impl Service {
 
     fn deactivate_client(&mut self, handle: ClientHandle) {
         log::debug!("deactivating client {handle}");
+        if let Some(gate) = self.edge_intent_gate.as_mut() {
+            gate.remove(handle);
+        }
         if self.client_manager.deactivate_client(handle) {
             self.capture.destroy(handle);
             self.broadcast_client(handle);
@@ -1494,6 +1545,9 @@ impl Service {
     }
 
     fn remove_client(&mut self, handle: ClientHandle) {
+        if let Some(gate) = self.edge_intent_gate.as_mut() {
+            gate.remove(handle);
+        }
         if self
             .client_manager
             .remove_client(handle)
@@ -1524,6 +1578,9 @@ impl Service {
     }
 
     fn update_pos(&mut self, handle: ClientHandle, pos: Position) {
+        if let Some(gate) = self.edge_intent_gate.as_mut() {
+            gate.remove(handle);
+        }
         // update state in event input emulator & input capture
         if self.client_manager.set_pos(handle, pos) {
             self.deactivate_client(handle);
@@ -1537,6 +1594,9 @@ impl Service {
         handle: ClientHandle,
         switch_target: Option<lan_mouse_ipc::SwitchHost>,
     ) {
+        if let Some(gate) = self.edge_intent_gate.as_mut() {
+            gate.remove(handle);
+        }
         self.client_manager.set_switch_target(handle, switch_target);
         self.broadcast_client(handle);
     }

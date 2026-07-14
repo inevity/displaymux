@@ -660,7 +660,7 @@ impl Capture for LayerShellInputCapture {
         Ok(inner.flush_events()?)
     }
 
-    fn resume_if_focused(&mut self, pos: Position) -> Result<bool, CaptureError> {
+    async fn resume_if_focused(&mut self, pos: Position) -> Result<bool, CaptureError> {
         let inner = self.0.get_mut();
         let resumed = inner.state.resume_if_focused(pos);
         inner.flush_events()?;
@@ -789,6 +789,7 @@ impl Dispatch<WlPointer, ()> for State {
                 app.pending_events.push_back((pos, CaptureEvent::Begin));
             }
             wl_pointer::Event::Leave { .. } => {
+                let retreated_pos = app.focused.as_ref().map(|window| window.pos);
                 /* There are rare cases, where when a window is opened in
                  * just the wrong moment, the pointer is released, while
                  * still grabbed.
@@ -802,6 +803,10 @@ impl Dispatch<WlPointer, ()> for State {
                 app.ungrab();
                 app.focused = None;
                 app.focused_serial = None;
+                if let Some(pos) = retreated_pos {
+                    app.pending_events
+                        .push_back((pos, CaptureEvent::EdgeRetreated));
+                }
             }
             wl_pointer::Event::Button {
                 serial: _,
