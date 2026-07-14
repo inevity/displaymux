@@ -330,7 +330,7 @@ unsafe extern "system" fn mouse_proc(ncode: i32, wparam: WPARAM, lparam: LPARAM)
         return CallNextHookEx(None, ncode, wparam, lparam);
     }
     let mouse = *(lparam.0 as *const MSLLHOOKSTRUCT);
-    if mouse.flags.contains(LLMHF_INJECTED) {
+    if mouse.flags & LLMHF_INJECTED != 0 {
         return CallNextHookEx(None, ncode, wparam, lparam);
     }
     let active = check_client_activation(wparam, lparam);
