@@ -13,6 +13,9 @@ pub const BTN_MIDDLE: u32 = 0x112;
 pub const BTN_BACK: u32 = 0x113;
 pub const BTN_FORWARD: u32 = 0x114;
 
+#[cfg(target_os = "macos")]
+pub const LAN_MOUSE_EVENT_SOURCE_USER_DATA: i64 = 0x4c41_4e4d_4f55_5345;
+
 #[derive(Debug, PartialEq, Clone, Copy)]
 pub enum PointerEvent {
     /// relative motion event

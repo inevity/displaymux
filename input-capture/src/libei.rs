@@ -30,6 +30,7 @@ use tokio::{
     sync::{
         Notify,
         mpsc::{self, Receiver, Sender},
+        oneshot,
     },
     task::JoinHandle,
 };
@@ -63,7 +64,7 @@ pub struct LibeiInputCapture {
     capture_task: JoinHandle<Result<(), CaptureError>>,
     event_rx: Receiver<(Position, CaptureEvent)>,
     notify_capture: Sender<LibeiNotifyEvent>,
-    notify_release: Arc<Notify>,
+    release_tx: Sender<oneshot::Sender<()>>,
     cancellation_token: CancellationToken,
     terminated: bool,
 }
@@ -219,14 +220,14 @@ impl LibeiInputCapture {
 
         let (event_tx, event_rx) = mpsc::channel(1);
         let (notify_capture, notify_rx) = mpsc::channel(1);
-        let notify_release = Arc::new(Notify::new());
+        let (release_tx, release_rx) = mpsc::channel(8);
 
         let cancellation_token = CancellationToken::new();
 
         let capture = do_capture(
             input_capture_ptr,
             notify_rx,
-            notify_release.clone(),
+            release_rx,
             first_session,
             event_tx,
             cancellation_token.clone(),
@@ -238,7 +239,7 @@ impl LibeiInputCapture {
             event_rx,
             capture_task,
             notify_capture,
-            notify_release,
+            release_tx,
             cancellation_token,
             terminated: false,
         };
@@ -250,7 +251,7 @@ impl LibeiInputCapture {
 async fn do_capture(
     input_capture: *const InputCapture,
     mut capture_event: Receiver<LibeiNotifyEvent>,
-    notify_release: Arc<Notify>,
+    mut release_rx: Receiver<oneshot::Sender<()>>,
     session: Option<(Session<InputCapture>, BitFlags<Capabilities>)>,
     event_tx: Sender<(Position, CaptureEvent)>,
     cancellation_token: CancellationToken,
@@ -308,7 +309,7 @@ async fn do_capture(
                 &event_tx,
                 &active_clients,
                 &mut next_barrier_id,
-                &notify_release,
+                &mut release_rx,
                 (cancel_session.clone(), cancel_update.clone()),
             );
 
@@ -351,7 +352,7 @@ async fn do_capture_session(
     event_tx: &Sender<(Position, CaptureEvent)>,
     active_clients: &[Position],
     next_barrier_id: &mut NonZeroU32,
-    notify_release: &Notify,
+    release_rx: &mut Receiver<oneshot::Sender<()>>,
     cancel: (CancellationToken, CancellationToken),
 ) -> Result<(), CaptureError> {
     let (cancel_session, cancel_update) = cancel;
@@ -427,25 +428,33 @@ async fn do_capture_session(
                     // client entered => send event
                     event_tx.send((pos, CaptureEvent::Begin)).await.expect("no channel");
 
-                    tokio::select! {
-                        _ = notify_release.notified() => { /* capture release */
+                    let release_completion = tokio::select! {
+                        completion = release_rx.recv() => { /* capture release */
                             log::debug!("release session requested");
+                            completion
                         },
                         _ = release_session.notified() => { /* release session */
                             log::debug!("ei devices changed");
                             ei_devices_changed = true;
+                            None
                         },
                         _ = cancel_session.cancelled() => { /* kill session notify */
                             log::debug!("session cancel requested");
                             break
                         },
-                    }
+                    };
 
                     release_capture(input_capture, session, activated, pos).await?;
+                    if let Some(completion) = release_completion {
+                        let _ = completion.send(());
+                    }
 
                 }
-                _ = notify_release.notified() => { /* capture release -> we are not capturing anyway, so ignore */
+                completion = release_rx.recv() => { /* capture release -> already local */
                     log::debug!("release session requested");
+                    if let Some(completion) = completion {
+                        let _ = completion.send(());
+                    }
                 },
                 _ = release_session.notified() => { /* release session */
                     log::debug!("ei devices changed");
@@ -595,8 +604,14 @@ impl LanMouseInputCapture for LibeiInputCapture {
     }
 
     async fn release(&mut self) -> Result<(), CaptureError> {
-        self.notify_release.notify_waiters();
-        Ok(())
+        let (completion_tx, completion_rx) = oneshot::channel();
+        self.release_tx
+            .send(completion_tx)
+            .await
+            .map_err(|_| CaptureError::ReleaseIncomplete)?;
+        completion_rx
+            .await
+            .map_err(|_| CaptureError::ReleaseIncomplete)
     }
 
     async fn terminate(&mut self) -> Result<(), CaptureError> {

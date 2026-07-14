@@ -13,6 +13,7 @@ use thiserror::Error;
 use tokio::{
     sync::Mutex as AsyncMutex,
     task::{JoinHandle, spawn_local},
+    time::timeout,
 };
 use webrtc_dtls::{
     config::{ClientAuthType::RequireAnyClientCert, Config, ExtendedMasterSecretType},
@@ -33,6 +34,7 @@ pub enum ListenerCreationError {
 }
 
 type ArcConn = Arc<dyn Conn + Send + Sync>;
+const LISTENER_SEND_TIMEOUT: Duration = Duration::from_secs(1);
 
 pub(crate) enum ListenEvent {
     Msg {
@@ -45,6 +47,9 @@ pub(crate) enum ListenEvent {
     },
     Rejected {
         fingerprint: String,
+    },
+    Disconnected {
+        addr: SocketAddr,
     },
 }
 
@@ -203,7 +208,7 @@ impl LanMouseListener {
         self.listen_tx.close();
     }
 
-    pub(crate) async fn reply(&self, addr: SocketAddr, event: ProtoEvent) {
+    pub(crate) async fn reply(&self, addr: SocketAddr, event: ProtoEvent) -> bool {
         log::trace!("reply {event} >=>=>=>=>=> {addr}");
         let (buf, len): ([u8; MAX_EVENT_SIZE], usize) = event.into();
         let conn = self
@@ -214,8 +219,13 @@ impl LanMouseListener {
             .find(|(candidate, _)| *candidate == addr)
             .map(|(_, conn)| conn.clone());
         if let Some(conn) = conn {
-            let _ = conn.send(&buf[..len]).await;
+            match timeout(LISTENER_SEND_TIMEOUT, conn.send(&buf[..len])).await {
+                Ok(Ok(_)) => return true,
+                Ok(Err(error)) => log::warn!("reply to {addr} failed: {error}"),
+                Err(_) => log::warn!("reply to {addr} timed out"),
+            }
         }
+        false
     }
 
     pub(crate) async fn broadcast(&self, event: ProtoEvent) {
@@ -228,7 +238,11 @@ impl LanMouseListener {
             .map(|(_, conn)| conn.clone())
             .collect::<Vec<_>>();
         for conn in conns {
-            let _ = conn.send(&buf[..len]).await;
+            match timeout(LISTENER_SEND_TIMEOUT, conn.send(&buf[..len])).await {
+                Ok(Ok(_)) => {}
+                Ok(Err(error)) => log::warn!("readiness broadcast failed: {error}"),
+                Err(_) => log::warn!("readiness broadcast timed out"),
+            }
         }
     }
 
@@ -294,8 +308,17 @@ async fn read_loop(
     let mut conns = conns.lock().await;
     let index = conns
         .iter()
-        .position(|(a, _)| *a == addr)
-        .expect("connection not found");
+        .position(|(a, candidate)| *a == addr && Arc::ptr_eq(candidate, &conn));
+    let Some(index) = index else {
+        return Ok(());
+    };
     conns.remove(index);
+    let address_still_connected = conns.iter().any(|(candidate, _)| *candidate == addr);
+    drop(conns);
+    if !address_still_connected {
+        dtls_tx
+            .send(ListenEvent::Disconnected { addr })
+            .expect("channel closed");
+    }
     Ok(())
 }

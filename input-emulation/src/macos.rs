@@ -11,8 +11,8 @@ use core_graphics::event::{
 };
 use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
 use input_event::{
-    BTN_BACK, BTN_FORWARD, BTN_LEFT, BTN_MIDDLE, BTN_RIGHT, Event, KeyboardEvent, PointerEvent,
-    scancode,
+    BTN_BACK, BTN_FORWARD, BTN_LEFT, BTN_MIDDLE, BTN_RIGHT, Event, KeyboardEvent,
+    LAN_MOUSE_EVENT_SOURCE_USER_DATA, PointerEvent, scancode,
 };
 use keycode::{KeyMap, KeyMapping};
 use std::cell::Cell;
@@ -46,6 +46,47 @@ pub(crate) struct MacOSEmulation {
     modifier_state: Rc<Cell<XMods>>,
     /// notify to cancel key repeats
     notify_repeat_task: Arc<Notify>,
+    /// Stable vendor:model:serial identity for the shared display.
+    display_selector: Option<MacDisplaySelector>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct MacDisplaySelector {
+    vendor: u32,
+    model: u32,
+    serial: u32,
+}
+
+impl MacDisplaySelector {
+    fn parse(value: &str) -> Result<Self, MacOSEmulationCreationError> {
+        let parts = value.split(':').collect::<Vec<_>>();
+        if parts.len() != 3 {
+            return Err(MacOSEmulationCreationError::InvalidDisplaySelector(
+                format!("{value:?}; expected decimal vendor:model:serial"),
+            ));
+        }
+        let parse_part = |part: &str, name: &str| {
+            part.parse::<u32>().map_err(|_| {
+                MacOSEmulationCreationError::InvalidDisplaySelector(format!(
+                    "{value:?}; {name} must be a decimal u32"
+                ))
+            })
+        };
+        Ok(Self {
+            vendor: parse_part(parts[0], "vendor")?,
+            model: parse_part(parts[1], "model")?,
+            serial: parse_part(parts[2], "serial")?,
+        })
+    }
+
+    fn for_display(display: CGDirectDisplayID) -> Self {
+        let display = CGDisplay::new(display);
+        Self {
+            vendor: display.vendor_number(),
+            model: display.model_number(),
+            serial: display.serial_number(),
+        }
+    }
 }
 
 /// Maps an evdev button code to the CGEventType used for drag events.
@@ -61,8 +102,12 @@ fn drag_event_type(button: u32) -> CGEventType {
 unsafe impl Send for MacOSEmulation {}
 
 impl MacOSEmulation {
-    pub(crate) fn new() -> Result<Self, MacOSEmulationCreationError> {
+    pub(crate) fn new(display_selector: Option<&str>) -> Result<Self, MacOSEmulationCreationError> {
         request_macos_emulation_permissions()?;
+
+        let display_selector = display_selector
+            .map(MacDisplaySelector::parse)
+            .transpose()?;
 
         let event_source = CGEventSource::new(CGEventSourceStateID::CombinedSessionState)
             .map_err(|_| MacOSEmulationCreationError::EventSourceCreation)?;
@@ -75,6 +120,7 @@ impl MacOSEmulation {
             repeat_task: None,
             notify_repeat_task: Arc::new(Notify::new()),
             modifier_state: Rc::new(Cell::new(XMods::empty())),
+            display_selector,
         })
     }
 
@@ -130,6 +176,36 @@ impl MacOSEmulation {
             self.notify_repeat_task.notify_waiters();
             let _ = task.await;
         }
+    }
+}
+
+fn post_event(event: &CGEvent) {
+    event.set_integer_value_field(
+        EventField::EVENT_SOURCE_USER_DATA,
+        LAN_MOUSE_EVENT_SOURCE_USER_DATA,
+    );
+    event.post(CGEventTapLocation::HID);
+}
+
+fn resolve_display(selector: Option<MacDisplaySelector>) -> Result<CGDirectDisplayID, io::Error> {
+    let active = CGDisplay::active_displays()
+        .map_err(|error| io::Error::other(format!("could not list active displays: {error}")))?;
+    let matching = active
+        .into_iter()
+        .filter(|display| {
+            selector.is_none_or(|selector| MacDisplaySelector::for_display(*display) == selector)
+        })
+        .collect::<Vec<_>>();
+    match matching.as_slice() {
+        [display] => Ok(*display),
+        [] => Err(io::Error::other(match selector {
+            Some(selector) => format!("configured macOS display {selector:?} is not active"),
+            None => "no active macOS display is available".to_owned(),
+        })),
+        _ => Err(io::Error::other(match selector {
+            Some(selector) => format!("configured macOS display {selector:?} is ambiguous"),
+            None => "multiple macOS displays are active; emulation_display is required".to_owned(),
+        })),
     }
 }
 
@@ -199,7 +275,7 @@ fn key_event(event_source: CGEventSource, key: u16, state: u8, modifiers: XMods)
         flags |= CGEventFlags::CGEventFlagNumericPad | CGEventFlags::CGEventFlagSecondaryFn;
     }
     event.set_flags(flags);
-    event.post(CGEventTapLocation::HID);
+    post_event(&event);
     log::trace!("key event: {key} {state}");
 }
 
@@ -211,7 +287,7 @@ fn modifier_event(event_source: CGEventSource, depressed: XMods) {
     let flags = to_cgevent_flags(depressed);
     event.set_type(CGEventType::FlagsChanged);
     event.set_flags(flags);
-    event.post(CGEventTapLocation::HID);
+    post_event(&event);
     log::trace!("modifiers updated: {depressed:?}");
 }
 
@@ -339,7 +415,7 @@ impl Emulation for MacOSEmulation {
                         };
                         event.set_integer_value_field(EventField::MOUSE_EVENT_DELTA_X, dx as i64);
                         event.set_integer_value_field(EventField::MOUSE_EVENT_DELTA_Y, dy as i64);
-                        event.post(CGEventTapLocation::HID);
+                        post_event(&event);
                     }
                     PointerEvent::Button {
                         time: _,
@@ -419,7 +495,7 @@ impl Emulation for MacOSEmulation {
                                 btn_num,
                             );
                         }
-                        event.post(CGEventTapLocation::HID);
+                        post_event(&event);
                     }
                     PointerEvent::Axis {
                         time: _,
@@ -449,7 +525,7 @@ impl Emulation for MacOSEmulation {
                                 return Ok(());
                             }
                         };
-                        event.post(CGEventTapLocation::HID);
+                        post_event(&event);
                     }
                     PointerEvent::AxisDiscrete120 { axis, value } => {
                         const LINES_PER_STEP: i32 = 3;
@@ -475,7 +551,7 @@ impl Emulation for MacOSEmulation {
                                 return Ok(());
                             }
                         };
-                        event.post(CGEventTapLocation::HID);
+                        post_event(&event);
                     }
                 }
 
@@ -523,15 +599,16 @@ impl Emulation for MacOSEmulation {
     }
 
     fn center_pointer(&mut self, _handle: EmulationHandle) -> Result<(), EmulationError> {
-        let location = self
-            .get_mouse_location()
-            .ok_or_else(|| io::Error::other("could not read mouse location"))?;
-        let display = get_display_at_point(location.x, location.y)
-            .ok_or_else(|| io::Error::other("could not find display containing mouse"))?;
+        let display = resolve_display(self.display_selector)?;
         let center = display_center(get_display_bounds(display));
-
-        CGDisplay::warp_mouse_cursor_position(center)
-            .map_err(|error| io::Error::other(format!("could not center mouse: {error:?}")))?;
+        let event = CGEvent::new_mouse_event(
+            self.event_source.clone(),
+            CGEventType::MouseMoved,
+            center,
+            CGMouseButton::Left,
+        )
+        .map_err(|_| io::Error::other("could not create pointer-centering event"))?;
+        post_event(&event);
         Ok(())
     }
 
@@ -630,5 +707,22 @@ mod tests {
 
         assert_eq!(center.x, -960.0);
         assert_eq!(center.y, 540.0);
+    }
+
+    #[test]
+    fn parses_stable_display_selector() {
+        assert_eq!(
+            MacDisplaySelector::parse("7789:33485:0").unwrap(),
+            MacDisplaySelector {
+                vendor: 7789,
+                model: 33485,
+                serial: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_incomplete_display_selector() {
+        assert!(MacDisplaySelector::parse("7789:33485").is_err());
     }
 }

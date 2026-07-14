@@ -26,8 +26,11 @@ use wayland_protocols_misc::zwp_virtual_keyboard_v1::client::{
 
 use wayland_client::{
     Connection, Dispatch, EventQueue, QueueHandle, delegate_noop,
-    globals::{GlobalListContents, registry_queue_init},
-    protocol::{wl_registry, wl_seat},
+    globals::{Global, GlobalList, GlobalListContents, registry_queue_init},
+    protocol::{
+        wl_output::{self, WlOutput},
+        wl_registry, wl_seat,
+    },
 };
 
 use input_event::{Event, KeyboardEvent, PointerEvent, scancode};
@@ -36,8 +39,10 @@ use super::EmulationHandle;
 use super::error::WaylandBindError;
 
 struct State {
+    global_list: GlobalList,
     keymap: Option<(u32, OwnedFd, u32)>,
     input_for_client: HashMap<EmulationHandle, VirtualInput>,
+    outputs: Vec<Output>,
     seat: wl_seat::WlSeat,
     qh: QueueHandle<Self>,
     vpm: VpManager,
@@ -46,35 +51,47 @@ struct State {
 
 // App State, implements Dispatch event handlers
 pub(crate) struct WlrootsEmulation {
+    display_selector: Option<String>,
     last_flush_failed: bool,
     state: State,
     queue: EventQueue<State>,
 }
 
+struct Output {
+    global: Global,
+    name: Option<String>,
+    proxy: WlOutput,
+}
+
 impl WlrootsEmulation {
-    pub(crate) fn new() -> Result<Self, WlrootsEmulationCreationError> {
+    pub(crate) fn new(
+        display_selector: Option<&str>,
+    ) -> Result<Self, WlrootsEmulationCreationError> {
         let conn = Connection::connect_to_env()?;
-        let (globals, queue) = registry_queue_init::<State>(&conn)?;
+        let (global_list, queue) = registry_queue_init::<State>(&conn)?;
         let qh = queue.handle();
 
-        let seat: wl_seat::WlSeat = globals
+        let seat: wl_seat::WlSeat = global_list
             .bind(&qh, 7..=8, ())
             .map_err(|e| WaylandBindError::new(e, "wl_seat 7..=8"))?;
 
-        let vpm: VpManager = globals
-            .bind(&qh, 1..=1, ())
-            .map_err(|e| WaylandBindError::new(e, "wlr-virtual-pointer-unstable-v1"))?;
-        let vkm: VkManager = globals
+        let vpm: VpManager = global_list
+            .bind(&qh, 1..=2, ())
+            .map_err(|e| WaylandBindError::new(e, "wlr-virtual-pointer-unstable-v1 1..=2"))?;
+        let vkm: VkManager = global_list
             .bind(&qh, 1..=1, ())
             .map_err(|e| WaylandBindError::new(e, "virtual-keyboard-unstable-v1"))?;
 
         let input_for_client: HashMap<EmulationHandle, VirtualInput> = HashMap::new();
 
         let mut emulate = WlrootsEmulation {
+            display_selector: display_selector.map(ToOwned::to_owned),
             last_flush_failed: false,
             state: State {
+                global_list,
                 keymap: None,
                 input_for_client,
+                outputs: Vec::new(),
                 seat,
                 vpm,
                 vkm,
@@ -82,6 +99,11 @@ impl WlrootsEmulation {
             },
             queue,
         };
+
+        for global in emulate.state.global_list.contents().clone_list() {
+            emulate.state.register_global(global);
+        }
+        emulate.queue.roundtrip(&mut emulate.state)?;
         while emulate.state.keymap.is_none() {
             emulate.queue.blocking_dispatch(&mut emulate.state)?;
         }
@@ -93,6 +115,58 @@ impl WlrootsEmulation {
 }
 
 impl State {
+    fn register_global(&mut self, global: Global) {
+        if global.interface.as_str() != "wl_output" {
+            return;
+        }
+        let version = global.version.min(4);
+        let proxy = self.global_list.registry().bind::<WlOutput, _, _>(
+            global.name,
+            version,
+            &self.qh,
+            global.name,
+        );
+        self.outputs.push(Output {
+            global,
+            name: None,
+            proxy,
+        });
+    }
+
+    fn deregister_global(&mut self, name: u32) {
+        self.outputs.retain(|output| {
+            if output.global.name == name {
+                output.proxy.release();
+                false
+            } else {
+                true
+            }
+        });
+    }
+
+    fn target_output(&self, selector: Option<&str>) -> Result<WlOutput, io::Error> {
+        let matching = self
+            .outputs
+            .iter()
+            .filter(|output| {
+                selector.is_none_or(|selector| output.name.as_deref() == Some(selector))
+            })
+            .collect::<Vec<_>>();
+        match matching.as_slice() {
+            [output] => Ok(output.proxy.clone()),
+            [] => Err(io::Error::other(match selector {
+                Some(selector) => format!("configured Wayland output {selector:?} is not active"),
+                None => "no active Wayland output is available".to_owned(),
+            })),
+            _ => Err(io::Error::other(match selector {
+                Some(selector) => format!("configured Wayland output {selector:?} is ambiguous"),
+                None => {
+                    "multiple Wayland outputs are active; emulation_display is required".to_owned()
+                }
+            })),
+        }
+    }
+
     fn add_client(&mut self, client: EmulationHandle) {
         let pointer: Vp = self.vpm.create_virtual_pointer(None, &self.qh, ());
         let keyboard: Vk = self.vkm.create_virtual_keyboard(&self.seat, &self.qh, ());
@@ -173,6 +247,28 @@ impl Emulation for WlrootsEmulation {
     }
     async fn terminate(&mut self) {
         /* nothing to do */
+    }
+
+    fn center_pointer(&mut self, _handle: EmulationHandle) -> Result<(), EmulationError> {
+        self.queue.roundtrip(&mut self.state).map_err(|error| {
+            io::Error::other(format!("could not refresh Wayland outputs: {error}"))
+        })?;
+        let output = self.state.target_output(self.display_selector.as_deref())?;
+        let pointer = self.state.vpm.create_virtual_pointer_with_output(
+            Some(&self.state.seat),
+            Some(&output),
+            &self.state.qh,
+            (),
+        );
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u32;
+        pointer.motion_absolute(now, 1, 1, 2, 2);
+        pointer.frame();
+        pointer.destroy();
+        self.queue.flush()?;
+        Ok(())
     }
 }
 
@@ -257,13 +353,47 @@ delegate_noop!(State: VkManager);
 
 impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for State {
     fn event(
-        _: &mut State,
+        state: &mut State,
         _: &wl_registry::WlRegistry,
-        _: wl_registry::Event,
+        event: wl_registry::Event,
         _: &GlobalListContents,
         _: &Connection,
         _: &QueueHandle<State>,
     ) {
+        match event {
+            wl_registry::Event::Global {
+                name,
+                interface,
+                version,
+            } => state.register_global(Global {
+                name,
+                interface,
+                version,
+            }),
+            wl_registry::Event::GlobalRemove { name } => state.deregister_global(name),
+            _ => {}
+        }
+    }
+}
+
+impl Dispatch<WlOutput, u32> for State {
+    fn event(
+        state: &mut Self,
+        _: &WlOutput,
+        event: <WlOutput as wayland_client::Proxy>::Event,
+        global_name: &u32,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let wl_output::Event::Name { name } = event {
+            if let Some(output) = state
+                .outputs
+                .iter_mut()
+                .find(|output| output.global.name == *global_name)
+            {
+                output.name = Some(name);
+            }
+        }
     }
 }
 

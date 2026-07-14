@@ -58,8 +58,10 @@ pub(crate) enum EmulationEvent {
         pointer_ready: bool,
         session_epoch: u64,
     },
-    /// capture should be released
-    ReleaseNotify,
+    /// Capture must be fully released before an incoming handoff can continue.
+    ReleaseCapture {
+        completion: oneshot::Sender<bool>,
+    },
     /// peer sent us a Hello with its build commit hash. Used to
     /// populate `client_manager.peer_commit` from the listen side
     /// too — without this, peer-version visibility silently fails
@@ -90,9 +92,10 @@ enum EmulationRequest {
 impl Emulation {
     pub(crate) fn new(
         backend: Option<input_emulation::Backend>,
+        display_selector: Option<String>,
         listener: LanMouseListener,
     ) -> Self {
-        let emulation_proxy = EmulationProxy::new(backend);
+        let emulation_proxy = EmulationProxy::new(backend, display_selector);
         let (request_tx, request_rx) = channel();
         let (event_tx, event_rx) = channel();
         let emulation_task = ListenTask {
@@ -196,7 +199,14 @@ impl ListenTask {
                             ProtoEvent::Enter(pos) => {
                                 if let Some(fingerprint) = self.listener.get_certificate_fingerprint(addr).await {
                                     log::info!("releasing capture: {addr} entered this device");
-                                    self.event_tx.send(EmulationEvent::ReleaseNotify).expect("channel closed");
+                                    let (completion_tx, completion_rx) = oneshot::channel();
+                                    self.event_tx.send(EmulationEvent::ReleaseCapture {
+                                        completion: completion_tx,
+                                    }).expect("channel closed");
+                                    if !completion_rx.await.unwrap_or(false) {
+                                        log::warn!("not acknowledging enter from {addr}: local capture release failed");
+                                        continue;
+                                    }
                                     if !self.emulation_proxy.center_pointer(addr).await {
                                         log::warn!("not acknowledging enter from {addr}: pointer centering failed");
                                         continue;
@@ -255,6 +265,12 @@ impl ListenTask {
                             .is_none_or(|i| i.elapsed() >= Duration::from_secs(2)) {
                                 self.event_tx.send(EmulationEvent::ConnectionAttempt { fingerprint }).expect("channel closed");
                             }
+                    }
+                    Some(ListenEvent::Disconnected { addr }) => {
+                        last_response.remove(&addr);
+                        pending_releases.disconnected(addr);
+                        self.emulation_proxy.remove(addr);
+                        self.event_tx.send(EmulationEvent::Disconnected { addr }).expect("channel closed");
                     }
                     None => break
                 }}
@@ -320,7 +336,7 @@ enum ProxyRequest {
 }
 
 impl EmulationProxy {
-    fn new(backend: Option<input_emulation::Backend>) -> Self {
+    fn new(backend: Option<input_emulation::Backend>, display_selector: Option<String>) -> Self {
         let (request_tx, request_rx) = channel();
         let (event_tx, event_rx) = channel();
         let keyboard_ready = Rc::new(Cell::new(false));
@@ -329,6 +345,7 @@ impl EmulationProxy {
         let exit_requested = Rc::new(Cell::new(false));
         let emulation_task = EmulationTask {
             backend,
+            display_selector,
             exit_requested: exit_requested.clone(),
             request_rx,
             event_tx,
@@ -425,6 +442,7 @@ impl EmulationProxy {
 
 struct EmulationTask {
     backend: Option<input_emulation::Backend>,
+    display_selector: Option<String>,
     exit_requested: Rc<Cell<bool>>,
     request_rx: Receiver<ProxyRequest>,
     event_tx: Sender<EmulationEvent>,
@@ -460,7 +478,7 @@ impl EmulationTask {
     async fn do_emulation(&mut self) -> Result<(), InputEmulationError> {
         log::info!("creating input emulation ...");
         let mut emulation = tokio::select! {
-            r = InputEmulation::new(self.backend) => r?,
+            r = InputEmulation::new(self.backend, self.display_selector.clone()) => r?,
             // allow termination event while requesting input emulation
             _ = wait_for_termination(&mut self.request_rx) => return Ok(()),
         };

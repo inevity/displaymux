@@ -25,6 +25,8 @@ use core_graphics::base::CGError;
 
 #[derive(Debug, Error)]
 pub enum CaptureError {
+    #[error("capture release did not complete")]
+    ReleaseIncomplete,
     #[error("activation stream closed unexpectedly")]
     ActivationClosed,
     #[error("libei stream was closed")]
@@ -160,4 +162,6 @@ pub enum MacosCaptureCreationError {
     #[cfg(target_os = "macos")]
     #[error("failed to get display ids: {0}")]
     ActiveDisplays(CGError),
+    #[error("no active display is available")]
+    NoActiveDisplay,
 }

@@ -15,13 +15,15 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::core::{PCWSTR, w};
 
+use tokio::sync::oneshot;
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, CreateWindowExW, DispatchMessageW, EDD_GET_DEVICE_INTERFACE_NAME, GetMessageW,
-    HOOKPROC, KBDLLHOOKSTRUCT, LLKHF_EXTENDED, MSG, MSLLHOOKSTRUCT, PostThreadMessageW,
-    RegisterClassW, SetWindowsHookExW, TranslateMessage, WH_KEYBOARD_LL, WH_MOUSE_LL, WINDOW_STYLE,
-    WM_DISPLAYCHANGE, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN,
-    WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN, WM_RBUTTONUP,
-    WM_SYSKEYDOWN, WM_SYSKEYUP, WM_USER, WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSW, WNDPROC,
+    HOOKPROC, KBDLLHOOKSTRUCT, LLKHF_EXTENDED, LLKHF_INJECTED, LLMHF_INJECTED, MSG, MSLLHOOKSTRUCT,
+    PostThreadMessageW, RegisterClassW, SetWindowsHookExW, TranslateMessage, WH_KEYBOARD_LL,
+    WH_MOUSE_LL, WINDOW_STYLE, WM_DISPLAYCHANGE, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN,
+    WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL,
+    WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_USER, WM_XBUTTONDOWN,
+    WM_XBUTTONUP, WNDCLASSW, WNDPROC,
 };
 
 use input_event::{
@@ -35,6 +37,7 @@ use crate::event_queue::{EventQueue, PushOutcome};
 pub(crate) struct EventThread {
     event_queue: Arc<EventQueue>,
     request_buffer: Arc<Mutex<Vec<ClientUpdate>>>,
+    release_waiters: Arc<Mutex<Vec<oneshot::Sender<()>>>>,
     thread: Option<thread::JoinHandle<()>>,
     thread_id: u32,
 }
@@ -42,17 +45,26 @@ pub(crate) struct EventThread {
 impl EventThread {
     pub(crate) fn new(event_queue: Arc<EventQueue>) -> Self {
         let request_buffer = Default::default();
-        let (thread, thread_id) = start(event_queue.clone(), Arc::clone(&request_buffer));
+        let release_waiters = Default::default();
+        let (thread, thread_id) = start(
+            event_queue.clone(),
+            Arc::clone(&request_buffer),
+            Arc::clone(&release_waiters),
+        );
         Self {
             event_queue,
             request_buffer,
+            release_waiters,
             thread: Some(thread),
             thread_id,
         }
     }
 
-    pub(crate) fn release_capture(&self) {
+    pub(crate) async fn release_capture(&self) {
+        let (completion_tx, completion_rx) = oneshot::channel();
+        self.release_waiters.lock().unwrap().push(completion_tx);
         self.signal(RequestType::Release);
+        let _ = completion_rx.await;
     }
 
     pub(crate) fn create(&self, pos: Position) {
@@ -134,12 +146,14 @@ fn get_msg() -> Option<MSG> {
 fn start(
     event_queue: Arc<EventQueue>,
     request_buffer: Arc<Mutex<Vec<ClientUpdate>>>,
+    release_waiters: Arc<Mutex<Vec<oneshot::Sender<()>>>>,
 ) -> (thread::JoinHandle<()>, u32) {
     /* condition variable to wait for thead id */
     let thread_id = Arc::new((Condvar::new(), Mutex::new(None)));
     let thread_id_ = Arc::clone(&thread_id);
 
-    let msg_thread = thread::spawn(|| start_routine(thread_id_, event_queue, request_buffer));
+    let msg_thread =
+        thread::spawn(|| start_routine(thread_id_, event_queue, request_buffer, release_waiters));
 
     /* wait for thread to set its id */
     let (cond, thread_id) = &*thread_id;
@@ -154,6 +168,7 @@ fn start_routine(
     ready: Arc<(Condvar, Mutex<Option<u32>>)>,
     event_queue: Arc<EventQueue>,
     request_buffer: Arc<Mutex<Vec<ClientUpdate>>>,
+    release_waiters: Arc<Mutex<Vec<oneshot::Sender<()>>>>,
 ) {
     EVENT_QUEUE.replace(Some(event_queue));
     /* communicate thread id */
@@ -225,6 +240,14 @@ fn start_routine(
                 x if x == RequestType::Exit as usize => break,
                 x if x == RequestType::Release as usize => {
                     ACTIVE_CLIENT.take();
+                    let waiters = release_waiters
+                        .lock()
+                        .unwrap()
+                        .drain(..)
+                        .collect::<Vec<_>>();
+                    for waiter in waiters {
+                        let _ = waiter.send(());
+                    }
                 }
                 x if x == RequestType::ClientUpdate as usize => {
                     let requests = {
@@ -303,6 +326,13 @@ fn check_client_activation(wparam: WPARAM, lparam: LPARAM) -> bool {
 }
 
 unsafe extern "system" fn mouse_proc(ncode: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    if ncode < 0 {
+        return CallNextHookEx(None, ncode, wparam, lparam);
+    }
+    let mouse = *(lparam.0 as *const MSLLHOOKSTRUCT);
+    if mouse.flags.contains(LLMHF_INJECTED) {
+        return CallNextHookEx(None, ncode, wparam, lparam);
+    }
     let active = check_client_activation(wparam, lparam);
 
     /* no client was active */
@@ -332,6 +362,13 @@ unsafe extern "system" fn mouse_proc(ncode: i32, wparam: WPARAM, lparam: LPARAM)
 }
 
 unsafe extern "system" fn kybrd_proc(ncode: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    if ncode < 0 {
+        return CallNextHookEx(None, ncode, wparam, lparam);
+    }
+    let keyboard = *(lparam.0 as *const KBDLLHOOKSTRUCT);
+    if keyboard.flags.contains(LLKHF_INJECTED) {
+        return CallNextHookEx(None, ncode, wparam, lparam);
+    }
     /* get active client if any */
     let Some(client) = ACTIVE_CLIENT.get() else {
         return CallNextHookEx(None, ncode, wparam, lparam);

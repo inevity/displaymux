@@ -14,7 +14,8 @@ use std::{
 use tokio::{sync::mpsc, task::AbortHandle};
 use windows::Win32::Foundation::{POINT, RECT};
 use windows::Win32::Graphics::Gdi::{
-    GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromPoint,
+    DEVMODEW, DISPLAY_DEVICE_ATTACHED_TO_DESKTOP, DISPLAY_DEVICEW, ENUM_CURRENT_SETTINGS,
+    EnumDisplayDevicesW, EnumDisplaySettingsW,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     INPUT, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE,
@@ -25,7 +26,10 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     INPUT_0, KEYEVENTF_EXTENDEDKEY, MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, SendInput,
 };
-use windows::Win32::UI::WindowsAndMessaging::{GetCursorPos, SetCursorPos, XBUTTON1, XBUTTON2};
+use windows::Win32::UI::WindowsAndMessaging::{
+    EDD_GET_DEVICE_INTERFACE_NAME, SetCursorPos, XBUTTON1, XBUTTON2,
+};
+use windows::core::PCWSTR;
 
 use super::{Emulation, EmulationHandle};
 
@@ -33,15 +37,19 @@ const DEFAULT_REPEAT_DELAY: Duration = Duration::from_millis(500);
 const DEFAULT_REPEAT_INTERVAL: Duration = Duration::from_millis(32);
 
 pub(crate) struct WindowsEmulation {
+    display_selector: Option<String>,
     repeat_task: Option<AbortHandle>,
     error_tx: mpsc::Sender<EmulationError>,
     error_rx: mpsc::Receiver<EmulationError>,
 }
 
 impl WindowsEmulation {
-    pub(crate) fn new() -> Result<Self, WindowsEmulationCreationError> {
+    pub(crate) fn new(
+        display_selector: Option<&str>,
+    ) -> Result<Self, WindowsEmulationCreationError> {
         let (error_tx, error_rx) = mpsc::channel(1);
         Ok(Self {
+            display_selector: display_selector.map(ToOwned::to_owned),
             repeat_task: None,
             error_tx,
             error_rx,
@@ -96,19 +104,8 @@ impl Emulation for WindowsEmulation {
     async fn terminate(&mut self) {}
 
     fn center_pointer(&mut self, _handle: EmulationHandle) -> Result<(), EmulationError> {
-        let mut cursor = POINT::default();
-        unsafe { GetCursorPos(&mut cursor) }.map_err(windows_io_error)?;
-
-        let monitor = unsafe { MonitorFromPoint(cursor, MONITOR_DEFAULTTONEAREST) };
-        let mut info = MONITORINFO {
-            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
-            ..Default::default()
-        };
-        if !unsafe { GetMonitorInfoW(monitor, &mut info) }.as_bool() {
-            return Err(io::Error::last_os_error().into());
-        }
-
-        let center = rect_center(info.rcMonitor);
+        let rect = resolve_display_rect(self.display_selector.as_deref())?;
+        let center = rect_center(rect);
         unsafe { SetCursorPos(center.x, center.y) }.map_err(windows_io_error)?;
         Ok(())
     }
@@ -119,6 +116,119 @@ impl Emulation for WindowsEmulation {
             Poll::Ready(None) | Poll::Pending => Poll::Pending,
         }
     }
+}
+
+fn resolve_display_rect(selector: Option<&str>) -> Result<RECT, io::Error> {
+    let mut matching = Vec::new();
+    unsafe {
+        for index in 0.. {
+            let mut adapter = DISPLAY_DEVICEW {
+                cb: std::mem::size_of::<DISPLAY_DEVICEW>() as u32,
+                ..Default::default()
+            };
+            if !EnumDisplayDevicesW(None, index, &mut adapter, EDD_GET_DEVICE_INTERFACE_NAME)
+                .as_bool()
+            {
+                break;
+            }
+            if !adapter
+                .StateFlags
+                .contains(DISPLAY_DEVICE_ATTACHED_TO_DESKTOP)
+            {
+                continue;
+            }
+
+            let mut identifiers = display_device_identifiers(&adapter);
+            for monitor_index in 0.. {
+                let mut monitor = DISPLAY_DEVICEW {
+                    cb: std::mem::size_of::<DISPLAY_DEVICEW>() as u32,
+                    ..Default::default()
+                };
+                if !EnumDisplayDevicesW(
+                    PCWSTR::from_raw(adapter.DeviceName.as_ptr()),
+                    monitor_index,
+                    &mut monitor,
+                    EDD_GET_DEVICE_INTERFACE_NAME,
+                )
+                .as_bool()
+                {
+                    break;
+                }
+                identifiers.extend(display_device_identifiers(&monitor));
+            }
+
+            if selector.is_some_and(|selector| {
+                identifiers
+                    .iter()
+                    .any(|identifier| display_identifier_matches(selector, identifier))
+            }) || selector.is_none()
+            {
+                let mut mode = DEVMODEW {
+                    dmSize: std::mem::size_of::<DEVMODEW>() as u16,
+                    ..Default::default()
+                };
+                if !EnumDisplaySettingsW(
+                    PCWSTR::from_raw(adapter.DeviceName.as_ptr()),
+                    ENUM_CURRENT_SETTINGS,
+                    &mut mode,
+                )
+                .as_bool()
+                {
+                    continue;
+                }
+                let position = mode.Anonymous1.Anonymous2.dmPosition;
+                matching.push(RECT {
+                    left: position.x,
+                    top: position.y,
+                    right: position.x + mode.dmPelsWidth as i32,
+                    bottom: position.y + mode.dmPelsHeight as i32,
+                });
+            }
+        }
+    }
+
+    match matching.as_slice() {
+        [rect] => Ok(*rect),
+        [] => Err(io::Error::other(match selector {
+            Some(selector) => format!("configured Windows display {selector:?} is not active"),
+            None => "no active Windows display is available".to_owned(),
+        })),
+        _ => Err(io::Error::other(match selector {
+            Some(selector) => format!("configured Windows display {selector:?} is ambiguous"),
+            None => {
+                "multiple Windows displays are active; emulation_display is required".to_owned()
+            }
+        })),
+    }
+}
+
+fn display_device_identifiers(device: &DISPLAY_DEVICEW) -> Vec<String> {
+    [
+        wide_string(&device.DeviceName),
+        wide_string(&device.DeviceString),
+        wide_string(&device.DeviceID),
+        wide_string(&device.DeviceKey),
+    ]
+    .into_iter()
+    .filter(|value| !value.is_empty())
+    .collect()
+}
+
+fn display_identifier_matches(selector: &str, identifier: &str) -> bool {
+    if let Some(hardware_id) = selector.strip_prefix("hardware:") {
+        return identifier
+            .split(['\\', '#'])
+            .any(|component| component.eq_ignore_ascii_case(hardware_id));
+    }
+    identifier.eq_ignore_ascii_case(selector)
+}
+
+fn wide_string(value: &[u16]) -> String {
+    let len = value
+        .iter()
+        .position(|unit| *unit == 0)
+        .unwrap_or(value.len());
+    String::from_utf16_lossy(&value[..len])
 }
 
 fn windows_io_error(error: windows::core::Error) -> EmulationError {
@@ -303,5 +413,17 @@ mod tests {
         });
 
         assert_eq!(center, POINT { x: -960, y: 540 });
+    }
+
+    #[test]
+    fn hardware_selector_matches_one_pnp_component() {
+        assert!(display_identifier_matches(
+            "hardware:GSM82CD",
+            r"DISPLAY\GSM82CD\5&39B6B5E7&1&UID257"
+        ));
+        assert!(!display_identifier_matches(
+            "hardware:GSM82CD",
+            r"DISPLAY\CMN1404\5&39B6B5E7&1&UID256"
+        ));
     }
 }

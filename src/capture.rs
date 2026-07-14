@@ -89,10 +89,10 @@ pub(crate) enum CaptureType {
     EnterOnly,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 enum CaptureRequest {
     /// capture must release the mouse
-    Release,
+    Release(Option<oneshot::Sender<bool>>),
     /// add a capture client
     Create(CaptureHandle, Position, CaptureType),
     /// destory a capture client
@@ -171,9 +171,17 @@ impl Capture {
     }
 
     pub(crate) fn release(&self) {
+        self.request_release(None);
+    }
+
+    pub(crate) fn release_with_completion(&self, completion: oneshot::Sender<bool>) {
+        self.request_release(Some(completion));
+    }
+
+    fn request_release(&self, completion: Option<oneshot::Sender<bool>>) {
         self.gate.borrow_mut().clear();
         self.request_tx
-            .send(CaptureRequest::Release)
+            .send(CaptureRequest::Release(completion))
             .expect("channel closed");
     }
 
@@ -282,7 +290,12 @@ impl CaptureTask {
                         CaptureRequest::Reenable => break,
                         CaptureRequest::Create(h, p, t) => self.add_capture(h, p, t),
                         CaptureRequest::Destroy(h) => self.remove_capture(h),
-                        CaptureRequest::Release => self.gate.borrow_mut().clear(),
+                        CaptureRequest::Release(completion) => {
+                            self.gate.borrow_mut().clear();
+                            if let Some(completion) = completion {
+                                let _ = completion.send(true);
+                            }
+                        }
                         CaptureRequest::SetReleaseBind(bind) => {
                             self.release_bind.borrow_mut().clone_from(&bind);
                         }
@@ -414,10 +427,15 @@ impl CaptureTask {
                 },
                 e = self.request_rx.recv() => match e.expect("channel closed") {
                     CaptureRequest::Reenable => { /* already active */ },
-                    CaptureRequest::Release => {
+                    CaptureRequest::Release(completion) => {
                         self.gate.borrow_mut().clear();
-                        self.release_capture(capture, CaptureReleaseReason::ServiceRequested)
-                            .await?;
+                        let result = self
+                            .release_capture(capture, CaptureReleaseReason::ServiceRequested)
+                            .await;
+                        if let Some(completion) = completion {
+                            let _ = completion.send(result.is_ok());
+                        }
+                        result?;
                     }
                     CaptureRequest::Create(h, p, t) => {
                         self.add_capture(h, p, t);
@@ -539,8 +557,19 @@ impl CaptureTask {
         capture: &mut InputCapture,
         reason: CaptureReleaseReason,
     ) -> Result<(), CaptureError> {
-        // If we have an active client, notify them we're leaving
-        let released_handle = if let Some(handle) = self.active_client.take() {
+        let released_handle = self.active_client.take();
+        let pressed_keys = if released_handle.is_some() {
+            capture.take_pressed_keys()
+        } else {
+            Default::default()
+        };
+
+        // Local keyboard and pointer ownership must be restored before any
+        // network cleanup can block or fail.
+        capture.release().await?;
+
+        // If we had an active client, notify it after local release.
+        if let Some(handle) = released_handle {
             self.active_peer_session_epoch = None;
             // Synthesize key-up events for every key still held in the
             // capture's pressed_keys set BEFORE sending Leave. Without
@@ -552,7 +581,7 @@ impl CaptureTask {
             // then runs every subsequent keystroke through those held
             // mods until its watchdog times out (1+ s) or our Leave
             // arrives — and Leave can be lost over UDP/DTLS.
-            for key in capture.take_pressed_keys() {
+            for key in pressed_keys {
                 let key_up = ProtoEvent::Input(Event::Keyboard(KeyboardEvent::Key {
                     time: 0,
                     key: key as u32,
@@ -581,11 +610,7 @@ impl CaptureTask {
             if let Err(e) = self.conn.send(ProtoEvent::Leave(0), handle).await {
                 log::warn!("failed to send Leave to client {handle}: {e}");
             }
-            Some(handle)
-        } else {
-            None
-        };
-        capture.release().await?;
+        }
         if let Some(handle) = released_handle {
             self.event_tx
                 .send(ICaptureEvent::ClientReleased { handle, reason })

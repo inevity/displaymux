@@ -17,7 +17,7 @@ use tokio::{
     net::UdpSocket,
     sync::Mutex,
     task::{JoinSet, spawn_local},
-    time::MissedTickBehavior,
+    time::{MissedTickBehavior, timeout},
 };
 use webrtc_dtls::{
     config::{Config, ExtendedMasterSecretType},
@@ -44,6 +44,7 @@ pub(crate) enum LanMouseConnectionError {
 
 const DEFAULT_CONNECTION_TIMEOUT: Duration = Duration::from_secs(5);
 const CONNECTION_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(1);
+const CONNECTION_SEND_TIMEOUT: Duration = CONNECTION_MAINTENANCE_INTERVAL;
 
 async fn connect(
     addr: SocketAddr,
@@ -151,11 +152,17 @@ impl LanMouseConnection {
                 if !self.client_manager.alive(handle) {
                     return Err(LanMouseConnectionError::TargetEmulationDisabled);
                 }
-                match conn.send(buf).await {
-                    Ok(_) => {}
-                    Err(e) => {
+                match timeout(CONNECTION_SEND_TIMEOUT, conn.send(buf)).await {
+                    Ok(Ok(_)) => {}
+                    Ok(Err(e)) => {
                         log::warn!("client {handle} failed to send: {e}");
                         disconnect(&self.client_manager, handle, addr, &conn, &self.conns).await;
+                        return Err(e.into());
+                    }
+                    Err(_) => {
+                        log::warn!("client {handle} send timed out");
+                        disconnect(&self.client_manager, handle, addr, &conn, &self.conns).await;
+                        return Err(LanMouseConnectionError::Timeout);
                     }
                 }
                 log::trace!("{event} >->->->->- {addr}");

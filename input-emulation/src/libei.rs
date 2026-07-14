@@ -19,10 +19,10 @@ use async_trait::async_trait;
 
 use reis::{
     ei::{
-        self, Button, Keyboard, Pointer, Scroll, button::ButtonState, handshake::ContextType,
-        keyboard::KeyState,
+        self, Button, Keyboard, Pointer, PointerAbsolute, Scroll, button::ButtonState,
+        handshake::ContextType, keyboard::KeyState,
     },
-    event::{self, Connection, DeviceCapability, DeviceEvent, EiEvent, SeatEvent},
+    event::{self, Connection, Device, DeviceCapability, DeviceEvent, EiEvent, SeatEvent},
     tokio::EiConvertEventStream,
 };
 
@@ -35,6 +35,7 @@ use super::{Emulation, EmulationHandle, error::LibeiEmulationCreationError};
 #[derive(Clone, Default)]
 struct Devices {
     pointer: Arc<RwLock<Option<(ei::Device, ei::Pointer)>>>,
+    pointer_absolute: Arc<RwLock<Option<(Device, ei::PointerAbsolute)>>>,
     scroll: Arc<RwLock<Option<(ei::Device, ei::Scroll)>>>,
     button: Arc<RwLock<Option<(ei::Device, ei::Button)>>>,
     keyboard: Arc<RwLock<Option<(ei::Device, ei::Keyboard)>>>,
@@ -44,6 +45,7 @@ pub(crate) struct LibeiEmulation {
     context: ei::Context,
     conn: event::Connection,
     devices: Devices,
+    display_selector: Option<String>,
     ei_task: JoinHandle<()>,
     error: Arc<Mutex<Option<EmulationError>>>,
     libei_error: Arc<AtomicBool>,
@@ -119,7 +121,9 @@ async fn get_ei_fd() -> Result<(RemoteDesktop, Session<RemoteDesktop>, OwnedFd),
 }
 
 impl LibeiEmulation {
-    pub(crate) async fn new() -> Result<Self, LibeiEmulationCreationError> {
+    pub(crate) async fn new(
+        display_selector: Option<&str>,
+    ) -> Result<Self, LibeiEmulationCreationError> {
         let (_remote_desktop, session, eifd) = get_ei_fd().await?;
         let stream = UnixStream::from(eifd);
         stream.set_nonblocking(true)?;
@@ -144,6 +148,7 @@ impl LibeiEmulation {
             context,
             conn,
             devices,
+            display_selector: display_selector.map(ToOwned::to_owned),
             ei_task,
             error,
             libei_error,
@@ -261,6 +266,56 @@ impl Emulation for LibeiEmulation {
         let _ = self.session.close().await;
         self.ei_task.abort();
     }
+
+    fn center_pointer(&mut self, _handle: EmulationHandle) -> Result<(), EmulationError> {
+        let pointer = self.devices.pointer_absolute.read().unwrap();
+        let (device, pointer) = pointer
+            .as_ref()
+            .ok_or_else(|| io::Error::other("libei has no absolute pointer device"))?;
+        let matching = device
+            .regions()
+            .iter()
+            .filter(|region| {
+                self.display_selector
+                    .as_deref()
+                    .is_none_or(|selector| region.mapping_id.as_deref() == Some(selector))
+            })
+            .collect::<Vec<_>>();
+        let region = match matching.as_slice() {
+            [region] => *region,
+            [] => {
+                return Err(io::Error::other(match self.display_selector.as_deref() {
+                    Some(selector) => {
+                        format!("configured libei region {selector:?} is not available")
+                    }
+                    None => "libei reported no absolute pointer region".to_owned(),
+                })
+                .into());
+            }
+            _ => {
+                return Err(io::Error::other(match self.display_selector.as_deref() {
+                    Some(selector) => format!("configured libei region {selector:?} is ambiguous"),
+                    None => "multiple libei regions are available; emulation_display is required"
+                        .to_owned(),
+                })
+                .into());
+            }
+        };
+
+        pointer.motion_absolute(
+            region.x as f32 + region.width as f32 / 2.0,
+            region.y as f32 + region.height as f32 / 2.0,
+        );
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_micros() as u64;
+        device.device().frame(self.conn.serial(), now);
+        self.context
+            .flush()
+            .map_err(|error| io::Error::new(error.kind(), error))?;
+        Ok(())
+    }
 }
 
 async fn ei_task(
@@ -320,6 +375,13 @@ async fn ei_event_handler(
                         .unwrap()
                         .replace((device.device().clone(), pointer));
                 }
+                if let Some(pointer_absolute) = e.device().interface::<PointerAbsolute>() {
+                    devices
+                        .pointer_absolute
+                        .write()
+                        .unwrap()
+                        .replace((e.device().clone(), pointer_absolute));
+                }
                 if let Some(keyboard) = e.device().interface::<Keyboard>() {
                     devices
                         .keyboard
@@ -344,6 +406,9 @@ async fn ei_event_handler(
             }
             EiEvent::DeviceRemoved(e) => {
                 log::debug!("device removed: {:?}", e.device().device_type());
+                if e.device().interface::<PointerAbsolute>().is_some() {
+                    devices.pointer_absolute.write().unwrap().take();
+                }
             }
             EiEvent::DevicePaused(e) => {
                 log::debug!("device paused: {:?}", e.device().device_type());

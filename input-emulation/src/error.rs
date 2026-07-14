@@ -135,6 +135,8 @@ pub enum LibeiEmulationCreationError {
 pub enum XdpEmulationCreationError {
     #[error(transparent)]
     Ashpd(#[from] ashpd::Error),
+    #[error("configured display targeting is not supported by this portal session: {0:?}")]
+    DisplayTargetUnsupported(String),
 }
 
 #[cfg(x11)]
@@ -153,6 +155,8 @@ pub enum MacOSEmulationCreationError {
     AccessibilityPermission,
     #[error("input control permission is required")]
     InputControlPermission,
+    #[error("invalid macOS display selector: {0}")]
+    InvalidDisplaySelector(String),
 }
 
 #[cfg(windows)]

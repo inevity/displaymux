@@ -19,7 +19,8 @@ use core_graphics::{
 };
 use futures_core::Stream;
 use input_event::{
-    BTN_BACK, BTN_FORWARD, BTN_LEFT, BTN_MIDDLE, BTN_RIGHT, Event, KeyboardEvent, PointerEvent,
+    BTN_BACK, BTN_FORWARD, BTN_LEFT, BTN_MIDDLE, BTN_RIGHT, Event, KeyboardEvent,
+    LAN_MOUSE_EVENT_SOURCE_USER_DATA, PointerEvent,
 };
 use keycode::{KeyMap, KeyMapping};
 use libc::c_void;
@@ -34,16 +35,34 @@ use std::{
 };
 use tokio::sync::{
     Mutex,
-    mpsc::{self, Receiver, Sender},
+    mpsc::{self, Receiver, Sender, UnboundedSender},
     oneshot,
 };
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, PartialEq)]
 struct Bounds {
     xmin: f64,
     xmax: f64,
     ymin: f64,
     ymax: f64,
+}
+
+fn covering_bounds(rectangles: impl IntoIterator<Item = (f64, f64, f64, f64)>) -> Option<Bounds> {
+    let mut rectangles = rectangles.into_iter();
+    let (xmin, ymin, width, height) = rectangles.next()?;
+    let mut bounds = Bounds {
+        xmin,
+        xmax: xmin + width,
+        ymin,
+        ymax: ymin + height,
+    };
+    for (xmin, ymin, width, height) in rectangles {
+        bounds.xmin = bounds.xmin.min(xmin);
+        bounds.xmax = bounds.xmax.max(xmin + width);
+        bounds.ymin = bounds.ymin.min(ymin);
+        bounds.ymax = bounds.ymax.max(ymin + height);
+    }
+    Some(bounds)
 }
 
 #[derive(Debug)]
@@ -62,7 +81,7 @@ struct InputCaptureState {
 
 #[derive(Debug)]
 enum ProducerEvent {
-    Release,
+    Release(oneshot::Sender<bool>),
     Create(Position),
     Destroy(Position),
     Grab(Position),
@@ -105,13 +124,16 @@ impl InputCaptureState {
     fn update_bounds(&mut self) -> Result<(), MacosCaptureCreationError> {
         let active_ids =
             CGDisplay::active_displays().map_err(MacosCaptureCreationError::ActiveDisplays)?;
-        active_ids.iter().for_each(|d| {
-            let bounds = CGDisplay::new(*d).bounds();
-            self.bounds.xmin = self.bounds.xmin.min(bounds.origin.x);
-            self.bounds.xmax = self.bounds.xmax.max(bounds.origin.x + bounds.size.width);
-            self.bounds.ymin = self.bounds.ymin.min(bounds.origin.y);
-            self.bounds.ymax = self.bounds.ymax.max(bounds.origin.y + bounds.size.height);
-        });
+        self.bounds = covering_bounds(active_ids.into_iter().map(|display| {
+            let bounds = CGDisplay::new(display).bounds();
+            (
+                bounds.origin.x,
+                bounds.origin.y,
+                bounds.size.width,
+                bounds.size.height,
+            )
+        }))
+        .ok_or(MacosCaptureCreationError::NoActiveDisplay)?;
 
         log::debug!("Updated displays bounds: {0:?}", self.bounds);
         Ok(())
@@ -153,11 +175,16 @@ impl InputCaptureState {
     ) -> Result<(), CaptureError> {
         log::debug!("handling event: {producer_event:?}");
         match producer_event {
-            ProducerEvent::Release => {
-                if self.current_pos.is_some() {
-                    self.show_cursor()?;
+            ProducerEvent::Release(completion) => {
+                let result = if self.current_pos.is_some() {
+                    let result = self.show_cursor();
                     self.current_pos = None;
-                }
+                    result
+                } else {
+                    Ok(())
+                };
+                let _ = completion.send(result.is_ok());
+                result?;
             }
             ProducerEvent::Grab(pos) => {
                 if self.current_pos.is_none() {
@@ -407,7 +434,7 @@ fn get_events(
 
 fn create_event_tap<'a>(
     client_state: Arc<Mutex<InputCaptureState>>,
-    notify_tx: Sender<ProducerEvent>,
+    notify_tx: UnboundedSender<ProducerEvent>,
     event_tx: Sender<(Position, CaptureEvent)>,
 ) -> Result<CGEventTap<'a>, MacosCaptureCreationError> {
     // Shared slot for the tap's mach port pointer. Stored as `usize`
@@ -485,10 +512,16 @@ fn create_event_tap<'a>(
                 state.current_pos = None;
             }
             notify_tx
-                .blocking_send(ProducerEvent::EventTapDisabled)
+                .send(ProducerEvent::EventTapDisabled)
                 .unwrap_or_else(|e| {
                     log::error!("Failed to send notification: {e}");
                 });
+            return CallbackResult::Keep;
+        }
+
+        if cg_ev.get_integer_value_field(EventField::EVENT_SOURCE_USER_DATA)
+            == LAN_MOUSE_EVENT_SOURCE_USER_DATA
+        {
             return CallbackResult::Keep;
         }
 
@@ -524,7 +557,7 @@ fn create_event_tap<'a>(
                     .unwrap_or_else(|e| log::warn!("{e}"));
                 res_events.push(CaptureEvent::Begin);
                 notify_tx
-                    .blocking_send(ProducerEvent::Grab(new_pos))
+                    .send(ProducerEvent::Grab(new_pos))
                     .expect("Failed to send notification");
             }
         }
@@ -575,7 +608,7 @@ fn create_event_tap<'a>(
 fn event_tap_thread(
     client_state: Arc<Mutex<InputCaptureState>>,
     event_tx: Sender<(Position, CaptureEvent)>,
-    notify_tx: Sender<ProducerEvent>,
+    notify_tx: UnboundedSender<ProducerEvent>,
     ready: std::sync::mpsc::Sender<Result<CFRunLoop, MacosCaptureCreationError>>,
     exit: oneshot::Sender<()>,
 ) {
@@ -601,11 +634,14 @@ fn event_tap_thread(
     // so the C side has a stable user_info pointer; reclaim it after
     // the run loop exits.
     let display_user_info = Box::into_raw(Box::new(display_notify_tx)) as *mut c_void;
-    unsafe {
+    let display_callback_registered = unsafe {
         CGDisplayRegisterReconfigurationCallback(
             display_reconfiguration_callback,
             display_user_info,
-        );
+        ) == kCGErrorSuccess
+    };
+    if !display_callback_registered {
+        log::error!("could not register display reconfiguration callback");
     }
 
     log::debug!("running CFRunLoop...");
@@ -613,11 +649,16 @@ fn event_tap_thread(
     log::debug!("event tap thread exiting!...");
 
     unsafe {
-        CGDisplayRemoveReconfigurationCallback(display_reconfiguration_callback, display_user_info);
+        if display_callback_registered {
+            let _ = CGDisplayRemoveReconfigurationCallback(
+                display_reconfiguration_callback,
+                display_user_info,
+            );
+        }
         // Reclaim the leaked sender Box so we don't leak a tokio
         // channel sender on every capture create/destroy cycle.
         drop(Box::from_raw(
-            display_user_info as *mut Sender<ProducerEvent>,
+            display_user_info as *mut UnboundedSender<ProducerEvent>,
         ));
     }
 
@@ -638,20 +679,20 @@ extern "C" fn display_reconfiguration_callback(_display: u32, flags: u32, user_i
     if user_info.is_null() {
         return;
     }
-    // SAFETY: user_info is a Box::into_raw of Sender<ProducerEvent>
+    // SAFETY: user_info is a Box::into_raw of UnboundedSender<ProducerEvent>
     // owned by `event_tap_thread`. It's valid for the lifetime of
     // that thread; the registration is removed before the box is
     // freed. The callback only fires while the run loop is running
     // on that thread, so we know the box is live here.
-    let sender = unsafe { &*(user_info as *const Sender<ProducerEvent>) };
-    if let Err(e) = sender.blocking_send(ProducerEvent::DisplayReconfigured) {
+    let sender = unsafe { &*(user_info as *const UnboundedSender<ProducerEvent>) };
+    if let Err(e) = sender.send(ProducerEvent::DisplayReconfigured) {
         log::warn!("failed to notify display reconfiguration: {e}");
     }
 }
 
 pub struct MacOSInputCapture {
     event_rx: Receiver<(Position, CaptureEvent)>,
-    notify_tx: Sender<ProducerEvent>,
+    notify_tx: UnboundedSender<ProducerEvent>,
     run_loop: CFRunLoop,
 }
 
@@ -661,7 +702,7 @@ impl MacOSInputCapture {
 
         let state = Arc::new(Mutex::new(InputCaptureState::new()?));
         let (event_tx, event_rx) = mpsc::channel(32);
-        let (notify_tx, mut notify_rx) = mpsc::channel(32);
+        let (notify_tx, mut notify_rx) = mpsc::unbounded_channel();
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
         let (tap_exit_tx, mut tap_exit_rx) = oneshot::channel();
 
@@ -753,32 +794,31 @@ impl Drop for MacOSInputCapture {
 #[async_trait]
 impl Capture for MacOSInputCapture {
     async fn create(&mut self, pos: Position) -> Result<(), CaptureError> {
-        let notify_tx = self.notify_tx.clone();
-        tokio::task::spawn_local(async move {
-            log::debug!("creating capture, {pos}");
-            let _ = notify_tx.send(ProducerEvent::Create(pos)).await;
-            log::debug!("done !");
-        });
+        log::debug!("creating capture, {pos}");
+        self.notify_tx
+            .send(ProducerEvent::Create(pos))
+            .map_err(|_| CaptureError::EventTapDisabled)?;
         Ok(())
     }
 
     async fn destroy(&mut self, pos: Position) -> Result<(), CaptureError> {
-        let notify_tx = self.notify_tx.clone();
-        tokio::task::spawn_local(async move {
-            log::debug!("destroying capture {pos}");
-            let _ = notify_tx.send(ProducerEvent::Destroy(pos)).await;
-            log::debug!("done !");
-        });
+        log::debug!("destroying capture {pos}");
+        self.notify_tx
+            .send(ProducerEvent::Destroy(pos))
+            .map_err(|_| CaptureError::EventTapDisabled)?;
         Ok(())
     }
 
     async fn release(&mut self) -> Result<(), CaptureError> {
-        let notify_tx = self.notify_tx.clone();
-        tokio::task::spawn_local(async move {
-            log::debug!("notifying Release");
-            let _ = notify_tx.send(ProducerEvent::Release).await;
-        });
-        Ok(())
+        let (completion_tx, completion_rx) = oneshot::channel();
+        self.notify_tx
+            .send(ProducerEvent::Release(completion_tx))
+            .map_err(|_| CaptureError::EventTapDisabled)?;
+        if completion_rx.await.unwrap_or(false) {
+            Ok(())
+        } else {
+            Err(CaptureError::ReleaseIncomplete)
+        }
     }
 
     async fn terminate(&mut self) -> Result<(), CaptureError> {
@@ -839,6 +879,28 @@ extern "C" {
 #[link(name = "ApplicationServices", kind = "framework")]
 extern "C" {
     fn AXIsProcessTrusted() -> bool;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn topology_bounds_are_recomputed_instead_of_accumulated() {
+        let old =
+            covering_bounds([(0.0, 0.0, 3840.0, 2160.0), (-1280.0, 0.0, 1280.0, 800.0)]).unwrap();
+        let current = covering_bounds([
+            (0.0, 0.0, 1280.0, 800.0),
+            (-2209.0, -2160.0, 3840.0, 2160.0),
+        ])
+        .unwrap();
+
+        assert_ne!(old, current);
+        assert_eq!(current.xmin, -2209.0);
+        assert_eq!(current.ymin, -2160.0);
+        assert_eq!(current.xmax, 1631.0);
+        assert_eq!(current.ymax, 800.0);
+    }
 }
 
 unsafe fn configure_cf_settings() -> Result<(), MacosCaptureCreationError> {

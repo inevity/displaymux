@@ -64,6 +64,7 @@ fn default_path() -> Result<PathBuf, VarError> {
 struct ConfigToml {
     capture_backend: Option<CaptureBackend>,
     emulation_backend: Option<EmulationBackend>,
+    emulation_display: Option<String>,
     port: Option<u16>,
     release_bind: Option<Vec<scancode::Linux>>,
     cert_path: Option<PathBuf>,
@@ -569,6 +570,13 @@ impl Config {
         self.args
             .emulation_backend
             .or(self.config_toml.as_ref().and_then(|c| c.emulation_backend))
+    }
+
+    /// Optional backend-specific display selector used for pointer placement.
+    pub fn emulation_display(&self) -> Option<String> {
+        self.config_toml
+            .as_ref()
+            .and_then(|config| config.emulation_display.clone())
     }
 
     /// the port to use (initially)

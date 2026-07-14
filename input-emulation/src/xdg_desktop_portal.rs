@@ -26,7 +26,14 @@ pub(crate) struct DesktopPortalEmulation {
 }
 
 impl DesktopPortalEmulation {
-    pub(crate) async fn new() -> Result<DesktopPortalEmulation, XdpEmulationCreationError> {
+    pub(crate) async fn new(
+        display_selector: Option<&str>,
+    ) -> Result<DesktopPortalEmulation, XdpEmulationCreationError> {
+        if let Some(display_selector) = display_selector {
+            return Err(XdpEmulationCreationError::DisplayTargetUnsupported(
+                display_selector.to_owned(),
+            ));
+        }
         log::debug!("connecting to org.freedesktop.portal.RemoteDesktop portal ...");
         let proxy = RemoteDesktop::new().await?;
 

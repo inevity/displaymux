@@ -1,8 +1,8 @@
 use async_trait::async_trait;
-use std::ptr;
+use std::{io, ptr, slice};
 use x11::{
     xlib::{self, XCloseDisplay},
-    xtest,
+    xrandr, xtest,
 };
 
 use input_event::{
@@ -15,12 +15,13 @@ use super::{Emulation, EmulationHandle, error::X11EmulationCreationError};
 
 pub(crate) struct X11Emulation {
     display: *mut xlib::Display,
+    display_selector: Option<String>,
 }
 
 unsafe impl Send for X11Emulation {}
 
 impl X11Emulation {
-    pub(crate) fn new() -> Result<Self, X11EmulationCreationError> {
+    pub(crate) fn new(display_selector: Option<&str>) -> Result<Self, X11EmulationCreationError> {
         let display = unsafe {
             match xlib::XOpenDisplay(ptr::null()) {
                 d if std::ptr::eq(d, ptr::null_mut::<xlib::Display>()) => {
@@ -29,7 +30,10 @@ impl X11Emulation {
                 display => Ok(display),
             }
         }?;
-        Ok(Self { display })
+        Ok(Self {
+            display,
+            display_selector: display_selector.map(ToOwned::to_owned),
+        })
     }
 
     fn relative_motion(&self, dx: i32, dy: i32) {
@@ -150,5 +154,80 @@ impl Emulation for X11Emulation {
 
     async fn terminate(&mut self) {
         /* nothing to do */
+    }
+
+    fn center_pointer(&mut self, _handle: EmulationHandle) -> Result<(), EmulationError> {
+        let rect = resolve_output_rect(self.display, self.display_selector.as_deref())?;
+        let root = unsafe { xlib::XDefaultRootWindow(self.display) };
+        let center_x = rect.x + rect.width / 2;
+        let center_y = rect.y + rect.height / 2;
+        unsafe {
+            xlib::XWarpPointer(self.display, 0, root, 0, 0, 0, 0, center_x, center_y);
+            xlib::XFlush(self.display);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct OutputRect {
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+}
+
+fn resolve_output_rect(
+    display: *mut xlib::Display,
+    selector: Option<&str>,
+) -> Result<OutputRect, io::Error> {
+    let root = unsafe { xlib::XDefaultRootWindow(display) };
+    let resources = unsafe { xrandr::XRRGetScreenResourcesCurrent(display, root) };
+    if resources.is_null() {
+        return Err(io::Error::other("could not enumerate X11 outputs"));
+    }
+
+    let mut matching = Vec::new();
+    unsafe {
+        let outputs = slice::from_raw_parts((*resources).outputs, (*resources).noutput as usize);
+        for output in outputs {
+            let info = xrandr::XRRGetOutputInfo(display, resources, *output);
+            if info.is_null() {
+                continue;
+            }
+            let name_bytes =
+                slice::from_raw_parts((*info).name.cast::<u8>(), (*info).nameLen as usize);
+            let name = String::from_utf8_lossy(name_bytes);
+            let selected = selector.is_none_or(|selector| name == selector);
+            if selected
+                && i32::from((*info).connection) == xrandr::RR_Connected
+                && (*info).crtc != 0
+            {
+                let crtc = xrandr::XRRGetCrtcInfo(display, resources, (*info).crtc);
+                if !crtc.is_null() {
+                    matching.push(OutputRect {
+                        x: (*crtc).x,
+                        y: (*crtc).y,
+                        width: (*crtc).width as i32,
+                        height: (*crtc).height as i32,
+                    });
+                    xrandr::XRRFreeCrtcInfo(crtc);
+                }
+            }
+            xrandr::XRRFreeOutputInfo(info);
+        }
+        xrandr::XRRFreeScreenResources(resources);
+    }
+
+    match matching.as_slice() {
+        [rect] => Ok(*rect),
+        [] => Err(io::Error::other(match selector {
+            Some(selector) => format!("configured X11 output {selector:?} is not active"),
+            None => "no active X11 output is available".to_owned(),
+        })),
+        _ => Err(io::Error::other(match selector {
+            Some(selector) => format!("configured X11 output {selector:?} is ambiguous"),
+            None => "multiple X11 outputs are active; emulation_display is required".to_owned(),
+        })),
     }
 }
