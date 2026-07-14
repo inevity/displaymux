@@ -2,13 +2,10 @@
 
 Parent: [Main fenced switch implementation plan](plan_main_fullscreen_multiview_switch_implementation.md)
 
-Status (2026-07-13): source implementation, automated tests, native builds,
-and coordinated three-host deployment are complete at lan-mouse commit
-`192354206aad01609488633f44b324564fce7ee0`. Linux, macOS, and Windows run the
-same revision. Native capture and emulation backends initialized on both
-spokes after macOS Accessibility approval. The exhaustive live failure matrix
-is blocked by the explicit decision to use the system normally and investigate
-only failures that occur in that use.
+Status (2026-07-14): completed at
+`7cc0f680768dc9b3ce479e0fb19d486c65ceb9a9`. The accidental-edge correction,
+native rebuilding, three-host deployment, service startup, and persistent-log
+checks passed. Normal use is the selected runtime acceptance path.
 
 ## Objective
 
@@ -35,6 +32,11 @@ Change lan-mouse from a fire-and-forget TV hook producer into the authority that
   release-complete and commit-authorization ordering, same-edge continuation,
   receiver-side center-before-ack behavior, native-library server-role failure
   notifications, and preservation of controller verification causes.
+- Revision `7cc0f68` adds the pre-controller edge-intent gate. Local and full
+  workspace checks pass; the exact pinned revision also passed Linux package,
+  macOS debug, and Windows release native test/build/deploy sequences. The
+  macOS and Windows sequences ran concurrently and all host recaps completed
+  with zero failures or unreachable hosts.
 - lan-mouse log production is non-blocking and bounded to 1,024 records of
   16 KiB, and reports accumulated drops when its persistent sink recovers.
 
@@ -92,11 +94,9 @@ Invariant checks:
 
 ## L0: Capture-Gate Feasibility
 
-Status: completed for the conservative release-first protocol with same-edge
-continuation. Release-before-notify, commit-decision, dropped-decision,
-permit-order, and same-focused-edge tests pass. Coordinated live deployment is
-complete; exhaustive manual input scenarios are blocked by the explicit
-normal-use-first acceptance decision.
+Status: completed for the 2026-07-14 refinement. The first tap is release-only;
+backend retreat evidence and a matching second tap are required before any
+controller request, and post-grant continuation requires same-edge proof.
 
 Use Main Plan Gate 0 before broad implementation.
 
@@ -108,8 +108,11 @@ Preferred one-crossing path:
 
 Conservative safe path if pre-capture is not portable:
 
-- on the first `CaptureEvent::Begin`, emit a candidate and immediately release capture;
-- run one fenced request while the user remains local;
+- on the first `CaptureEvent::Begin`, immediately release capture and prime a
+  bounded intent without emitting a controller candidate;
+- require native retreat evidence for that same edge, then a second matching
+  `Begin` for the same handle, target, and peer session before the deadline;
+- only after that confirmation run one fenced request while the user remains local;
 - store an expiring grant without switching ownership;
 - if the same edge remains focused, resume that crossing after the grant;
   otherwise, on the next matching crossing, revalidate grant plus lease,
@@ -118,16 +121,23 @@ Conservative safe path if pre-capture is not portable:
 
 Do not retain current `active_client`/`WaitingForAck` behavior while the TV transaction is pending. Do not buffer keyboard or pointer events for later remote replay.
 
-Decision (2026-07-11): implement the conservative safe path. The shared
+Decision (2026-07-11, refined 2026-07-14): implement the conservative safe path. The shared
 capture abstraction has no pre-capture edge notification; all native backends
 surface `CaptureEvent::Begin` after exclusive capture begins, while all expose
 the same asynchronous `release()` operation. The first `Begin` therefore
-releases immediately and creates the fenced request. The grant is armed for a
-same-focused-edge continuation or a later matching crossing and cannot itself
-enable capture. This preserves one portable state machine across Linux,
-macOS, and Windows.
+releases immediately and primes only local intent. Layer-shell `Leave` or
+native macOS/Windows inward motion rearms the intent. The input-capture portal
+does not expose post-release local motion and must therefore fail closed rather
+than infer retreat from its release cursor offset. The second matching `Begin`
+creates the fenced request. Only its valid grant may enable same-focused-edge
+continuation or a later matching crossing. This preserves one state machine
+across Linux, macOS, and Windows while making backend evidence capability
+explicit; a server must select a backend that can prove retreat before edge
+switching is enabled.
 
-Exit gate: an automated event-order test and a manual active-backend test prove local clicks, motion, scroll, and keys remain available while pending and after failure.
+Exit gate result: automated event-order tests, native workspace tests, builds,
+and service startup pass. Runtime pointer behavior is accepted through normal
+use rather than a separate scripted physical test matrix.
 
 ## L1: Capability-Aware Peer Protocol
 
@@ -201,13 +211,16 @@ For return to `SERVER_HOST`, release remote capture first even if the TV daemon 
 
 ## L4: Capture State-Machine Integration
 
-Status: completed with target/epoch permits, release completion before
-controller preparation, an explicit crossing commit-authorization reply,
-same-edge continuation, single-use commit, and delayed-command rejection tests.
+Status: completed. The pre-controller intent gate, target/epoch permits,
+release completion, explicit commit authorization, native same-edge
+continuation, single-use commit, and delayed-command rejection are implemented
+and verified.
 
 Refactor event ownership before adding network behavior:
 
-- `capture.rs` reports a candidate without installing `active_client` or sending `Enter`.
+- `capture.rs` reports the first released edge and retreat evidence without
+  installing `active_client`, sending `Enter`, or starting controller work;
+  only the second matching rearmed edge becomes a candidate.
 - `service.rs` owns one gate state and starts the bounded switch client request.
 - only a validated `GrantArmed` command may let capture install the target and emit `Enter`.
 - both keyboard and pointer forwarding become enabled by the same state transition.
@@ -240,7 +253,7 @@ normal-use-first acceptance decision.
 
 Status: completed. Generated fenced configuration, exact-revision native
 build/test, bounded macOS/Windows log wrappers, installation, service restart,
-and peer connection verification passed for revision `1923542` on all hosts.
+and persistent log verification passed for revision `7cc0f68` on all hosts.
 The macOS and Windows task sequences run concurrently under one Ansible
 `strategy: free` play, and their native test/build commands use bounded async
 polling. Each native build links the platform notification implementation into
@@ -273,7 +286,7 @@ cargo build --frozen --release --bin lan-mouse \
 macOS spoke, using its native capture/emulation implementation:
 
 ```sh
-cargo build --frozen --release --bin lan-mouse --no-default-features
+cargo build --frozen --profile dev --bin lan-mouse --no-default-features
 ```
 
 Windows spoke, using its native capture/emulation implementation:
@@ -293,15 +306,16 @@ The Ansible implementation must:
    GTK, libadwaita, `gvsbuild`, and GTK runtime DLL collection are not.
 4. Keep the existing Linux PKGBUILD feature list, but point its source at the
    patched repository/revision instead of the upstream release tag.
-5. Install macOS `target/release/lan-mouse` at a stable daemon path and update
+5. Install macOS `target/debug/lan-mouse` at a stable daemon path and update
    the LaunchAgent. A changed executable may require Accessibility permission
    to be granted again.
 6. Install only Windows `target\release\lan-mouse.exe` into the existing
    program directory; the non-GTK build does not require the current GTK DLL
    archive.
-7. Run platform-appropriate `cargo test` with the same feature selection before
-   installation, record the commit only after build/test success, then restart
-   the service and verify the peer-reported commit/capability version.
+7. Pin a locally checked commit, run platform-appropriate `cargo test` with the
+   same feature selection before installation, record the installed build
+   identity only after native build/test success, then restart the service and
+   verify the peer-reported commit/capability version.
 
 Rollout handshake:
 
@@ -359,7 +373,7 @@ Do not combine backend refactoring, protocol wire changes, TV behavior, and depl
 - Mixed or old versions fail closed.
 - Persistent logs on all three hosts reconstruct create, grant, commit, renewal, release, and fallback using shared identities.
 
-Current gate assessment: source, automated, and native cache-build gates pass.
-The child plan is not live-complete until deployment proves active backend
-behavior, mixed-version fail-closed startup, peer readiness, and correlated
-persistent logs on all three hosts.
+Current gate assessment: source, automated, native build, deployment, managed
+service startup, and persistent log-source gates pass for `7cc0f68`. Runtime
+interaction acceptance proceeds through normal use; physical incident traces
+will be evaluated if ordinary use exposes a failure.

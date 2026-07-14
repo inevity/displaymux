@@ -65,17 +65,21 @@ ProtocolType == [
     reservation_epoch  : Nat,
     keyboard_owner     : Host,
     pointer_owner      : Host,
+    edge_intent_target : RequestTarget,
+    edge_intent_rearmed : BOOLEAN,
+    edge_intent_timer  : Nat,
     fallback_required  : BOOLEAN,
     tv_control_available : BOOLEAN
 ]
 
 \* --- CONSTANTS ---
 
-CONSTANTS SWITCH_TIMEOUT, WAKE_TIMEOUT, RECONNECT_CAP
+CONSTANTS SWITCH_TIMEOUT, WAKE_TIMEOUT, RECONNECT_CAP, EDGE_INTENT_TIMEOUT
 
 ASSUME /\ SWITCH_TIMEOUT \in Nat /\ SWITCH_TIMEOUT > 0
        /\ WAKE_TIMEOUT \in Nat /\ WAKE_TIMEOUT > 0
        /\ RECONNECT_CAP \in Nat /\ RECONNECT_CAP > 0
+       /\ EDGE_INTENT_TIMEOUT \in Nat /\ EDGE_INTENT_TIMEOUT > 0
 
 HostCapture == [
     linux |-> "capturing_linux",
@@ -129,6 +133,7 @@ TypeInvariant ==
     /\ remote_input_ready \in [RemoteHosts -> [InputCapabilities -> BOOLEAN]]
     /\ wake_pending \in ({"none"} \cup RemoteHosts)
     /\ protocol \in ProtocolType
+    /\ protocol.edge_intent_timer \in 0..EDGE_INTENT_TIMEOUT
 
 \* Keyboard and mouse are never independently switched. The local user's
 \* physical input is one unit: pointer motion, pointer buttons, scroll, and
@@ -270,6 +275,9 @@ Init ==
          reservation_epoch |-> 0,
          keyboard_owner |-> SERVER_HOST,
          pointer_owner |-> SERVER_HOST,
+         edge_intent_target |-> "none",
+         edge_intent_rearmed |-> FALSE,
+         edge_intent_timer |-> 0,
          fallback_required |-> FALSE,
          tv_control_available |-> FALSE
        ]
@@ -536,8 +544,74 @@ SubscriptionFires ==
 \*   display shows nothing → keyboard/mouse captured by dead host → stuck.
 \* =====================================================================
 
-\* Phase 1: Cursor crosses edge. Reserve the input bundle and issue the TV
-\* command. Observed TV state and input ownership remain unchanged.
+\* Edge intent is established before Phase 1. The first crossing only releases
+\* native capture and primes this state. It cannot reserve input, issue HTTP,
+\* wake a host, or command the TV. A backend-authoritative retreat from that
+\* edge rearms the intent; only a second matching crossing before the deadline
+\* may be consumed by EnterOtherHost, SendWoL, a readiness rejection, or the
+\* MultiView input-only path.
+\* A backend that cannot observe post-release retreat must leave the intent
+\* un-rearmed. In particular, a portal release cursor offset is not user intent.
+ConfirmedEdgeIntent(host) ==
+    /\ host \in RemoteHosts
+    /\ protocol.edge_intent_target = host
+    /\ protocol.edge_intent_rearmed
+    /\ protocol.edge_intent_timer > 0
+
+PrimeEdgeIntent(host) ==
+    /\ host \in RemoteHosts
+    /\ tv_mode \in {"fullscreen", "multiview"}
+    /\ pending_switch = "none"
+    /\ protocol.phase = "idle"
+    /\ input_owner = SERVER_HOST
+    /\ cursor = SERVER_HOST
+    /\ capture = "idle"
+    /\ (protocol.edge_intent_target # host
+        \/ protocol.edge_intent_timer = 0)
+    /\ protocol' = [protocol EXCEPT
+                       !.edge_intent_target = host,
+                       !.edge_intent_rearmed = FALSE,
+                       !.edge_intent_timer = EDGE_INTENT_TIMEOUT]
+    /\ UNCHANGED <<tv_mode, tv_input, cursor, capture, input_owner, ws_state,
+                   subscribe_active, daemon_healthy, pending_switch,
+                   reconnect_count, switch_timer, wake_timer, input_signal,
+                   remote_online, remote_input_ready, wake_pending>>
+
+EdgeIntentRetreated(host) ==
+    /\ host \in RemoteHosts
+    /\ protocol.edge_intent_target = host
+    /\ ~protocol.edge_intent_rearmed
+    /\ protocol.edge_intent_timer > 0
+    /\ protocol' = [protocol EXCEPT !.edge_intent_rearmed = TRUE]
+    /\ UNCHANGED <<tv_mode, tv_input, cursor, capture, input_owner, ws_state,
+                   subscribe_active, daemon_healthy, pending_switch,
+                   reconnect_count, switch_timer, wake_timer, input_signal,
+                   remote_online, remote_input_ready, wake_pending>>
+
+EdgeIntentTimerTick ==
+    /\ protocol.edge_intent_target \in RemoteHosts
+    /\ protocol.edge_intent_timer > 1
+    /\ protocol' = [protocol EXCEPT
+                       !.edge_intent_timer = @ - 1]
+    /\ UNCHANGED <<tv_mode, tv_input, cursor, capture, input_owner, ws_state,
+                   subscribe_active, daemon_healthy, pending_switch,
+                   reconnect_count, switch_timer, wake_timer, input_signal,
+                   remote_online, remote_input_ready, wake_pending>>
+
+EdgeIntentTimeout ==
+    /\ protocol.edge_intent_target \in RemoteHosts
+    /\ protocol.edge_intent_timer = 1
+    /\ protocol' = [protocol EXCEPT
+                       !.edge_intent_target = "none",
+                       !.edge_intent_rearmed = FALSE,
+                       !.edge_intent_timer = 0]
+    /\ UNCHANGED <<tv_mode, tv_input, cursor, capture, input_owner, ws_state,
+                   subscribe_active, daemon_healthy, pending_switch,
+                   reconnect_count, switch_timer, wake_timer, input_signal,
+                   remote_online, remote_input_ready, wake_pending>>
+
+\* Phase 1: A confirmed second edge crossing reserves the input bundle and
+\* issues the TV command. Observed TV state and input ownership remain unchanged.
 \* APPROACH 1: ALWAYS issues set_input() — no stale-state no-op guard.
 \* switch_timer starts countdown for signal verification.
 \* GUARD: target host must be online and ready for BOTH keyboard and pointer.
@@ -546,6 +620,7 @@ SubscriptionFires ==
 \*   keep input_owner=SERVER_HOST; do not split keyboard from mouse.
 EnterOtherHost(host) ==
     /\ host \in RemoteHosts
+    /\ ConfirmedEdgeIntent(host)
     /\ tv_mode = "fullscreen"
     /\ pending_switch = "none"          \* debounce: only one switch at a time
     /\ protocol.phase = "idle"
@@ -572,6 +647,9 @@ EnterOtherHost(host) ==
                           !.reservation_epoch = request,
                           !.keyboard_owner = SERVER_HOST,
                           !.pointer_owner = SERVER_HOST,
+                          !.edge_intent_target = "none",
+                          !.edge_intent_rearmed = FALSE,
+                          !.edge_intent_timer = 0,
                           !.fallback_required = FALSE]
     \* tv_input and input_signal remain observations; command intent cannot
     \* update them. Input remains on SERVER_HOST until client commit.
@@ -912,6 +990,7 @@ SignalLossRevert ==
 \* When RemoteHostOnline fires → WakeAndRetry automatically re-enters.
 SendWoL(host) ==
     /\ host \in RemoteHosts
+    /\ ConfirmedEdgeIntent(host)
     /\ tv_mode = "fullscreen"
     /\ pending_switch = "none"
     /\ cursor = SERVER_HOST
@@ -932,7 +1011,10 @@ SendWoL(host) ==
                           !.reservation_target = "none",
                           !.reservation_epoch = 0,
                           !.keyboard_owner = SERVER_HOST,
-                          !.pointer_owner = SERVER_HOST]
+                          !.pointer_owner = SERVER_HOST,
+                          !.edge_intent_target = "none",
+                          !.edge_intent_rearmed = FALSE,
+                          !.edge_intent_timer = 0]
     /\ UNCHANGED <<tv_mode, tv_input, cursor, capture, input_owner, ws_state,
                    subscribe_active, daemon_healthy, pending_switch,
                    reconnect_count, switch_timer, input_signal, remote_online,
@@ -1090,7 +1172,8 @@ RemoteInputReadinessUpdate(host) ==
 \* one atomic control stream. Reject the enter; do not wake and do not capture.
 RemoteInputNotReadyReject(host) ==
     /\ host \in RemoteHosts
-    /\ tv_mode = "fullscreen"
+    /\ ConfirmedEdgeIntent(host)
+    /\ tv_mode \in {"fullscreen", "multiview"}
     /\ pending_switch = "none"
     /\ cursor = SERVER_HOST
     /\ input_owner = SERVER_HOST
@@ -1098,10 +1181,14 @@ RemoteInputNotReadyReject(host) ==
     /\ ws_state = "connected"
     /\ remote_online[host] = TRUE
     /\ ~RemoteReadyForControl(host)
+    /\ protocol' = [protocol EXCEPT
+                       !.edge_intent_target = "none",
+                       !.edge_intent_rearmed = FALSE,
+                       !.edge_intent_timer = 0]
     /\ UNCHANGED <<tv_mode, tv_input, cursor, capture, input_owner, ws_state,
                    subscribe_active, daemon_healthy, pending_switch,
                    reconnect_count, switch_timer, wake_timer, input_signal,
-                   remote_online, remote_input_ready, wake_pending, protocol>>
+                   remote_online, remote_input_ready, wake_pending>>
 
 \* Remote host disconnects (power off, crash, network loss).
 \* If displaying, switching to, reserving, or controlling that host, release
@@ -1218,6 +1305,7 @@ ExitMultiView ==
 \* Do NOT switch TV input — it's showing multiple sources already.
 EnterMultiViewHost(host) ==
     /\ host \in RemoteHosts
+    /\ ConfirmedEdgeIntent(host)
     /\ tv_mode = "multiview"
     /\ pending_switch = "none"
     /\ protocol.phase = "idle"
@@ -1236,7 +1324,10 @@ EnterMultiViewHost(host) ==
                           !.reservation_target = host,
                           !.reservation_epoch = request,
                           !.keyboard_owner = host,
-                          !.pointer_owner = host]
+                          !.pointer_owner = host,
+                          !.edge_intent_target = "none",
+                          !.edge_intent_rearmed = FALSE,
+                          !.edge_intent_timer = 0]
     /\ UNCHANGED <<tv_mode, tv_input, ws_state, subscribe_active,
                    daemon_healthy, pending_switch, reconnect_count,
                    switch_timer, wake_timer, input_signal, remote_online,
@@ -1317,6 +1408,10 @@ Next ==
     \/ SSAPSubscribe
     \/ SSAPDisconnect
     \/ SubscriptionFires
+    \/ \E host \in RemoteHosts : PrimeEdgeIntent(host)
+    \/ \E host \in RemoteHosts : EdgeIntentRetreated(host)
+    \/ EdgeIntentTimerTick
+    \/ EdgeIntentTimeout
     \/ \E host \in RemoteHosts : EnterOtherHost(host)
     \/ \E host \in RemoteHosts : SendWoL(host)
     \/ WakeTimerTick
@@ -1348,6 +1443,8 @@ Spec == Init /\ [][Next]_vars
           /\ WF_vars(SSAPRegistered)
           /\ WF_vars(SSAPSubscribe)
           /\ WF_vars(ReconnectFails)
+          /\ WF_vars(EdgeIntentTimerTick)
+          /\ WF_vars(EdgeIntentTimeout)
           /\ WF_vars(TimerTick)
           /\ WF_vars(RemoteCommandOutcome)
           /\ WF_vars(RemoteVerificationOutcome)
@@ -1455,9 +1552,11 @@ TLCFiniteState ==
 \*     capture) are
 \*     modeled in one spec. The HealthDefinition invariant ties them
 \*     together: daemon_healthy iff connected AND subscribed.
-\* C10 (fenced enter): reserve keyboard+pointer, issue TV command, acknowledge,
-\*     obtain a fresh epoch-tagged observation, issue an expiring grant, then
-\*     let lan-mouse atomically commit both owners. These are separate actions.
+\* C10 (fenced enter): the first edge entry only primes local intent. A
+\*     backend-authoritative retreat plus a second matching entry consumes that
+\*     intent before lan-mouse can reserve keyboard+pointer, issue a TV command,
+\*     obtain a fresh epoch-tagged observation, issue an expiring grant, and
+\*     atomically commit both owners. These are separate actions.
 \* C11 (pre-switch wake): EnterOtherHost requires
 \*     RemoteReadyForControl(target) = TRUE for remote hosts. If the
 \*     host is asleep/offline, SendWoL fires instead — sends Wake-on-LAN,
@@ -1488,10 +1587,11 @@ Executable artifacts live in `../tla/`:
   the review that found the defects corrected here.
 
 The finite configuration was checked with TLC 2.19 from
-`/home/example/.cache/nvim/tla.nvim/tla2tools.jar`. TLC completed with no error:
-36,259,841 states generated, 1,064,650 distinct states, depth 28, all twelve
-invariants and all four liveness properties checked. This is bounded validation,
-not a proof of the unbounded production specification.
+`/home/example/.cache/nvim/tla.nvim/tla2tools.jar` on 2026-07-14 after adding the
+edge-intent protocol. TLC completed with no error: 308,009,681 states generated,
+8,717,850 distinct states, depth 34, all twelve invariants and all four liveness
+properties checked. This is bounded validation, not a proof of the unbounded
+production specification.
 
 ## Architecture Design
 
@@ -1611,30 +1711,52 @@ must provide a request-correlated commit gate:
 2. Because native backends report the edge after exclusive capture begins,
    lan-mouse immediately releases that first crossing. It sends no keyboard,
    pointer-motion, pointer-button, or scroll events to the target.
-3. lan-mouse creates one `/enter/{target}` request and stores its request ID,
+3. That first crossing only primes a bounded edge-intent record keyed by the
+   capture handle, switch target, and peer session. It sends no controller
+   request, reserves no lease, wakes no host, and cannot change the TV.
+4. The native backend must report that the pointer retreated from the same
+   edge. A different edge, target, peer session, configuration, or expired
+   intent replaces or clears the record and remains local.
+5. Only a second matching physical crossing consumes the rearmed intent.
+   `ResumeIfFocused` is forbidden before this confirmation, so a retained
+   layer-shell focus cannot manufacture user intent. The deployment's
+   `edge_double_tap_ms` is a stale-intent deadline, not a controller timeout.
+   The initial 500 ms value is deployment policy: it bounds how long the first
+   intent may remain reusable while allowing a deliberate retreat and second
+   push. Expiry always stays local, and the value can be tuned from normal-use
+   timing without weakening the two-contact invariant.
+6. lan-mouse then creates one `/enter/{target}` request and stores its request ID,
    epoch, and deadline. `409 busy` never means allow.
-4. If the request is waking, lan-mouse keeps both input paths local and polls
+7. If the request is waking, lan-mouse keeps both input paths local and polls
    that request ID. The daemon cannot switch input later without client commit.
-5. Before the TV command, the lan-mouse hub reserves keyboard and pointer
+8. Before the TV command, the lan-mouse hub reserves keyboard and pointer
    capacity as one expiring bundle lease. Partial reservation is failure.
-6. The daemon issues `set_input`, receives its correlated acknowledgement,
+9. The daemon issues `set_input`, receives its correlated acknowledgement,
    then obtains a fresh active-input and signal observation tagged with the
    current switch epoch.
-7. The daemon returns an expiring grant containing request epoch and lease ID.
+10. The daemon returns an expiring grant containing request epoch and lease ID.
    lan-mouse arms it without changing ownership. If the pointer is still
    focused on the same physical edge and the same edge-enter serial is current,
    the native capture backend resumes that crossing; otherwise the next
    matching crossing consumes the grant. The resumed or later crossing
    revalidates the peer session and both deadlines, atomically commits
    keyboard+pointer, and reports commit. A stale or late grant is rejected.
-8. On the receiving host, `Enter` releases any outgoing capture and moves the
+11. On the receiving host, `Enter` releases any outgoing capture and moves the
    native pointer to the center of the display that currently contains it
    before returning `Ack`. The transmitted edge remains only the return-edge
    barrier. Centering failure withholds `Ack`, so remote input forwarding
    cannot begin from an edge coordinate and the enter handshake fails closed.
-9. Any other result (`waking`, `multiview`, `not_ready`, `busy`, 4xx/5xx,
+12. Any other result (`waking`, `multiview`, `not_ready`, `busy`, 4xx/5xx,
    timeout, native controller task failure, lease loss) keeps keyboard and mouse
    on `SERVER_HOST`.
+
+Retreat evidence is native but its meaning is shared: layer-shell emits it
+only after `wl_pointer::Leave` from the edge surface; macOS and Windows emit it
+only after local motion returns inside the source display beyond the edge
+rearm zone. The InputCapture portal cannot observe post-release local motion,
+so release completion or a compositor-applied cursor offset is not retreat
+evidence and cannot rearm edge intent. A server using that backend must keep
+edge switching fail-closed until an authoritative retreat source is available.
 
 This is a hard contract. The removed asynchronous `enter_hook` path could start
 only after capture had already begun and therefore could not satisfy C10. A

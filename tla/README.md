@@ -27,14 +27,18 @@ safety, and liveness failures and are not canonical runnable modules.
 
 ## Latest Completed Check
 
-TLC 2.19 completed `TvDisplaySwitchFinite.cfg` on 2026-07-10 with no error:
+TLC 2.19 completed `TvDisplaySwitchFinite.cfg` on 2026-07-14 after the
+edge-intent protocol was added, with no error:
 
-- 36,259,841 states generated
-- 1,064,650 distinct states
-- depth 28
+- 308,009,681 states generated
+- 8,717,850 distinct states
+- depth 34
 - all twelve invariants checked
 - all four liveness properties checked
 
-The corrected model explicitly handles server-signal loss during wake timeout,
-cancels wake state on subscription override and SSAP disconnect, and uses strong
-fairness for timeout versus readiness retry under an oscillating environment.
+The corrected model also requires first edge contact, backend retreat evidence,
+and a second matching contact before reservation, wake, TV control, readiness
+rejection, or MultiView ownership can start. It explicitly handles
+server-signal loss during wake timeout, cancels wake state on subscription
+override and SSAP disconnect, and uses strong fairness for timeout versus
+readiness retry under an oscillating environment.

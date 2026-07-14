@@ -2,19 +2,18 @@
 
 ## Plan Control
 
-- Status: implementation, automated verification, native builds, and
-  coordinated production deployment are complete as of 2026-07-13. Linux,
-  macOS, and Windows run the same pinned lan-mouse revision. The exhaustive
-  live failure matrix and production percentile measurements are blocked by
-  the explicit normal-use-first acceptance decision; failures encountered in
-  ordinary use will be analyzed from the persistent logs.
+- Status: completed for the 2026-07-14 accidental-edge correction. The first
+  edge contact is release-only, native retreat plus a matching second contact
+  is required before controller work, and exact revision `7cc0f68` is deployed
+  on Linux, macOS, and Windows. Runtime acceptance continues through normal use
+  as explicitly requested; the exhaustive physical matrix remains deferred.
 - Design baseline: `fullscreenmultiviewswitchdesign.md` originated at commit
   `319b762`; its living prose and model now describe the implemented protocol.
 - Rust daemon implementation: parent-repository commit `97d31e1` plus its
   prerequisite fenced-protocol commits and verification-cause commit
   `d4d08e3`.
 - lan-mouse implementation: clean `../../lan-mouse` commit
-  `192354206aad01609488633f44b324564fce7ee0`.
+  `7cc0f680768dc9b3ce479e0fb19d486c65ceb9a9`.
 - Controlling objective: implement the approved design without allowing keyboard and pointer ownership to split, and without claiming server-host fallback before the TV state is freshly observed.
 - Compatibility policy: there is no legacy mutation API, compatibility flag,
   fire-and-forget hook authorization, or mixed-version operation. Old peers and
@@ -59,6 +58,28 @@ Linked child plans:
   TOML, plist, shell, PKGBUILD, systemd, and Windows PowerShell artifacts pass
   their available native parsers; bounded macOS and Windows rotation wrappers
   also passed temporary-file runtime tests on their respective hosts.
+
+## Edge Intent Verification (2026-07-14)
+
+- `cargo check`, `cargo test`, and `cargo test --workspace` pass for lan-mouse;
+  the workspace run checks 55 tests across capture, emulation, core, CLI, and
+  protocol crates. `cargo clippy --workspace --all-targets` completes with only
+  four pre-existing warnings outside the edge-intent change.
+- The server-role gate is keyed by capture handle, switch target, and peer
+  session. A first edge entry releases capture and primes local state only;
+  backend retreat evidence rearms it, and only a matching second entry can
+  reserve the input bundle or start controller work. Layer-shell, macOS, and
+  Windows provide native retreat evidence. The input-capture portal fails
+  closed because it cannot observe post-release local motion.
+- One Ansible run packaged exact commit `7cc0f68`, built and installed the Linux
+  no-GTK package, then ran macOS and Windows native test/build/deploy sequences
+  concurrently. macOS used the configured debug profile; Windows used release.
+  All three services and persistent-log checks passed with zero failed or
+  unreachable hosts.
+- TLC 2.19 completed `TvDisplaySwitchFinite.cfg` with all twelve invariants and
+  four liveness properties: 308,009,681 states generated, 8,717,850 distinct
+  states, depth 34, and no error. This remains bounded validation, not proof of
+  the unbounded production specification.
 
 ## TLA Planning Frame
 
@@ -150,18 +171,23 @@ Gate evidence:
 - A manual backend test proves pointer buttons, motion, scroll, and keyboard remain usable on `SERVER_HOST` while pending and after every denial/failure.
 - Cancellation and timeout release any backend capture without waiting for the TV daemon.
 
-Gate 0 decision (2026-07-11, refined 2026-07-13): use the conservative
-release-first refinement with same-edge continuation.
+Gate 0 decision (2026-07-11, refined 2026-07-13 and 2026-07-14): use the
+conservative release-first refinement with a pre-controller double-edge
+intent gate.
 The current backend-neutral API reports `CaptureEvent::Begin` only after the
 backend has entered exclusive capture, so a portable one-crossing pre-capture
-candidate does not exist. On the first crossing, lan-mouse must emit only a
-candidate, call the existing backend-neutral `capture.release()`, and keep all
-input local while obtaining an expiring grant. A backend may re-grab and
-synthesize `Begin` only if the original edge is still focused and its enter
-serial is unchanged; otherwise only a later matching crossing may revalidate
-the grant and emit `ProtoEvent::Enter`. This decision remains subject to the
-automated event-order and native-backend verification gates below; no backend
-may buffer input while the grant is pending.
+candidate does not exist. On the first crossing, lan-mouse calls the existing
+backend-neutral `capture.release()`, records only a bounded intent keyed by
+handle, target, and peer session, and performs no controller or TV operation.
+The backend must then prove retreat from that edge. Only a second matching
+physical crossing before `edge_double_tap_ms` may create the fenced request.
+A backend may re-grab and synthesize `Begin` only after that confirmed request
+returns a valid grant; retained layer-shell focus cannot confirm initial user
+intent. The input-capture portal cannot observe post-release local motion, so
+it must not infer retreat from a cursor offset; edge switching remains disabled
+there until an authoritative retreat source exists. This decision remains
+subject to automated event-order and native backend verification; no backend
+may buffer input while intent or a grant is pending.
 
 ## Interface Decision Required Before Phase 3
 
@@ -244,11 +270,9 @@ Exit gate: scripted transport tests prove correlation, reconnect/resubscribe/res
 
 ### Phase 4: lan-mouse Capability, Lease, and Capture Gate
 
-Status: completed and covered by protocol, lease, release-before-notify,
-crossing commit authorization, same-edge continuation, native controller
-lifecycle, capture permit, Linux tests, native spoke builds, and live backend
-startup. Exhaustive manual input scenarios remain blocked by the explicit
-normal-use-first acceptance decision.
+Status: completed. The pre-controller edge-intent gate, native retreat proof,
+same-focused-edge continuation after grant, automated checks, and all three
+native builds passed for revision `7cc0f68`.
 
 Owner: `plan_lan_mouse_atomic_input_gate.md`.
 
@@ -277,13 +301,12 @@ Exit gate: black-box API tests prove status code, body schema, idempotency, stal
 
 ### Phase 6: Coordinated Deployment Cutover
 
-Status: completed. Revision `1923542` passed Linux, macOS, and Windows native
-tests and release builds from the pinned bundle, was installed on all three
-hosts, and started with matching peer identity. Windows initialized native
-capture/emulation immediately. macOS failed closed while Accessibility was
-absent, then initialized native capture/emulation after approval and a
-LaunchAgent-only restart. macOS and Windows native task sequences executed in
-parallel under one Ansible process. Each target binary contains its native
+Status: completed. The earlier `1923542` rollout established the fenced
+protocol. The 2026-07-14 correction then packaged exact revision `7cc0f68`,
+passed Linux, macOS, and Windows native tests and builds, installed it on all
+three hosts, and restarted only the managed services. macOS used its configured
+debug profile and Windows used release. The two spoke task sequences executed
+in parallel under one Ansible process. Each target binary contains its native
 notification backend; `lan_mouse_server_host` selects the emitting instance
 without an external notification executable.
 
@@ -373,8 +396,9 @@ The objective is complete only when:
 - deployment and rollback are repeatable across Linux, macOS, and Windows;
 - the obsolete plans are marked historical or removed in a separate reviewed cleanup, and no compatibility path remains in production code.
 
-Current completion assessment: source-level implementation and automated test
-criteria are satisfied, but the objective is not production-complete. Exact-pin
-macOS/Windows builds, the live cutover, native active-backend behavior, physical
-TV failure matrix, forensic log reconstruction, and production percentile
-measurements remain blocked on explicit coordinated-host authorization.
+Current completion assessment: the requested source implementation, bounded
+model check, exact-pin native builds, coordinated live cutover, service startup,
+and persistent log-source checks are complete at `7cc0f68`. The user selected
+normal-use-first acceptance instead of an exhaustive live failure matrix;
+physical failure traces and production percentile measurements are therefore
+deferred evidence, not incomplete implementation work.
