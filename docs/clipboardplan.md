@@ -2,7 +2,8 @@
 
 ## Plan Control
 
-- Status: in progress. P0 completed on 2026-07-14; P1 is the next action.
+- Status: in progress. P0 and P1 completed on 2026-07-14; P2 is the next
+  action.
 - Plan type: scoped child implementation plan. The requested filename is
   `docs/clipboardplan.md`; this is not a replacement root objective and
   therefore does not supersede
@@ -433,7 +434,23 @@ Rollback: none; P0 is read-only.
 
 ## P1: Domain State and Native Actor Contract
 
-Status: pending. Depends on P0.
+Status: completed on 2026-07-14.
+
+P1 evidence:
+
+- added the unused-at-runtime `lan-mouse-clipboard` workspace crate with
+  identity newtypes, one-active-handoff coordinator, serialized native actor,
+  and a single payload slot outside the Service event path;
+- actor apply uses a generation-guarded backend write operation, preventing a
+  native generation check/write race;
+- 21 focused tests cover identity exhaustion/non-reuse, supersession,
+  authority/process/host fences, return-to-server preparation, stable capture,
+  unavailable-versus-empty behavior, destination preservation, duplicate
+  apply, payload isolation, queue saturation/closure, shutdown, and a delayed
+  three-host result;
+- `cargo fmt --all -- --check`, focused check/test, and no-GTK workspace
+  check/test pass; the two pre-existing no-feature warnings are unchanged;
+- no runtime Service or existing workspace crate imports the new crate.
 
 ### Files
 
@@ -567,7 +584,8 @@ cargo check --workspace --exclude lan-mouse-gtk --no-default-features
 cargo test --workspace --exclude lan-mouse-gtk --no-default-features
 ```
 
-P1 exit gate: all tests pass, payload count/size assertions are executable,
+P1 exit result: passed. All tests pass, payload count/size assertions are
+executable, generation compare-and-write is one backend critical operation,
 and no runtime service code imports the new crate yet.
 
 Commit boundary: stage only the new crate, workspace membership, lockfile, and
@@ -1202,7 +1220,7 @@ must not be collapsed before their individual gates pass.
 ## Implementation Status
 
 - P0 Refinement and baseline gate: completed 2026-07-14
-- P1 Domain state and actor contract: pending
+- P1 Domain state and actor contract: completed 2026-07-14
 - P2 Framing, authentication, and transport: pending
 - P3 Coordinator and input-transition hooks: pending
 - P4 Linux native actor: pending
