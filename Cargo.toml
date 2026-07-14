@@ -5,6 +5,7 @@ members = [
     "input-event",
     "lan-mouse-ipc",
     "lan-mouse-cli",
+    "lan-mouse-clipboard",
     "lan-mouse-gtk",
     "lan-mouse-proto",
 ]

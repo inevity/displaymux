@@ -2054,6 +2054,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "lan-mouse-clipboard"
+version = "0.1.0"
+dependencies = [
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "lan-mouse-gtk"
 version = "0.3.0"
 dependencies = [
