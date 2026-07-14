@@ -2,7 +2,7 @@
 
 ## Plan Control
 
-- Status: in progress. P0 and P1 completed on 2026-07-14; P2 is the next
+- Status: in progress. P0 through P2 completed on 2026-07-14; P3 is the next
   action.
 - Plan type: scoped child implementation plan. The requested filename is
   `docs/clipboardplan.md`; this is not a replacement root objective and
@@ -595,7 +595,27 @@ Rollback: remove the unused workspace member; runtime behavior is unchanged.
 
 ## P2: Framing, Authentication, and Transport
 
-Status: pending. Depends on P1.
+Status: completed on 2026-07-14.
+
+P2 evidence:
+
+- implemented fixed network-order `LMCB` V1 framing for all control and
+  snapshot messages outside `lan-mouse-proto`;
+- prefix validation rejects magic/version/type/flags/header/length faults
+  before payload allocation, and fixed identity metadata is validated before
+  payload read or inbound publication;
+- implemented TLS 1.3-only mutual certificate authentication with exact leaf
+  fingerprint authorization, TLS handshake signature verification, ALPN, and
+  authenticated certificate-to-`HostId` binding;
+- implemented deterministic peer process-session replacement, authority/peer
+  fences, one writer, bounded control paths, and one payload total across
+  queued and active transfer state;
+- handoff cancellation interrupts a blocked payload write and releases its
+  bytes; malformed clipboard input exits independently while a fake input path
+  continues;
+- the focused crate suite now has 47 passing tests; formatting, focused check,
+  and no-GTK workspace check/test pass with only the two unchanged baseline
+  warnings.
 
 ### Files
 
@@ -686,8 +706,10 @@ downgrade is allowed.
 Run P1 commands plus focused codec, TLS-loopback, and fault-transport tests.
 Add dependencies to `Cargo.toml` only after the exact APIs are used.
 
-P2 exit gate: every malformed-length path proves no oversized allocation, the
-TLS test proves mutual fingerprint identity, and input-isolation tests pass.
+P2 exit result: passed. Every malformed-length path is rejected before
+oversized allocation, loopback TLS proves mutual fingerprint identity and
+host binding, stale payload metadata is rejected before publication, and
+input-isolation tests pass.
 
 Commit boundary: framing, TLS transport, necessary dependency/lockfile changes,
 and focused tests. Proposed subject: `feat: add authenticated clipboard transport`.
@@ -1221,7 +1243,7 @@ must not be collapsed before their individual gates pass.
 
 - P0 Refinement and baseline gate: completed 2026-07-14
 - P1 Domain state and actor contract: completed 2026-07-14
-- P2 Framing, authentication, and transport: pending
+- P2 Framing, authentication, and transport: completed 2026-07-14
 - P3 Coordinator and input-transition hooks: pending
 - P4 Linux native actor: pending
 - P5 Windows native actor: pending
