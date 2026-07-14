@@ -1,6 +1,7 @@
 use crate::{
     capture::{Capture, CaptureType, ICaptureEvent},
     client::ClientManager,
+    clipboard::{ClipboardRuntime, ClipboardTransitionId},
     config::{Config, ConfigClient},
     connect::LanMouseConnection,
     crypto,
@@ -15,6 +16,7 @@ use crate::{
     },
 };
 use futures::StreamExt;
+use lan_mouse_clipboard::{ClipboardReason, TlsIdentity};
 use lan_mouse_ipc::{
     AsyncFrontendListener, ClientHandle, FrontendEvent, FrontendRequest, IpcError,
     IpcListenerCreationError, Position, Status,
@@ -108,6 +110,9 @@ pub struct Service {
     active_switch_capture: Option<(ClientHandle, u64)>,
     pending_switch_cleanup: Option<(GateContext, &'static str)>,
     next_release_epoch: u64,
+    clipboard: ClipboardRuntime,
+    clipboard_tls_identity: Option<TlsIdentity>,
+    pending_clipboard_fallback: Option<(ClientHandle, u64)>,
 }
 
 #[derive(Debug)]
@@ -172,6 +177,28 @@ impl Service {
         // load certificate
         let cert = crypto::load_or_generate_key_and_cert(config.cert_path())?;
         let public_key_fingerprint = crypto::certificate_fingerprint(&cert);
+        let clipboard_tls_identity = match crypto::clipboard_tls_identity(&cert) {
+            Ok(identity) => Some(identity),
+            Err(error) => {
+                tracing::warn!(
+                    event = "clipboard_backend_unavailable",
+                    error = %error,
+                    "clipboard TLS identity conversion failed; input remains available"
+                );
+                None
+            }
+        };
+        let clipboard = ClipboardRuntime::start(
+            config.clipboard(),
+            switch_controller.as_ref().map(SwitchController::local_host),
+            switch_controller
+                .as_ref()
+                .map(SwitchController::server_host),
+            config.port(),
+            clipboard_tls_identity.clone(),
+            config.clients(),
+            config.authorized_fingerprints(),
+        );
 
         // create frontend communication adapter, exit if already running
         let frontend_listener = AsyncFrontendListener::new().await?;
@@ -221,6 +248,9 @@ impl Service {
             active_switch_capture: None,
             pending_switch_cleanup: None,
             next_release_epoch: 0,
+            clipboard,
+            clipboard_tls_identity,
+            pending_clipboard_fallback: None,
         };
         Ok(service)
     }
@@ -257,6 +287,10 @@ impl Service {
         }
 
         log::info!("terminating service ...");
+        self.clipboard
+            .handle()
+            .cancel_current(ClipboardReason::Canceled);
+        self.clipboard.shutdown();
         let switch_context = self.bundle_lease.invalidate();
         self.capture.release();
         self.cancel_switch_task();
@@ -380,6 +414,7 @@ impl Service {
                 SystemNotifier::new(controller.local_host(), controller.server_host())
             })
             .unwrap_or_else(SystemNotifier::disabled);
+        self.restart_clipboard();
         for h in self.client_manager.registered_clients() {
             self.remove_client(h);
         }
@@ -443,7 +478,10 @@ impl Service {
             }
             EmulationEvent::PortChanged(port) => match port {
                 Ok(port) => {
-                    self.port = port;
+                    if self.port != port {
+                        self.port = port;
+                        self.restart_clipboard();
+                    }
                     self.notify_frontend(FrontendEvent::PortChanged(port, None));
                 }
                 Err(e) => self
@@ -496,6 +534,7 @@ impl Service {
                 // we entered the capture zone for an incoming connection
                 // => notify it that its capture should be released
                 if let Some(incoming) = self.incoming_conn_info.get(&handle) {
+                    let _ = self.clipboard.handle().capture_provisional();
                     self.next_release_epoch = self
                         .next_release_epoch
                         .checked_add(1)
@@ -505,6 +544,10 @@ impl Service {
                 }
             }
             ICaptureEvent::CaptureDisabled => {
+                self.clipboard
+                    .handle()
+                    .cancel_current(ClipboardReason::BackendUnavailable);
+                self.pending_clipboard_fallback = None;
                 self.capture_status = Status::Disabled;
                 if let Some(gate) = self.edge_intent_gate.as_mut() {
                     gate.clear();
@@ -567,6 +610,20 @@ impl Service {
             }
             ICaptureEvent::ClientReleased { handle, reason } => {
                 log::info!("released client {handle} capture");
+                if reason == crate::capture::CaptureReleaseReason::PeerReleaseRequested {
+                    if let Some((pending_handle, release_epoch)) =
+                        self.pending_clipboard_fallback.take()
+                    {
+                        if pending_handle == handle {
+                            let _ = self
+                                .clipboard
+                                .handle()
+                                .activate(ClipboardTransitionId::Fallback { release_epoch });
+                        }
+                    }
+                } else {
+                    self.pending_clipboard_fallback = None;
+                }
                 self.active_switch_capture = None;
                 if self.pending_switch_cleanup.is_some() {
                     self.complete_pending_switch_cleanup();
@@ -581,7 +638,47 @@ impl Service {
                 self.broadcast_client(handle);
                 self.handle_peer_readiness_change(handle);
             }
+            ICaptureEvent::PeerReleaseStarted {
+                handle,
+                release_epoch,
+            } => {
+                let Some(server_host) = self
+                    .switch_controller
+                    .as_ref()
+                    .map(SwitchController::server_host)
+                else {
+                    return;
+                };
+                if self
+                    .clipboard
+                    .handle()
+                    .begin_fallback(release_epoch, server_host)
+                {
+                    self.pending_clipboard_fallback = Some((handle, release_epoch));
+                }
+            }
         }
+    }
+
+    fn restart_clipboard(&mut self) {
+        self.clipboard
+            .handle()
+            .cancel_current(ClipboardReason::Canceled);
+        self.clipboard.shutdown();
+        self.pending_clipboard_fallback = None;
+        self.clipboard = ClipboardRuntime::start(
+            self.config.clipboard(),
+            self.switch_controller
+                .as_ref()
+                .map(SwitchController::local_host),
+            self.switch_controller
+                .as_ref()
+                .map(SwitchController::server_host),
+            self.port,
+            self.clipboard_tls_identity.clone(),
+            self.config.clients(),
+            self.config.authorized_fingerprints(),
+        );
     }
 
     fn peer_readiness(&self, handle: ClientHandle) -> Option<PeerBundleReadiness> {
@@ -740,6 +837,10 @@ impl Service {
                 return;
             }
         };
+        let _ = self
+            .clipboard
+            .handle()
+            .begin_remote(context.lease.lease_epoch, context.target);
         self.reset_switch_deadline();
         if !self.start_prepare_task(context.clone(), readiness) {
             self.fail_context(context, "controller_busy");
@@ -1074,6 +1175,12 @@ impl Service {
             self.controller_now_ms(),
         ) {
             Ok((context, grant)) => {
+                let _ = self
+                    .clipboard
+                    .handle()
+                    .activate(ClipboardTransitionId::Outgoing {
+                        lease_epoch: context.lease.lease_epoch,
+                    });
                 self.reset_switch_deadline();
                 if !self.start_commit_task(context.clone(), grant) {
                     self.defer_failure_until_capture_release(context, "commit_task_busy");
@@ -1283,6 +1390,12 @@ impl Service {
         reason: &'static str,
         detail: Option<String>,
     ) {
+        self.clipboard.handle().cancel(
+            ClipboardTransitionId::Outgoing {
+                lease_epoch: context.lease.lease_epoch,
+            },
+            ClipboardReason::Canceled,
+        );
         if self
             .bundle_lease
             .context()
@@ -1313,6 +1426,12 @@ impl Service {
     }
 
     fn defer_failure_until_capture_release(&mut self, context: GateContext, reason: &'static str) {
+        self.clipboard.handle().cancel(
+            ClipboardTransitionId::Outgoing {
+                lease_epoch: context.lease.lease_epoch,
+            },
+            ClipboardReason::Canceled,
+        );
         if self
             .bundle_lease
             .context()
@@ -1336,6 +1455,12 @@ impl Service {
         let Some(context) = self.bundle_lease.invalidate() else {
             return;
         };
+        self.clipboard.handle().cancel(
+            ClipboardTransitionId::Outgoing {
+                lease_epoch: context.lease.lease_epoch,
+            },
+            ClipboardReason::Canceled,
+        );
         self.cancel_switch_task();
         self.switch_deadline = None;
         if notify_failure {

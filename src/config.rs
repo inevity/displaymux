@@ -60,7 +60,9 @@ fn default_path() -> Result<PathBuf, VarError> {
     Ok(PathBuf::from(default_path))
 }
 
-#[derive(Serialize, Deserialize, Clone, Default, PartialEq)]
+const DEFAULT_CLIPBOARD_MAX_BYTES: usize = 3 * 1024 * 1024;
+
+#[derive(Serialize, Deserialize, Clone, PartialEq)]
 struct ConfigToml {
     capture_backend: Option<CaptureBackend>,
     emulation_backend: Option<EmulationBackend>,
@@ -71,6 +73,62 @@ struct ConfigToml {
     clients: Option<Vec<TomlClient>>,
     authorized_fingerprints: Option<HashMap<String, String>>,
     switch_controller: Option<SwitchControllerToml>,
+    clipboard: Option<ClipboardToml>,
+}
+
+impl Default for ConfigToml {
+    fn default() -> Self {
+        Self {
+            capture_backend: None,
+            emulation_backend: None,
+            emulation_display: None,
+            port: None,
+            release_bind: None,
+            cert_path: None,
+            clients: None,
+            authorized_fingerprints: None,
+            switch_controller: None,
+            clipboard: Some(ClipboardToml::default()),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(default)]
+struct ClipboardToml {
+    enabled: bool,
+    max_bytes: usize,
+}
+
+impl Default for ClipboardToml {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_bytes: DEFAULT_CLIPBOARD_MAX_BYTES,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ClipboardConfig {
+    pub(crate) enabled: bool,
+    pub(crate) max_bytes: usize,
+}
+
+impl TryFrom<ClipboardToml> for ClipboardConfig {
+    type Error = ConfigError;
+
+    fn try_from(config: ClipboardToml) -> Result<Self, Self::Error> {
+        if config.max_bytes == 0 || u64::try_from(config.max_bytes).is_err() {
+            return Err(ConfigError::Clipboard(
+                "max_bytes must be non-zero and representable by the wire protocol".to_string(),
+            ));
+        }
+        Ok(Self {
+            enabled: config.enabled,
+            max_bytes: config.max_bytes,
+        })
+    }
 }
 
 #[derive(Clone, Deserialize, PartialEq, Serialize)]
@@ -370,6 +428,7 @@ pub struct Config {
     watch_rx: tokio::sync::mpsc::Receiver<Result<notify::Event, notify::Error>>,
 }
 
+#[derive(Clone)]
 pub(crate) struct ConfigClient {
     pub ips: HashSet<IpAddr>,
     pub hostname: Option<String>,
@@ -437,6 +496,8 @@ pub enum ConfigError {
     Watcher(#[from] notify::Error),
     #[error("invalid switch controller configuration: {0}")]
     SwitchController(String),
+    #[error("invalid clipboard configuration: {0}")]
+    Clipboard(String),
 }
 
 const DEFAULT_RELEASE_KEYS: [scancode::Linux; 4] =
@@ -482,6 +543,9 @@ impl Config {
             .and_then(|config| config.switch_controller.clone())
         {
             SwitchControllerConfig::try_from(controller)?;
+        }
+        if let Some(clipboard) = config_toml.as_ref().and_then(|config| config.clipboard) {
+            ClipboardConfig::try_from(clipboard)?;
         }
 
         // --cert-path <file> overrules default location
@@ -612,6 +676,15 @@ impl Config {
             .expect("switch controller was validated before installation")
     }
 
+    pub(crate) fn clipboard(&self) -> ClipboardConfig {
+        self.config_toml
+            .as_ref()
+            .and_then(|config| config.clipboard)
+            .unwrap_or_default()
+            .try_into()
+            .expect("clipboard configuration was validated before installation")
+    }
+
     /// release bind for returning control to the host
     pub fn release_bind(&self) -> Vec<scancode::Linux> {
         self.config_toml
@@ -659,6 +732,12 @@ impl Config {
             Ok(current_config) => {
                 if let Some(controller) = current_config.switch_controller.clone() {
                     if let Err(error) = SwitchControllerConfig::try_from(controller) {
+                        log::warn!("{:?}: {error}", self.config_path());
+                        return Ok(false);
+                    }
+                }
+                if let Some(clipboard) = current_config.clipboard {
+                    if let Err(error) = ClipboardConfig::try_from(clipboard) {
                         log::warn!("{:?}: {error}", self.config_path());
                         return Ok(false);
                     }
@@ -769,5 +848,40 @@ mod tests {
             SwitchControllerConfig::try_from(config),
             Err(ConfigError::SwitchController(_))
         ));
+    }
+
+    #[test]
+    fn clipboard_defaults_to_enabled_with_three_megabyte_limit() {
+        assert_eq!(
+            ClipboardConfig::try_from(ClipboardToml::default()).unwrap(),
+            ClipboardConfig {
+                enabled: true,
+                max_bytes: 3 * 1024 * 1024,
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_zero_clipboard_limit() {
+        assert!(matches!(
+            ClipboardConfig::try_from(ClipboardToml {
+                enabled: true,
+                max_bytes: 0,
+            }),
+            Err(ConfigError::Clipboard(_))
+        ));
+    }
+
+    #[test]
+    fn partial_clipboard_table_uses_documented_defaults() {
+        let config: ConfigToml = toml::from_str("[clipboard]\nenabled = false\n").unwrap();
+
+        assert_eq!(
+            config.clipboard,
+            Some(ClipboardToml {
+                enabled: false,
+                max_bytes: 3 * 1024 * 1024,
+            })
+        );
     }
 }

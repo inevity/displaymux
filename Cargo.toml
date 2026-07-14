@@ -32,6 +32,7 @@ input-event = { path = "input-event", version = "0.4.0" }
 input-emulation = { path = "input-emulation", version = "0.4.0", default-features = false }
 input-capture = { path = "input-capture", version = "0.4.0", default-features = false }
 lan-mouse-cli = { path = "lan-mouse-cli", version = "0.3.0" }
+lan-mouse-clipboard = { path = "lan-mouse-clipboard", version = "0.1.0" }
 lan-mouse-gtk = { path = "lan-mouse-gtk", version = "0.3.0", optional = true }
 lan-mouse-ipc = { path = "lan-mouse-ipc", version = "0.3.0" }
 lan-mouse-proto = { path = "lan-mouse-proto", version = "0.3.0" }
@@ -59,6 +60,8 @@ clap = { version = "4.4.11", features = ["derive"] }
 slab = "0.4.9"
 thiserror = "2.0.0"
 tokio-util = "0.7.11"
+tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring"] }
+tracing = "0.1.44"
 local-channel = "0.1.5"
 webrtc-dtls = { version = "0.12.0", features = ["pem"] }
 webrtc-util = "0.11.0"

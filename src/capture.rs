@@ -56,6 +56,11 @@ pub(crate) enum ICaptureEvent {
     },
     /// A peer readiness/session update was received on the outgoing connection.
     PeerReadiness(u64),
+    /// A valid active peer requested return-to-server release.
+    PeerReleaseStarted {
+        handle: CaptureHandle,
+        release_epoch: u64,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -409,6 +414,14 @@ impl CaptureTask {
                             log::info!(
                                 "releasing capture for peer request epoch {release_epoch}"
                             );
+                            if self.active_client == Some(handle) {
+                                self.event_tx
+                                    .send(ICaptureEvent::PeerReleaseStarted {
+                                        handle,
+                                        release_epoch,
+                                    })
+                                    .expect("channel closed");
+                            }
                             self.release_capture(
                                 capture,
                                 CaptureReleaseReason::PeerReleaseRequested,

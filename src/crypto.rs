@@ -10,12 +10,16 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use webrtc_dtls::crypto::Certificate;
 
+use lan_mouse_clipboard::TlsIdentity;
+
 #[derive(Debug, Error)]
 pub enum Error {
     #[error(transparent)]
     Io(#[from] io::Error),
     #[error(transparent)]
     Dtls(#[from] webrtc_dtls::Error),
+    #[error(transparent)]
+    ClipboardTls(#[from] lan_mouse_clipboard::TlsError),
 }
 
 pub fn generate_fingerprint(cert: &[u8]) -> String {
@@ -32,6 +36,14 @@ pub fn generate_fingerprint(cert: &[u8]) -> String {
 pub fn certificate_fingerprint(cert: &Certificate) -> String {
     let certificate = cert.certificate.first().expect("certificate missing");
     generate_fingerprint(certificate)
+}
+
+pub fn clipboard_tls_identity(cert: &Certificate) -> Result<TlsIdentity, Error> {
+    TlsIdentity::new(
+        cert.certificate.clone(),
+        cert.private_key.serialized_der.clone(),
+    )
+    .map_err(Into::into)
 }
 
 /// load certificate from file
@@ -68,4 +80,23 @@ pub(crate) fn generate_key_and_cert(path: &Path) -> Result<Certificate, Error> {
     let mut writer = BufWriter::new(f);
     writer.write_all(serialized.as_bytes())?;
     Ok(cert)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dtls_certificate_converts_to_clipboard_tls_identity() {
+        let certificate = Certificate::generate_self_signed(["clipboard-test".to_string()])
+            .expect("test certificate");
+
+        let identity = clipboard_tls_identity(&certificate).expect("clipboard identity");
+
+        assert_eq!(identity.certificates(), certificate.certificate.as_slice());
+        assert_eq!(
+            identity.fingerprint().to_string(),
+            certificate_fingerprint(&certificate)
+        );
+    }
 }

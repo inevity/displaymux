@@ -51,6 +51,12 @@ pub struct BeginHandoff {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+struct PendingOwnership {
+    handoff_id: HandoffId,
+    target_token: OwnershipToken,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CoordinatorCommand {
     PrepareTarget {
         handoff_id: HandoffId,
@@ -81,8 +87,6 @@ pub enum CoordinatorCommand {
 pub enum CoordinatorError {
     #[error("clipboard handoff identity exhausted")]
     IdentityExhausted,
-    #[error("unknown clipboard host: {0}")]
-    UnknownHost(HostId),
     #[error("clipboard target is already the current owner")]
     SameHost,
     #[error("clipboard handoff is stale")]
@@ -106,6 +110,7 @@ pub struct Coordinator {
     next_handoff_epoch: HandoffEpoch,
     max_bytes: usize,
     process_sessions: HashMap<HostId, ProcessSessionId>,
+    pending_ownership: Option<PendingOwnership>,
     active: Option<ActiveHandoff>,
     last_terminal: Option<(HandoffId, Result<(), ClipboardReason>)>,
 }
@@ -132,6 +137,7 @@ impl Coordinator {
             next_handoff_epoch: HandoffEpoch::new(0),
             max_bytes,
             process_sessions,
+            pending_ownership: None,
             active: None,
             last_terminal: None,
         }
@@ -176,6 +182,23 @@ impl Coordinator {
         }
     }
 
+    pub fn remove_process_session(&mut self, host: &HostId) -> Vec<CoordinatorCommand> {
+        if self.process_sessions.remove(host).is_none() {
+            return Vec::new();
+        }
+        if self
+            .active
+            .as_ref()
+            .is_some_and(|handoff| handoff.source_host == *host || handoff.target_host == *host)
+        {
+            self.cancel(ClipboardReason::ChannelUnavailable)
+                .into_iter()
+                .collect()
+        } else {
+            Vec::new()
+        }
+    }
+
     pub fn set_enabled(&mut self, enabled: bool) -> Vec<CoordinatorCommand> {
         if self.enabled == enabled {
             return Vec::new();
@@ -195,15 +218,8 @@ impl Coordinator {
         let source_process_session_id = self
             .process_sessions
             .get(&self.current_token.owner_host_id)
-            .copied()
-            .ok_or_else(|| {
-                CoordinatorError::UnknownHost(self.current_token.owner_host_id.clone())
-            })?;
-        let target_process_session_id = self
-            .process_sessions
-            .get(&target_host)
-            .copied()
-            .ok_or_else(|| CoordinatorError::UnknownHost(target_host.clone()))?;
+            .copied();
+        let target_process_session_id = self.process_sessions.get(&target_host).copied();
 
         let ownership_epoch = self
             .next_ownership_epoch
@@ -229,7 +245,15 @@ impl Coordinator {
             owner_host_id: target_host.clone(),
         };
         let source_token = self.current_token.clone();
-        if self.enabled {
+        self.pending_ownership = Some(PendingOwnership {
+            handoff_id,
+            target_token: target_token.clone(),
+        });
+        if let (true, Some(source_process_session_id), Some(target_process_session_id)) = (
+            self.enabled,
+            source_process_session_id,
+            target_process_session_id,
+        ) {
             commands.extend([
                 CoordinatorCommand::PrepareTarget {
                     handoff_id,
@@ -243,23 +267,28 @@ impl Coordinator {
                     max_bytes: self.max_bytes,
                 },
             ]);
-        }
-        self.active = self.enabled.then_some(ActiveHandoff {
-            id: handoff_id,
-            source_host: source_token.owner_host_id.clone(),
-            source_token: source_token.clone(),
-            source_process_session_id,
-            target_host,
-            target_token: target_token.clone(),
-            target_process_session_id,
-            phase: HandoffPhase::Capturing,
-            snapshot: None,
-            target_preparation: None,
-            target_activated: false,
-            snapshot_published: false,
-        });
-        if !self.enabled {
-            self.last_terminal = Some((handoff_id, Err(ClipboardReason::Canceled)));
+            self.active = Some(ActiveHandoff {
+                id: handoff_id,
+                source_host: source_token.owner_host_id.clone(),
+                source_token: source_token.clone(),
+                source_process_session_id,
+                target_host,
+                target_token: target_token.clone(),
+                target_process_session_id,
+                phase: HandoffPhase::Capturing,
+                snapshot: None,
+                target_preparation: None,
+                target_activated: false,
+                snapshot_published: false,
+            });
+        } else {
+            let reason = if self.enabled {
+                ClipboardReason::CapabilityMissing
+            } else {
+                ClipboardReason::Canceled
+            };
+            self.active = None;
+            self.last_terminal = Some((handoff_id, Err(reason)));
         }
         Ok(BeginHandoff {
             handoff_id,
@@ -323,6 +352,21 @@ impl Coordinator {
         target_token: &OwnershipToken,
         target_process_session_id: ProcessSessionId,
     ) -> Result<Vec<CoordinatorCommand>, CoordinatorError> {
+        let pending = self
+            .pending_ownership
+            .as_ref()
+            .ok_or(CoordinatorError::StaleHandoff)?;
+        if pending.handoff_id != handoff_id {
+            return Err(CoordinatorError::StaleHandoff);
+        }
+        if pending.target_token != *target_token {
+            return Err(CoordinatorError::StaleOwnerToken);
+        }
+        self.pending_ownership = None;
+        self.current_token = target_token.clone();
+        if self.active.is_none() {
+            return Ok(Vec::new());
+        }
         {
             let handoff = self.match_active_mut(handoff_id)?;
             if handoff.target_token != *target_token {
@@ -332,7 +376,6 @@ impl Coordinator {
                 return Err(CoordinatorError::StaleProcessSession);
             }
         }
-        self.current_token = target_token.clone();
         if self
             .active
             .as_ref()
@@ -393,10 +436,19 @@ impl Coordinator {
         Ok(())
     }
 
-    pub fn abort(&mut self, handoff_id: HandoffId) -> Result<CoordinatorCommand, CoordinatorError> {
-        self.match_active_mut(handoff_id)?;
-        self.cancel(ClipboardReason::Canceled)
-            .ok_or(CoordinatorError::StaleHandoff)
+    pub fn abort(
+        &mut self,
+        handoff_id: HandoffId,
+    ) -> Result<Vec<CoordinatorCommand>, CoordinatorError> {
+        if self
+            .pending_ownership
+            .as_ref()
+            .is_none_or(|pending| pending.handoff_id != handoff_id)
+        {
+            return Err(CoordinatorError::StaleHandoff);
+        }
+        self.pending_ownership = None;
+        Ok(self.cancel(ClipboardReason::Canceled).into_iter().collect())
     }
 
     fn cancel(&mut self, reason: ClipboardReason) -> Option<CoordinatorCommand> {
@@ -607,7 +659,7 @@ mod tests {
 
     #[test]
     fn disable_cancels_only_clipboard_state() {
-        let (mut coordinator, _, remote, _, _) = fixture();
+        let (mut coordinator, _, remote, _, remote_process) = fixture();
         let token_before = coordinator.current_token().clone();
         let begin = coordinator.begin_handoff(remote).unwrap();
         assert_eq!(
@@ -618,7 +670,69 @@ mod tests {
         );
         assert_eq!(coordinator.current_token(), &token_before);
         assert!(coordinator.active().is_none());
+        assert!(
+            coordinator
+                .ownership_activated(begin.handoff_id, &begin.target_token, remote_process)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(coordinator.current_token(), &begin.target_token);
         assert!(coordinator.set_enabled(true).is_empty());
+    }
+
+    #[test]
+    fn missing_peer_capability_still_advances_input_owner_token() {
+        let (mut coordinator, server, _, server_process, _) = fixture();
+        let remote = HostId::from("not-connected");
+
+        let outbound = coordinator.begin_handoff(remote).unwrap();
+        assert!(outbound.commands.is_empty());
+        assert!(coordinator.active().is_none());
+        assert_eq!(
+            coordinator.last_terminal(),
+            Some(&(outbound.handoff_id, Err(ClipboardReason::CapabilityMissing)))
+        );
+        assert!(
+            coordinator
+                .ownership_activated(
+                    outbound.handoff_id,
+                    &outbound.target_token,
+                    ProcessSessionId::new(0),
+                )
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(coordinator.current_token(), &outbound.target_token);
+
+        let fallback = coordinator.begin_handoff(server).unwrap();
+        assert!(fallback.commands.is_empty());
+        assert_eq!(fallback.source_token, outbound.target_token);
+        assert!(
+            coordinator
+                .ownership_activated(fallback.handoff_id, &fallback.target_token, server_process,)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(coordinator.current_token(), &fallback.target_token);
+    }
+
+    #[test]
+    fn abort_clears_pending_activation_even_without_clipboard_capability() {
+        let (mut coordinator, _, _, _, _) = fixture();
+        let begin = coordinator
+            .begin_handoff(HostId::from("not-connected"))
+            .unwrap();
+
+        assert!(coordinator.abort(begin.handoff_id).unwrap().is_empty());
+        assert_eq!(
+            coordinator.ownership_activated(
+                begin.handoff_id,
+                &begin.target_token,
+                ProcessSessionId::new(0),
+            ),
+            Err(CoordinatorError::StaleHandoff)
+        );
+        assert_eq!(coordinator.current_token(), &begin.source_token);
     }
 
     #[test]
@@ -685,6 +799,27 @@ mod tests {
             }]
         );
         assert!(coordinator.active().is_none());
+    }
+
+    #[test]
+    fn peer_disconnect_cancels_clipboard_but_preserves_pending_input_activation() {
+        let (mut coordinator, _, remote, _, remote_process) = fixture();
+        let begin = coordinator.begin_handoff(remote.clone()).unwrap();
+
+        assert_eq!(
+            coordinator.remove_process_session(&remote),
+            vec![CoordinatorCommand::CancelHandoff {
+                handoff_id: begin.handoff_id,
+            }]
+        );
+        assert!(coordinator.active().is_none());
+        assert!(
+            coordinator
+                .ownership_activated(begin.handoff_id, &begin.target_token, remote_process)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(coordinator.current_token(), &begin.target_token);
     }
 
     #[test]
