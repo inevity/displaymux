@@ -80,9 +80,43 @@ where
 mod tests {
     use super::*;
     use std::{
-        sync::mpsc::{Receiver, Sender, channel},
+        sync::{
+            Mutex, Once,
+            mpsc::{Receiver, Sender, channel},
+        },
         time::{Duration, Instant},
     };
+
+    struct CaptureLogger {
+        records: Mutex<Vec<String>>,
+    }
+
+    impl log::Log for CaptureLogger {
+        fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
+            metadata.level() <= log::Level::Info
+        }
+
+        fn log(&self, record: &log::Record<'_>) {
+            if self.enabled(record.metadata()) {
+                self.records.lock().unwrap().push(record.args().to_string());
+            }
+        }
+
+        fn flush(&self) {}
+    }
+
+    static CAPTURE_LOGGER: CaptureLogger = CaptureLogger {
+        records: Mutex::new(Vec::new()),
+    };
+    static CAPTURE_LOGGER_INIT: Once = Once::new();
+
+    fn reset_capture_logger() {
+        CAPTURE_LOGGER_INIT.call_once(|| {
+            log::set_logger(&CAPTURE_LOGGER).unwrap();
+            log::set_max_level(log::LevelFilter::Info);
+        });
+        CAPTURE_LOGGER.records.lock().unwrap().clear();
+    }
 
     struct BlockingSink {
         entered: Sender<()>,
@@ -132,5 +166,22 @@ mod tests {
         let mut writer = spawn_writer(1, 4, io::sink());
         writer.write_all(b"12345").unwrap();
         assert_eq!(writer.dropped.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn tracing_clipboard_events_reach_log_facade() {
+        reset_capture_logger();
+
+        tracing::info!(
+            event = "clipboard_backend_ready",
+            reason = "ready",
+            "native clipboard actor ready"
+        );
+
+        let records = CAPTURE_LOGGER.records.lock().unwrap();
+        assert!(records.iter().any(|record| {
+            record.contains("clipboard_backend_ready")
+                && record.contains("native clipboard actor ready")
+        }));
     }
 }
