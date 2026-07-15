@@ -588,16 +588,20 @@ Payload bytes, hashes, and text-derived metadata are memory-only. They are never
 ### 11.1 Commands
 
 ```text
+SynchronizeAuthority(current_token)
 ObserveGeneration
 PrepareTarget(handoff_id, target_token)
 CaptureSource(handoff_id, source_token, max_bytes)
+CaptureProvisional(source_token, max_bytes)
+BindProvisional(handoff_id, source_token)
+PublishSnapshot(handoff_id, snapshot_id)
 ActivateTarget(handoff_id, target_token)
-Apply(handoff_id, target_token, snapshot_id, baseline, payload)
+StageSnapshot(handoff_id, target_token, snapshot_id, baseline, payload)
 Cancel(handoff_id)
 Shutdown
 ```
 
-All commands are idempotent by identity. `Cancel` and `Shutdown` do not wait for an operating-system clipboard lock held by another process.
+All commands are idempotent by identity. `SynchronizeAuthority` is an identity-only fence: it clears stale prepared, captured, staged, and applied actor state without reading or writing the native clipboard. `StageSnapshot` applies only after the same target token has been activated. `Cancel` and `Shutdown` do not wait for an operating-system clipboard lock held by another process.
 
 ### 11.2 Results
 
@@ -618,7 +622,9 @@ No result contains clipboard text in its `Debug`, `Display`, error, tracing, or 
 - no OS clipboard lock is held across network I/O or an async await
 - actor requests have deadlines and cancellation identities
 - actor queue saturation returns a skip result
-- backend restart creates a new process/backend session and invalidates old generations
+- native `BackendUnavailable`, permission loss, or generation exhaustion terminates the actor and withdraws clipboard capability without changing input ownership
+- backend restart creates a new actor/backend session, clears old preparation and payload state, and invalidates old generations
+- runtime backend reinitialization uses one fixed low-frequency implementation retry; it is not a user timing knob and never gates input
 
 ## 12. Platform Design
 
@@ -629,6 +635,10 @@ No result contains clipboard text in its `Debug`, `Display`, error, tracing, or 
 - Subscribe with `AddClipboardFormatListener` and handle `WM_CLIPBOARDUPDATE`.
 - Use `GetClipboardSequenceNumber` as the native generation.
 - Serialize `OpenClipboard`; retry only within a short actor-local budget.
+- Before advertising `clipboard_text_v1`, initialization must successfully open
+  and close the clipboard without reading or mutating it. Contention therefore
+  leaves capability absent; the runtime's fixed low-frequency actor
+  reinitialization advertises it only after native access recovers.
 - Read `CF_UNICODETEXT` and validate `GlobalSize` before copying.
 - Write `CF_UNICODETEXT` and retain ownership according to Win32 rules.
 - Do not export content carrying `ExcludeClipboardContentFromMonitorProcessing`.
@@ -638,10 +648,18 @@ The existing scheduled task already runs Lan Mouse in the user session. A Window
 
 ### 12.2 macOS
 
-- Use a dedicated AppKit-compatible actor/run loop.
+- Use one dedicated serialized AppKit-compatible actor thread. Wrap each
+  synchronous native operation in an autorelease pool; these `NSPasteboard`
+  calls do not require a continuously running AppKit event loop.
 - Use `NSPasteboard.general` and `changeCount` as the native generation.
 - Inspect data length before copying into the transport snapshot.
 - Recognize concealed/transient community marker types where available.
+- Treat an empty native type list as explicit `Empty`; a nil type result is
+  unavailable or permission denied and must not clear a destination.
+- Recheck `changeCount`, preconstruct the `NSString` writing object, and reject
+  denied access before mutation. Replace text using `clearContents` followed by
+  `writeObjects` in one serialized actor critical section. Apply explicit
+  `Empty` with `clearContents` alone.
 - Package the non-GTK process with a stable bundle identifier and `LSUIElement` identity so pasteboard privacy authorization is stable.
 - Surface persistent permission denial as backend-unavailable status.
 

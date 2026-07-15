@@ -2,8 +2,7 @@
 
 ## Plan Control
 
-- Status: in progress. P0 through P2 completed on 2026-07-14; P3 is the next
-  action.
+- Status: in progress. P0 through P6 are complete; P7 is the next action.
 - Plan type: scoped child implementation plan. The requested filename is
   `docs/clipboardplan.md`; this is not a replacement root objective and
   therefore does not supersede
@@ -718,7 +717,8 @@ Rollback: transport is not yet started by `Service`; remove the P2 commit.
 
 ## P3: Coordinator and Input-Transition Hooks
 
-Status: pending. Depends on P1 and P2.
+Status: completed on 2026-07-14 in Lan Mouse commit `48cf966`. Depends on P1
+and P2.
 
 ### Files
 
@@ -844,7 +844,13 @@ Rollback: disable/remove Service startup and hooks as one commit; no
 
 ## P4: Linux Native Clipboard Actor
 
-Status: pending. Depends on P3.
+Status: completed on 2026-07-14 in Lan Mouse commit `ce5aa91`. Depends on P3.
+
+Verification completed with the locked full workspace check/test, the exact
+deployed no-GTK Linux feature check/test, bounded Wayland pipe and X11 `INCR`
+tests, actor backend-loss/restart fencing tests, and read-only live Wayland and
+X11 generation probes. Native clipboard mutation was not performed against the
+user's live desktop session.
 
 ### Files and Backend Selection
 
@@ -903,7 +909,7 @@ usable.
 
 ## P5: Windows Native Clipboard Actor
 
-Status: pending. Depends on P4.
+Status: complete. Depends on P4.
 
 ### Implementation
 
@@ -919,6 +925,10 @@ Status: pending. Depends on P4.
   update notification.
 - Bound `OpenClipboard` contention retries with the P0 native-API rationale;
   do not expose a user timing knob.
+- Require one successful non-mutating `OpenClipboard` probe before actor
+  readiness and `clipboard_text_v1` capability advertisement. If that probe
+  fails, expose no actor, preserve input, and retry actor initialization at the
+  fixed low-frequency runtime cadence.
 - Shut down the window/thread without leaving clipboard ownership or a lock
   held.
 
@@ -935,8 +945,27 @@ Status: pending. Depends on P4.
 - native no-GTK Windows workspace tests and binary build;
 - input remains usable when the Windows actor thread is stopped.
 
-P5 exit gate: tests and native build pass on Windows itself. A Linux
-cross-compile is not accepted as native backend verification.
+P5 implementation exit gate: native tests, the no-GTK workspace check/tests,
+and a native binary build pass on Windows itself; the active-session
+busy-clipboard path proves that readiness is withheld before capability
+advertisement. A Linux cross-compile is not accepted as native backend
+verification. Successful interactive text/empty mutation remains required by
+P8 minimal runtime acceptance before deployment.
+
+Verification evidence (2026-07-15): the native crate tests (58 passed, two
+interactive tests ignored), no-GTK workspace check/tests, and debug binary
+build pass on Windows. The isolated interactive-token test reaches
+`WinSta0\\Default` in active console Session 2. A Win32 trace reproduced
+`OpenClipboard` error 5 for the complete 200 ms actor-local budget. The prior
+implementation still advertised actor readiness because initialization checked
+only window/listener creation and `GetClipboardSequenceNumber`; first capture
+then failed and killed the actor. Initialization now performs a non-mutating
+open/close probe. The active-session busy test passes in 0.44 seconds by
+returning `BackendUnavailable` before exposing the actor or mutating clipboard
+content, and the runtime retries initialization independently of input. The
+positive text/empty test reaches this new initialization gate and performs no
+mutation while the clipboard remains unavailable. No installed binary,
+production scheduled task, or running Lan Mouse service was changed.
 
 Commit boundary: Windows backend and its target-specific dependencies/tests.
 Proposed subject: `feat: add Windows clipboard backend`.
@@ -945,17 +974,24 @@ Rollback: Windows advertises no clipboard capability; input remains usable.
 
 ## P6: macOS Native Clipboard Actor
 
-Status: pending. Depends on P5.
+Status: completed in `8c5f40e`. Depends on P5.
 
 ### Implementation
 
-- Run the general pasteboard adapter on the required AppKit run loop/thread.
+- Run the general pasteboard adapter on one serialized AppKit-compatible actor
+  thread, with an autorelease pool around each native operation. Synchronous
+  `NSPasteboard` calls do not require a continuously running AppKit event loop.
 - Use `NSPasteboard.changeCount` as the opaque generation.
 - Read/write only plain UTF-8 text and explicit empty.
 - Reject private/concealed/transient content according to the design's privacy
   policy.
 - Preserve a target-local change by comparing `changeCount` with the prepared
   baseline immediately before write.
+- Preconstruct text objects and reject denied access before mutation. Replace
+  text with AppKit's `clearContents` plus `writeObjects` protocol in one actor
+  critical section; represent explicit empty with `clearContents` alone.
+- Decode an empty native type list as explicit empty. A nil type result remains
+  unavailable or permission denied and must never synthesize empty.
 - Keep any required provider/application object alive after apply.
 - Maintain the stable launch identity used by the current signed daemon and
   LaunchAgent. Do not create a changing per-build identity that loses user
@@ -982,6 +1018,17 @@ Status: pending. Depends on P5.
 
 P6 exit gate: tests and the configured debug native build pass on macOS itself,
 with the LaunchAgent running in the interactive user session.
+
+Verification evidence (2026-07-15): the native macOS clipboard crate passes 57
+tests, including an AppKit unique-pasteboard test for Unicode text, explicit
+empty, concealed/private rejection, unsupported content, and a stale
+`changeCount` destination race. The locked no-GTK workspace check/tests and
+configured debug binary build pass natively with Rust 1.97.0 on macOS 15.7.7.
+The production LaunchAgent remained untouched and running in `gui/501` under
+the stable `com.feschber.lan-mouse` identity. A read-only general-pasteboard
+probe reached the active user pasteboard and returned `UnsupportedFormat` for
+the user's current non-text content before mutation; deterministic native write
+coverage therefore uses a unique pasteboard and does not overwrite user data.
 
 Commit boundary: macOS backend, stable identity integration, target-specific
 dependencies, and tests. Proposed subject: `feat: add macOS clipboard backend`.
@@ -1043,6 +1090,11 @@ failures remain logs/status and do not produce notification spam.
   peer or the input listener.
 - Verify clipboard-disabled and capability-missing hosts do not create retry or
   CPU loops.
+- Audit the Windows `EmptyClipboard`/`SetClipboardData` and macOS
+  `clearContents`/`writeObjects` critical sections against the model's
+  `NativeWrite` refinement boundary. Validate all fallible preflight before
+  clear and document the unavoidable process/OS-failure boundary rather than
+  claiming a platform transaction that neither native API provides.
 
 ### Performance Gate
 
@@ -1244,10 +1296,11 @@ must not be collapsed before their individual gates pass.
 - P0 Refinement and baseline gate: completed 2026-07-14
 - P1 Domain state and actor contract: completed 2026-07-14
 - P2 Framing, authentication, and transport: completed 2026-07-14
-- P3 Coordinator and input-transition hooks: pending
-- P4 Linux native actor: pending
-- P5 Windows native actor: pending
-- P6 macOS native actor: pending
-- P7 Cross-platform hardening and observability: pending
+- P3 Coordinator and input-transition hooks: completed in `48cf966`
+- P4 Linux native actor: completed in `ce5aa91`
+- P5 Windows native actor: completed 2026-07-15; positive live mutation remains
+  part of P8 acceptance
+- P6 macOS native actor: completed in `8c5f40e`
+- P7 Cross-platform hardening and observability: pending, next action
 - P8 Native build and deployment: pending
 - P9 Final refinement and acceptance: pending
