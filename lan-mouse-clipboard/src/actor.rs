@@ -156,24 +156,42 @@ pub fn spawn_actor<B: ClipboardBackend>(
     process_session_id: ProcessSessionId,
     local_host_id: HostId,
     initial_token: OwnershipToken,
-) -> std::io::Result<SpawnedActor> {
+) -> Result<SpawnedActor, ClipboardReason> {
     // One active handoff can emit at most one request for each command class
     // before completion. Payload bytes use a separate single ownership slot.
     let (request_tx, request_rx) = mpsc::channel(COMMAND_CLASS_COUNT);
     let (payload_tx, payload_rx) = mpsc::channel(PAYLOAD_SLOT_COUNT);
+    let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
     let thread = thread::Builder::new()
         .name(name.to_string())
         .spawn(move || {
-            Actor::new(
+            let mut actor = Actor::new(
                 backend,
                 process_session_id,
                 local_host_id,
                 initial_token,
                 request_rx,
                 payload_tx,
-            )
-            .run();
-        })?;
+            );
+            match actor.backend.initialize() {
+                Ok(()) => {
+                    let _ = ready_tx.send(Ok(()));
+                    actor.run();
+                }
+                Err(reason) => {
+                    let _ = ready_tx.send(Err(reason));
+                    actor.backend.shutdown();
+                }
+            }
+        })
+        .map_err(|_| ClipboardReason::BackendUnavailable)?;
+    if let Err(reason) = ready_rx
+        .recv()
+        .unwrap_or(Err(ClipboardReason::BackendUnavailable))
+    {
+        let _ = thread.join();
+        return Err(reason);
+    }
     Ok(SpawnedActor {
         handle: ActorHandle { request_tx },
         payload_rx,
@@ -646,6 +664,7 @@ mod tests {
     }
 
     struct BackendState {
+        initialize_failure: Option<ClipboardReason>,
         generation: NativeGeneration,
         generation_results: VecDeque<Result<NativeGeneration, ClipboardReason>>,
         data: ClipboardData,
@@ -662,6 +681,7 @@ mod tests {
             Self {
                 state: Arc::new((
                     Mutex::new(BackendState {
+                        initialize_failure: None,
                         generation: NativeGeneration::new(0),
                         generation_results: VecDeque::new(),
                         data,
@@ -685,6 +705,10 @@ mod tests {
 
         fn set_generation(&self, generation: u64) {
             self.state.0.lock().unwrap().generation = NativeGeneration::new(generation);
+        }
+
+        fn fail_initialize(&self, reason: ClipboardReason) {
+            self.state.0.lock().unwrap().initialize_failure = Some(reason);
         }
 
         fn set_data(&self, data: ClipboardData) {
@@ -730,6 +754,21 @@ mod tests {
     }
 
     impl ClipboardBackend for FakeBackend {
+        fn initialize(&mut self) -> Result<(), ClipboardReason> {
+            match self
+                .control
+                .state
+                .0
+                .lock()
+                .unwrap()
+                .initialize_failure
+                .take()
+            {
+                Some(reason) => Err(reason),
+                None => Ok(()),
+            }
+        }
+
         fn generation(&mut self) -> Result<NativeGeneration, ClipboardReason> {
             let (lock, condvar) = &*self.control.state;
             let mut state = lock.lock().unwrap();
@@ -1175,6 +1214,23 @@ mod tests {
             closed_handle.try_request(ActorCommand::ObserveGeneration),
             Err(ClipboardReason::ChannelUnavailable)
         ));
+    }
+
+    #[test]
+    fn initialization_failure_never_exposes_actor_and_releases_backend() {
+        let control = BackendControl::new(ClipboardData::Empty);
+        control.fail_initialize(ClipboardReason::BackendUnavailable);
+
+        let result = spawn_actor(
+            "clipboard-test",
+            control.backend(),
+            ProcessSessionId::new(5),
+            HostId::from("server"),
+            token("server", 0),
+        );
+
+        assert!(matches!(result, Err(ClipboardReason::BackendUnavailable)));
+        assert!(control.state.0.lock().unwrap().shutdown);
     }
 
     #[test]

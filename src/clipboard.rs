@@ -1,4 +1,4 @@
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 use std::thread;
 use std::{
     collections::HashMap,
@@ -16,6 +16,8 @@ use lan_mouse_clipboard::{
 };
 #[cfg(target_os = "linux")]
 use lan_mouse_clipboard::{LinuxClipboardBackend, spawn_actor};
+#[cfg(target_os = "windows")]
+use lan_mouse_clipboard::{WindowsClipboardBackend, spawn_actor};
 use lan_mouse_ipc::SwitchHost;
 use tokio::{
     sync::{mpsc, oneshot},
@@ -317,8 +319,7 @@ fn initialize_native_actor(
                     process_session_id,
                     local_host,
                     initial_token,
-                )
-                .map_err(|_| ClipboardReason::BackendUnavailable)?;
+                )?;
                 tracing::info!(event = "clipboard_backend_ready", backend = backend_name);
                 Ok(spawned)
             });
@@ -327,7 +328,36 @@ fn initialize_native_actor(
     receiver
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "windows")]
+fn initialize_native_actor(
+    process_session_id: ProcessSessionId,
+    local_host: HostId,
+    initial_token: OwnershipToken,
+) -> oneshot::Receiver<Result<SpawnedActor, ClipboardReason>> {
+    let (completion, receiver) = oneshot::channel();
+    let _ = thread::Builder::new()
+        .name("lan-mouse-clipboard-init".to_string())
+        .spawn(move || {
+            let actor = WindowsClipboardBackend::connect().and_then(|backend| {
+                let spawned = spawn_actor(
+                    "lan-mouse-clipboard",
+                    backend,
+                    process_session_id,
+                    local_host,
+                    initial_token,
+                )?;
+                tracing::info!(
+                    event = "clipboard_backend_ready",
+                    backend = "windows_clipboard"
+                );
+                Ok(spawned)
+            });
+            let _ = completion.send(actor);
+        });
+    receiver
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
 fn initialize_native_actor(
     _process_session_id: ProcessSessionId,
     _local_host: HostId,
