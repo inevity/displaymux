@@ -319,8 +319,21 @@
 
 - name: Restart Windows lan-mouse when runtime inputs changed
   ansible.windows.win_shell: |
-    schtasks /end /tn LanMouseDaemon 2>$null
-    Start-Sleep 2
+    schtasks /end /tn LanMouseDaemon 2>$null | Out-Null
+    $expected = [System.IO.Path]::GetFullPath("{{ win_installed_binary }}")
+    $processes = Get-CimInstance Win32_Process -Filter "Name = 'lan-mouse.exe'" |
+      Where-Object { $_.ExecutablePath -and [System.IO.Path]::GetFullPath($_.ExecutablePath) -eq $expected }
+    $processes | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction Stop }
+
+    $deadline = (Get-Date).AddSeconds(10)
+    do {
+      $remaining = Get-CimInstance Win32_Process -Filter "Name = 'lan-mouse.exe'" |
+        Where-Object { $_.ExecutablePath -and [System.IO.Path]::GetFullPath($_.ExecutablePath) -eq $expected }
+      if (-not $remaining) { break }
+      Start-Sleep -Milliseconds 100
+    } while ((Get-Date) -lt $deadline)
+    if ($remaining) { throw "lan-mouse.exe did not stop before scheduled task restart" }
+
     schtasks /run /tn LanMouseDaemon
     exit $LASTEXITCODE
   when:
@@ -331,9 +344,33 @@
 - name: Ensure Windows lan-mouse is running when inputs are unchanged
   ansible.windows.win_shell: |
     $expected = [System.IO.Path]::GetFullPath("{{ win_installed_binary }}")
+    $expectedWrapper = [System.IO.Path]::GetFullPath("{{ win_wrapper }}")
     $process = Get-CimInstance Win32_Process -Filter "Name = 'lan-mouse.exe'" |
       Where-Object { $_.ExecutablePath -and [System.IO.Path]::GetFullPath($_.ExecutablePath) -eq $expected }
-    if (-not $process) {
+    $parent = if ($process) {
+      Get-CimInstance Win32_Process -Filter "ProcessId = $($process.ParentProcessId)"
+    }
+    $task = Get-ScheduledTask -TaskName LanMouseDaemon
+    $supervised = $process -and
+      $parent.Name -eq "pwsh.exe" -and
+      $parent.CommandLine -like "*$expectedWrapper*" -and
+      $task.State -eq "Running"
+
+    if (-not $supervised) {
+      schtasks /end /tn LanMouseDaemon 2>$null | Out-Null
+      if ($process) {
+        Stop-Process -Id $process.ProcessId -Force -ErrorAction Stop
+      }
+
+      $deadline = (Get-Date).AddSeconds(10)
+      do {
+        $remaining = Get-CimInstance Win32_Process -Filter "Name = 'lan-mouse.exe'" |
+          Where-Object { $_.ExecutablePath -and [System.IO.Path]::GetFullPath($_.ExecutablePath) -eq $expected }
+        if (-not $remaining) { break }
+        Start-Sleep -Milliseconds 100
+      } while ((Get-Date) -lt $deadline)
+      if ($remaining) { throw "unsupervised lan-mouse.exe did not stop" }
+
       schtasks /run /tn LanMouseDaemon
       if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       Write-Output "started"
@@ -347,9 +384,17 @@
 - name: Wait for Windows lan-mouse process
   ansible.windows.win_shell: |
     $expected = [System.IO.Path]::GetFullPath("{{ win_installed_binary }}")
+    $expectedWrapper = [System.IO.Path]::GetFullPath("{{ win_wrapper }}")
     $process = Get-CimInstance Win32_Process -Filter "Name = 'lan-mouse.exe'" |
       Where-Object { $_.ExecutablePath -and [System.IO.Path]::GetFullPath($_.ExecutablePath) -eq $expected }
     if (-not $process) { throw "lan-mouse.exe is not running" }
+    $parent = Get-CimInstance Win32_Process -Filter "ProcessId = $($process.ParentProcessId)"
+    if (-not $parent -or $parent.Name -ne "pwsh.exe" -or $parent.CommandLine -notlike "*$expectedWrapper*") {
+      throw "lan-mouse.exe is not supervised by the scheduled wrapper"
+    }
+    if ((Get-ScheduledTask -TaskName LanMouseDaemon).State -ne "Running") {
+      throw "LanMouseDaemon scheduled task is not running"
+    }
     Write-Output $process.ExecutablePath
   register: win_process
   retries: 10
