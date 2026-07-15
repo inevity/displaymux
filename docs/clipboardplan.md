@@ -2,11 +2,12 @@
 
 ## Plan Control
 
-- Status: corrective P9 model and local Rust verification completed on
-  2026-07-15 after normal-use runtime acceptance exposed an OS-independent
-  prepare-acknowledgement race. P0 through P8 remain complete for the
-  previously deployed revision; native builds and deployment of the corrected
-  revision remain pending.
+- Status: corrective P9 model, local Rust verification, native builds, and
+  deployment completed on 2026-07-15 for revision
+  `a688304f2ee3fada02e5c001d6669a4cde8c87a5` after normal-use runtime
+  acceptance exposed an OS-independent prepare-acknowledgement race. Final
+  normal-use acceptance is blocked until macOS Accessibility authorization is
+  restored for the rebuilt binary.
 - Plan type: scoped child implementation plan. The requested filename is
   `docs/clipboardplan.md`; this is not a replacement root objective and
   therefore does not supersede
@@ -1187,12 +1188,13 @@ Proposed subject: `feat: harden clipboard handoff lifecycle`.
 
 ## P8: Native Build and Deployment
 
-Status: blocked on one macOS Accessibility reauthorization before normal-use
-acceptance. Exact revision `8a32992a08e0cb2c7fe207d4f0561d316caa2db8`
-is installed and running on Linux, Windows, and macOS. Both Linux services are
-active and Windows now reports `clipboard_backend_ready`; macOS reports its
-clipboard backend ready but rejects input capture/emulation because TCC does
-not recognize the newly rebuilt ad-hoc-signed binary. Depends on P7.
+Status: corrected revision native builds and deployment completed; blocked on
+one macOS Accessibility reauthorization before normal-use acceptance. Exact
+revision `a688304f2ee3fada02e5c001d6669a4cde8c87a5` is installed and running on
+Linux, Windows, and macOS. Both Linux services are active, and Windows and
+macOS report `clipboard_backend_ready`; macOS rejects input
+capture/emulation because TCC does not recognize the rebuilt ad-hoc-signed
+binary. Depends on P7.
 
 P8 evidence recorded on 2026-07-15:
 
@@ -1221,6 +1223,16 @@ P8 evidence recorded on 2026-07-15:
   zero failed or unreachable hosts. Windows accepted native generation zero
   and reached `clipboard_backend_ready`; minimal normal-use clipboard
   acceptance is blocked only by macOS Accessibility reauthorization.
+- corrective revision `a688304` passed native Linux no-GTK production-feature
+  tests/build, native Windows no-GTK tests/release build, and native macOS
+  no-GTK tests/debug build. The all-inventory Ansible rollout completed with
+  zero failed or unreachable hosts; Linux and Windows input/clipboard backends
+  are ready, and macOS reports `clipboard_backend_ready`;
+- the macOS binary is ad-hoc signed with identifier
+  `com.feschber.lan-mouse`, no valid code-signing identity is installed, and
+  its designated requirement is the build-specific CDHash. Consequently,
+  rebuilding changes the TCC identity and requires Accessibility authorization
+  again before input switching and normal-use clipboard acceptance can run.
 
 Deployment is one final phase, not a substitute for domain/native tests.
 
@@ -1294,8 +1306,9 @@ restart Lan Mouse only. Native clipboards are not rewritten during rollback.
 
 ## P9: Final Refinement and Acceptance
 
-Status: verification completed on 2026-07-15; phase closure remains blocked on
-the P8 all-host runtime and normal-use acceptance gate. Depends on P8.
+Status: model, Rust, native-build, and deployment verification completed on
+2026-07-15; phase closure remains blocked on macOS Accessibility
+reauthorization and the P8 normal-use acceptance gate. Depends on P8.
 
 P9 evidence:
 
@@ -1418,9 +1431,10 @@ must not be collapsed before their individual gates pass.
 - P7 Cross-platform hardening and observability: completed in `852f51e`, with
   tracing-log integration in `1e6ec36` and Windows native failure detail in
   `b5b17aa`
-- P8 Native build and deployment: blocked; `8a32992` is installed and running
-  on all hosts, Windows clipboard readiness is verified, and macOS input awaits
-  one Accessibility reauthorization for the rebuilt binary
+- P8 Native build and deployment: corrected revision `a688304` is installed on
+  all hosts with zero failed/unreachable hosts; Linux and Windows are ready,
+  while macOS input awaits one Accessibility reauthorization for the rebuilt
+  binary before normal-use acceptance
 - P9 Final refinement and acceptance: corrective model and local Rust
-  verification completed; native builds, corrected-revision deployment, and
-  normal-use acceptance remain pending
+  verification completed; corrected-revision native builds and deployment
+  completed; normal-use acceptance remains blocked on macOS Accessibility
