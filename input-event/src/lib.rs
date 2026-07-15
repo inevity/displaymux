@@ -16,6 +16,9 @@ pub const BTN_FORWARD: u32 = 0x114;
 #[cfg(target_os = "macos")]
 pub const LAN_MOUSE_EVENT_SOURCE_USER_DATA: i64 = 0x4c41_4e4d_4f55_5345;
 
+#[cfg(target_os = "windows")]
+pub const LAN_MOUSE_WINDOWS_EXTRA_INFO: usize = 0x4c41_4e4d;
+
 #[derive(Debug, PartialEq, Clone, Copy)]
 pub enum PointerEvent {
     /// relative motion event

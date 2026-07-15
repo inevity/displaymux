@@ -1,7 +1,7 @@
 use super::error::{EmulationError, WindowsEmulationCreationError};
 use input_event::{
-    BTN_BACK, BTN_FORWARD, BTN_LEFT, BTN_MIDDLE, BTN_RIGHT, Event, KeyboardEvent, PointerEvent,
-    scancode,
+    BTN_BACK, BTN_FORWARD, BTN_LEFT, BTN_MIDDLE, BTN_RIGHT, Event, KeyboardEvent,
+    LAN_MOUSE_WINDOWS_EXTRA_INFO, PointerEvent, scancode,
 };
 
 use async_trait::async_trait;
@@ -297,7 +297,7 @@ fn rel_mouse(dx: i32, dy: i32) -> Result<(), EmulationError> {
         mouseData: 0,
         dwFlags: MOUSEEVENTF_MOVE,
         time: 0,
-        dwExtraInfo: 0,
+        dwExtraInfo: LAN_MOUSE_WINDOWS_EXTRA_INFO,
     };
     send_mouse_input(mi)
 }
@@ -333,7 +333,7 @@ fn mouse_button(button: u32, state: u32) -> Result<(), EmulationError> {
         mouseData: mouse_data,
         dwFlags: dw_flags,
         time: 0,
-        dwExtraInfo: 0,
+        dwExtraInfo: LAN_MOUSE_WINDOWS_EXTRA_INFO,
     };
     send_mouse_input(mi)
 }
@@ -350,7 +350,7 @@ fn scroll(axis: u8, value: i32) -> Result<(), EmulationError> {
         mouseData: -value as u32,
         dwFlags: event_type,
         time: 0,
-        dwExtraInfo: 0,
+        dwExtraInfo: LAN_MOUSE_WINDOWS_EXTRA_INFO,
     };
     send_mouse_input(mi)
 }

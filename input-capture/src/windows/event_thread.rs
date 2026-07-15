@@ -27,7 +27,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use input_event::{
-    BTN_BACK, BTN_FORWARD, BTN_LEFT, BTN_MIDDLE, BTN_RIGHT, Event, KeyboardEvent, PointerEvent,
+    BTN_BACK, BTN_FORWARD, BTN_LEFT, BTN_MIDDLE, BTN_RIGHT, Event, KeyboardEvent,
+    LAN_MOUSE_WINDOWS_EXTRA_INFO, PointerEvent,
     scancode::{self, Linux},
 };
 
@@ -401,6 +402,12 @@ unsafe extern "system" fn mouse_proc(ncode: i32, wparam: WPARAM, lparam: LPARAM)
     }
     let mouse = *(lparam.0 as *const MSLLHOOKSTRUCT);
     if mouse.flags & LLMHF_INJECTED != 0 {
+        if is_lan_mouse_injected_motion(wparam, &mouse) {
+            // Input received from the current remote owner must remain visible
+            // to Windows, but its pointer motion also drives the local return
+            // barrier. Other injected input remains outside the capture path.
+            check_client_activation(wparam, lparam);
+        }
         return CallNextHookEx(None, ncode, wparam, lparam);
     }
     let active = check_client_activation(wparam, lparam);
@@ -429,6 +436,12 @@ unsafe extern "system" fn mouse_proc(ncode: i32, wparam: WPARAM, lparam: LPARAM)
 
     /* don't pass event to applications */
     LRESULT(1)
+}
+
+fn is_lan_mouse_injected_motion(wparam: WPARAM, mouse: &MSLLHOOKSTRUCT) -> bool {
+    wparam.0 == WM_MOUSEMOVE as usize
+        && mouse.flags & LLMHF_INJECTED != 0
+        && mouse.dwExtraInfo == LAN_MOUSE_WINDOWS_EXTRA_INFO
 }
 
 unsafe extern "system" fn kybrd_proc(ncode: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
@@ -686,6 +699,32 @@ mod tests {
             entry,
             (95, 50),
             (96, 50),
+        ));
+    }
+
+    #[test]
+    fn only_lan_mouse_injected_motion_drives_return_barrier() {
+        let own_motion = MSLLHOOKSTRUCT {
+            flags: LLMHF_INJECTED,
+            dwExtraInfo: LAN_MOUSE_WINDOWS_EXTRA_INFO,
+            ..Default::default()
+        };
+        assert!(is_lan_mouse_injected_motion(
+            WPARAM(WM_MOUSEMOVE as usize),
+            &own_motion,
+        ));
+
+        let unrelated_motion = MSLLHOOKSTRUCT {
+            dwExtraInfo: 0,
+            ..own_motion
+        };
+        assert!(!is_lan_mouse_injected_motion(
+            WPARAM(WM_MOUSEMOVE as usize),
+            &unrelated_motion,
+        ));
+        assert!(!is_lan_mouse_injected_motion(
+            WPARAM(WM_LBUTTONDOWN as usize),
+            &own_motion,
         ));
     }
 }
