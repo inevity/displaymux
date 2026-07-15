@@ -15,7 +15,7 @@
     <key>EnvironmentVariables</key>
     <dict>
         <key>RUST_LOG</key>
-        <string>lan_mouse=info</string>
+        <string>{{ lan_mouse_log_filter }}</string>
     </dict>
     <key>StandardOutPath</key>
     <string>{{ ansible_facts.env.HOME }}/Library/Logs/lan-mouse.log</string>

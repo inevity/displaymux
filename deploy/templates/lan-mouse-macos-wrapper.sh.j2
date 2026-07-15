@@ -38,5 +38,5 @@ rotate_stream() {
 }
 
 exec > >(rotate_stream "${stdout_log}") 2> >(rotate_stream "${stderr_log}")
-export RUST_LOG=lan_mouse=info
+export RUST_LOG={{ lan_mouse_log_filter }}
 exec "{{ lan_mouse_macos_binary }}" daemon

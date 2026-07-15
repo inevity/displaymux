@@ -59,7 +59,7 @@ function Write-BoundedLog([hashtable]$State, [string]$Line) {
 $stdoutState = Open-LogState $stdoutLog
 $stderrState = Open-LogState $stderrLog
 
-$env:RUST_LOG = "lan_mouse=info"
+$env:RUST_LOG = "{{ lan_mouse_log_filter }}"
 $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
 $startInfo.FileName = "{{ lan_mouse_windows_binary }}"
 $startInfo.ArgumentList.Add("daemon")
