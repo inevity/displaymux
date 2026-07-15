@@ -92,6 +92,21 @@ fn lan_mouse_event_drives_return_barrier(
         && matches!(event_type, CGEventType::MouseMoved)
 }
 
+fn dispatch_capture_events(
+    lan_mouse_event: bool,
+    capture_position: Option<Position>,
+    events: &[CaptureEvent],
+    mut send: impl FnMut(Position, CaptureEvent),
+) -> bool {
+    if let Some(position) = capture_position {
+        for &event in events {
+            send(position, event);
+        }
+    }
+
+    capture_position.is_some() && !lan_mouse_event
+}
+
 #[derive(Debug)]
 struct InputCaptureState {
     /// active capture positions
@@ -644,16 +659,16 @@ fn create_event_tap<'a>(
             }
         }
 
-        if lan_mouse_event {
-            // Remote pointer motion must remain visible to macOS while also
-            // allowing the spoke's local edge to request a return to its server.
-            CallbackResult::Keep
-        } else if let Some(pos) = capture_position {
-            res_events.iter().for_each(|e| {
-                // error must be ignored, since the event channel
-                // may already be closed when the InputCapture instance is dropped.
-                let _ = event_tx.blocking_send((pos, *e));
-            });
+        let drop_event = dispatch_capture_events(
+            lan_mouse_event,
+            capture_position,
+            &res_events,
+            |position, event| {
+                // The event channel may already be closed when InputCapture is dropped.
+                let _ = event_tx.blocking_send((position, event));
+            },
+        );
+        if drop_event {
             // Returning Drop should stop the event from being processed
             // but core fundation still returns the event
             cg_ev.set_type(CGEventType::Null);
@@ -1051,6 +1066,20 @@ mod tests {
             0,
             false,
         ));
+    }
+
+    #[test]
+    fn lan_mouse_crossing_delivers_begin_without_suppressing_remote_motion() {
+        let mut delivered = Vec::new();
+        let drop_event = dispatch_capture_events(
+            true,
+            Some(Position::Left),
+            &[CaptureEvent::Begin],
+            |position, event| delivered.push((position, event)),
+        );
+
+        assert_eq!(delivered, vec![(Position::Left, CaptureEvent::Begin)]);
+        assert!(!drop_event);
     }
 }
 
