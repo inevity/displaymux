@@ -2,9 +2,10 @@
 
 ## Plan Control
 
-- Status: in progress. P0 through P7 are complete. P8 has deployed one exact
-  revision but remains open for all-host runtime acceptance; P9 verification
-  is complete and remains dependent on P8 closure.
+- Status: blocked on explicit approval to restart the user-stopped Linux Lan
+  Mouse and `tv-multiview` services. P0 through P7 are complete, P8 has
+  deployed one exact revision, and P9 verification is complete but remains
+  dependent on P8 runtime acceptance.
 - Plan type: scoped child implementation plan. The requested filename is
   `docs/clipboardplan.md`; this is not a replacement root objective and
   therefore does not supersede
@@ -1180,7 +1181,8 @@ Proposed subject: `feat: harden clipboard handoff lifecycle`.
 
 ## P8: Native Build and Deployment
 
-Status: in progress. Exact revision
+Status: blocked pending explicit approval to restart the user-stopped Linux
+services and perform normal-use acceptance. Exact revision
 `852f51e47e6b074feac7a0ab2014eb7dbb4b9dcc` is installed on Linux, Windows,
 and macOS. Windows and macOS are running; the Linux Lan Mouse and
 `tv-multiview` services are intentionally inactive at the user's explicit
@@ -1407,8 +1409,8 @@ must not be collapsed before their individual gates pass.
   part of P8 acceptance
 - P6 macOS native actor: completed in `8c5f40e`
 - P7 Cross-platform hardening and observability: completed in `852f51e`
-- P8 Native build and deployment: in progress; exact artifacts are installed,
-  but Linux services are intentionally inactive and normal-use acceptance is
-  pending
+- P8 Native build and deployment: blocked; exact artifacts are installed, but
+  Linux services are intentionally inactive pending explicit restart approval
+  and normal-use acceptance
 - P9 Final refinement and acceptance: verification completed; closure blocked
   on P8 runtime acceptance
