@@ -2,7 +2,9 @@
 
 ## Plan Control
 
-- Status: in progress. P0 through P7 are complete; P8 is the next action.
+- Status: in progress. P0 through P7 are complete. P8 has deployed one exact
+  revision but remains open for all-host runtime acceptance; P9 verification
+  is complete and remains dependent on P8 closure.
 - Plan type: scoped child implementation plan. The requested filename is
   `docs/clipboardplan.md`; this is not a replacement root objective and
   therefore does not supersede
@@ -1178,7 +1180,38 @@ Proposed subject: `feat: harden clipboard handoff lifecycle`.
 
 ## P8: Native Build and Deployment
 
-Status: pending. Depends on P7.
+Status: in progress. Exact revision
+`852f51e47e6b074feac7a0ab2014eb7dbb4b9dcc` is installed on Linux, Windows,
+and macOS. Windows and macOS are running; the Linux Lan Mouse and
+`tv-multiview` services are intentionally inactive at the user's explicit
+request, so the all-host runtime gate is not yet complete. Depends on P7.
+
+P8 evidence recorded on 2026-07-15:
+
+- deployment commit `01c99e8` renders clipboard configuration, preserves the
+  native build profiles, opens authenticated TCP ingress, and separates Lan
+  Mouse restart ownership from `tv-multiview` restart ownership;
+- follow-up commit `44218b1` fixes the Windows cutover path so a forced
+  Scheduled Task stop cannot leave an orphaned daemon accepted as healthy;
+- native Linux production-feature tests/package build, native Windows no-GTK
+  tests/release build, and native macOS no-GTK tests/debug build passed;
+- build identity is the same source revision and Cargo.lock hash on all three
+  hosts. Artifact SHA-256 values are Linux
+  `4a18ba8bace3c902153b3d49d274ac1218115702f3f1910f86bd830fa4f70c64`,
+  Windows
+  `b077e47f1159ea921dfc0f5332d4a05e98b8c5a9eee9fb60e03a92c5f84ceb34`,
+  and macOS
+  `62f9fc619dafa3f4b2b149320b7bf598629a47171db72ea4ec45210d66ff4f70`;
+- Windows is verified as one exact daemon supervised by the running
+  `LanMouseDaemon` PowerShell wrapper, and macOS is verified under the loaded
+  `com.feschber.lan-mouse` LaunchAgent;
+- `[clipboard]` is enabled with `max_bytes = 3145728` on all three hosts.
+  Persistent runtime log samples contain only status/error metadata, while the
+  code-level log-capture tests prove clipboard payload values are not logged;
+- Linux has the exact artifact and configuration installed, but
+  `lan-mouse.service` and `tv-multiview.service` are both inactive by explicit
+  user request. Minimal normal-use clipboard acceptance remains pending until
+  those services are restarted.
 
 Deployment is one final phase, not a substitute for domain/native tests.
 
@@ -1252,7 +1285,25 @@ restart Lan Mouse only. Native clipboards are not rewritten during rollback.
 
 ## P9: Final Refinement and Acceptance
 
-Status: pending. Depends on P8.
+Status: verification completed on 2026-07-15; phase closure remains blocked on
+the P8 all-host runtime and normal-use acceptance gate. Depends on P8.
+
+P9 evidence:
+
+- `ClipboardHandoff.cfg`: no error after 32,357,094 generated states and
+  1,525,938 distinct states;
+- `ClipboardHandoff-capability-disabled.cfg`: no error after 467 generated
+  states and 16 distinct states;
+- `ClipboardHandoff-liveness.cfg`: no error after 70,107,300 generated states,
+  7,433,184 distinct states, and both temporal-property branches over the
+  complete state space;
+- `cargo fmt --all -- --check`, the locked no-GTK workspace check/test, and the
+  exact Linux production-feature check/test passed. The no-GTK suite includes
+  67 passing clipboard tests and two intentionally ignored interactive live
+  display-server probes;
+- no-GTK all-target and Linux production-feature clippy runs passed with only
+  the recorded non-fatal warnings; native Windows, macOS, and Linux build/test
+  evidence is recorded under P8.
 
 ### TLC Recheck
 
@@ -1356,5 +1407,8 @@ must not be collapsed before their individual gates pass.
   part of P8 acceptance
 - P6 macOS native actor: completed in `8c5f40e`
 - P7 Cross-platform hardening and observability: completed in `852f51e`
-- P8 Native build and deployment: pending, next action
-- P9 Final refinement and acceptance: pending
+- P8 Native build and deployment: in progress; exact artifacts are installed,
+  but Linux services are intentionally inactive and normal-use acceptance is
+  pending
+- P9 Final refinement and acceptance: verification completed; closure blocked
+  on P8 runtime acceptance
