@@ -119,7 +119,10 @@ impl TryFrom<ClipboardToml> for ClipboardConfig {
     type Error = ConfigError;
 
     fn try_from(config: ClipboardToml) -> Result<Self, Self::Error> {
-        if config.max_bytes == 0 || u64::try_from(config.max_bytes).is_err() {
+        if config.max_bytes == 0
+            || config.max_bytes.checked_add(1).is_none()
+            || u64::try_from(config.max_bytes).is_err()
+        {
             return Err(ConfigError::Clipboard(
                 "max_bytes must be non-zero and representable by the wire protocol".to_string(),
             ));
@@ -867,6 +870,17 @@ mod tests {
             ClipboardConfig::try_from(ClipboardToml {
                 enabled: true,
                 max_bytes: 0,
+            }),
+            Err(ConfigError::Clipboard(_))
+        ));
+    }
+
+    #[test]
+    fn rejects_clipboard_limit_without_oversize_sentinel() {
+        assert!(matches!(
+            ClipboardConfig::try_from(ClipboardToml {
+                enabled: true,
+                max_bytes: usize::MAX,
             }),
             Err(ConfigError::Clipboard(_))
         ));

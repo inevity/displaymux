@@ -13,6 +13,9 @@ const SOURCE_CHANGE_RETRIES: usize = 1;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ActorCommand {
+    SynchronizeAuthority {
+        current_token: OwnershipToken,
+    },
     ObserveGeneration,
     PrepareTarget {
         handoff_id: HandoffId,
@@ -48,6 +51,9 @@ pub enum ActorCommand {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ActorEvent {
+    AuthoritySynchronized {
+        current_token: OwnershipToken,
+    },
     Generation(NativeGeneration),
     Prepared {
         handoff_id: HandoffId,
@@ -82,6 +88,10 @@ pub enum ActorEvent {
         snapshot_id: SnapshotId,
     },
     Skipped {
+        handoff_id: Option<HandoffId>,
+        reason: ClipboardReason,
+    },
+    BackendUnavailable {
         handoff_id: Option<HandoffId>,
         reason: ClipboardReason,
     },
@@ -220,8 +230,9 @@ impl<B: ClipboardBackend> Actor<B> {
         while let Some(request) = self.request_rx.blocking_recv() {
             let shutdown = matches!(request.command, ActorCommand::Shutdown);
             let event = self.handle(request.command);
+            let backend_lost = matches!(event, ActorEvent::BackendUnavailable { .. });
             let _ = request.completion.send(event);
-            if shutdown {
+            if shutdown || backend_lost {
                 break;
             }
         }
@@ -233,12 +244,12 @@ impl<B: ClipboardBackend> Actor<B> {
 
     fn handle(&mut self, command: ActorCommand) -> ActorEvent {
         match command {
+            ActorCommand::SynchronizeAuthority { current_token } => {
+                self.synchronize_authority(current_token)
+            }
             ActorCommand::ObserveGeneration => match self.backend.generation() {
                 Ok(generation) => ActorEvent::Generation(generation),
-                Err(reason) => ActorEvent::Skipped {
-                    handoff_id: None,
-                    reason,
-                },
+                Err(reason) => Self::native_failure(None, reason),
             },
             ActorCommand::PrepareTarget {
                 handoff_id,
@@ -274,6 +285,19 @@ impl<B: ClipboardBackend> Actor<B> {
         }
     }
 
+    fn synchronize_authority(&mut self, current_token: OwnershipToken) -> ActorEvent {
+        if current_token.authority_session_id != self.current_token.authority_session_id
+            || current_token != self.current_token
+        {
+            self.source_snapshot = None;
+            self.stage = None;
+            self.preparation = None;
+            self.applied = None;
+            self.current_token = current_token.clone();
+        }
+        ActorEvent::AuthoritySynchronized { current_token }
+    }
+
     fn prepare_target(
         &mut self,
         handoff_id: HandoffId,
@@ -287,7 +311,7 @@ impl<B: ClipboardBackend> Actor<B> {
         if target_token.owner_host_id == self.local_host_id && target_token != self.current_token {
             let baseline_generation = match self.backend.generation() {
                 Ok(generation) => generation,
-                Err(reason) => return Self::skipped(Some(handoff_id), reason),
+                Err(reason) => return Self::native_failure(Some(handoff_id), reason),
             };
             self.preparation = Some((handoff_id, target_token.clone(), baseline_generation));
             ActorEvent::Prepared {
@@ -316,11 +340,14 @@ impl<B: ClipboardBackend> Actor<B> {
         }
         let data = match self.stable_capture(max_bytes) {
             Ok(data) => data,
-            Err(reason) => return Self::skipped(handoff_id, reason),
+            Err(ActorFailure::Native(reason)) => return Self::native_failure(handoff_id, reason),
+            Err(ActorFailure::Handoff(reason)) => return Self::skipped(handoff_id, reason),
         };
         let sequence = match self.next_snapshot_sequence.get().checked_add(1) {
             Some(sequence) => sequence,
-            None => return Self::skipped(handoff_id, ClipboardReason::IdentityExhausted),
+            None => {
+                return Self::native_failure(handoff_id, ClipboardReason::IdentityExhausted);
+            }
         };
         self.next_snapshot_sequence = SnapshotSequence::new(sequence);
         let snapshot_id = SnapshotId {
@@ -354,26 +381,32 @@ impl<B: ClipboardBackend> Actor<B> {
         }
     }
 
-    fn stable_capture(&mut self, max_bytes: usize) -> Result<ClipboardData, ClipboardReason> {
+    fn stable_capture(&mut self, max_bytes: usize) -> Result<ClipboardData, ActorFailure> {
         for retry in 0..=SOURCE_CHANGE_RETRIES {
-            let before = self.backend.generation()?;
-            let data = self.backend.capture(max_bytes)?;
+            let before = self.backend.generation().map_err(ActorFailure::Native)?;
+            let data = self
+                .backend
+                .capture(max_bytes)
+                .map_err(ActorFailure::Native)?;
             match &data {
                 ClipboardData::Text(bytes) => {
-                    std::str::from_utf8(bytes).map_err(|_| ClipboardReason::InvalidUtf8)?;
+                    std::str::from_utf8(bytes)
+                        .map_err(|_| ActorFailure::Handoff(ClipboardReason::InvalidUtf8))?;
                 }
                 ClipboardData::Empty => {}
-                ClipboardData::Unavailable(reason) => return Err(*reason),
+                ClipboardData::Unavailable(reason) => {
+                    return Err(ActorFailure::Handoff(*reason));
+                }
             }
             if data.len() > max_bytes {
-                return Err(ClipboardReason::Oversize);
+                return Err(ActorFailure::Handoff(ClipboardReason::Oversize));
             }
-            let after = self.backend.generation()?;
+            let after = self.backend.generation().map_err(ActorFailure::Native)?;
             if before == after {
                 return Ok(data);
             }
             if retry == SOURCE_CHANGE_RETRIES {
-                return Err(ClipboardReason::SourceChanged);
+                return Err(ActorFailure::Handoff(ClipboardReason::SourceChanged));
             }
         }
         unreachable!("bounded capture loop always returns")
@@ -533,7 +566,7 @@ impl<B: ClipboardBackend> Actor<B> {
         let post_write_generation = match self.backend.apply(stage.baseline_generation, &stage.data)
         {
             Ok(generation) => generation,
-            Err(reason) => return Self::skipped(Some(stage.handoff_id), reason),
+            Err(reason) => return Self::native_failure(Some(stage.handoff_id), reason),
         };
         self.applied = Some(identity);
         self.preparation = None;
@@ -579,6 +612,22 @@ impl<B: ClipboardBackend> Actor<B> {
         );
         ActorEvent::Skipped { handoff_id, reason }
     }
+
+    fn native_failure(handoff_id: Option<HandoffId>, reason: ClipboardReason) -> ActorEvent {
+        match reason {
+            ClipboardReason::BackendUnavailable
+            | ClipboardReason::PermissionDenied
+            | ClipboardReason::IdentityExhausted => {
+                ActorEvent::BackendUnavailable { handoff_id, reason }
+            }
+            _ => Self::skipped(handoff_id, reason),
+        }
+    }
+}
+
+enum ActorFailure {
+    Native(ClipboardReason),
+    Handoff(ClipboardReason),
 }
 
 #[cfg(test)]
@@ -1023,24 +1072,6 @@ mod tests {
         )
         .unwrap();
 
-        control.fail_capture(ClipboardReason::BackendUnavailable);
-        assert!(matches!(
-            recv(
-                actor
-                    .handle
-                    .try_request(ActorCommand::CaptureSource {
-                        handoff_id: handoff(1),
-                        source_token: source.clone(),
-                        max_bytes: 16,
-                    })
-                    .unwrap()
-            ),
-            ActorEvent::Skipped {
-                reason: ClipboardReason::BackendUnavailable,
-                ..
-            }
-        ));
-
         for reason in [
             ClipboardReason::PrivateContent,
             ClipboardReason::UnsupportedFormat,
@@ -1106,6 +1137,44 @@ mod tests {
         assert!(actor.payload_rx.try_recv().is_err());
         recv(actor.handle.try_request(ActorCommand::Shutdown).unwrap());
         actor.join().unwrap();
+    }
+
+    #[test]
+    fn native_capture_failure_reports_backend_loss_and_closes_actor() {
+        let control = BackendControl::new(ClipboardData::Empty);
+        control.fail_capture(ClipboardReason::BackendUnavailable);
+        let source = token("server", 0);
+        let actor = spawn_actor(
+            "clipboard-test",
+            control.backend(),
+            ProcessSessionId::new(5),
+            HostId::from("server"),
+            source.clone(),
+        )
+        .unwrap();
+        assert_eq!(
+            recv(
+                actor
+                    .handle
+                    .try_request(ActorCommand::CaptureSource {
+                        handoff_id: handoff(1),
+                        source_token: source,
+                        max_bytes: 16,
+                    })
+                    .unwrap()
+            ),
+            ActorEvent::BackendUnavailable {
+                handoff_id: Some(handoff(1)),
+                reason: ClipboardReason::BackendUnavailable,
+            }
+        );
+        let closed_handle = actor.handle.clone();
+        actor.join().unwrap();
+        assert!(control.state.0.lock().unwrap().shutdown);
+        assert!(matches!(
+            closed_handle.try_request(ActorCommand::ObserveGeneration),
+            Err(ClipboardReason::ChannelUnavailable)
+        ));
     }
 
     #[test]
@@ -1175,13 +1244,17 @@ mod tests {
                     })
                     .unwrap()
             ),
-            ActorEvent::Skipped {
+            ActorEvent::BackendUnavailable {
                 reason: ClipboardReason::BackendUnavailable,
                 ..
             }
         ));
-        recv(actor.handle.try_request(ActorCommand::Shutdown).unwrap());
+        let closed_handle = actor.handle.clone();
         actor.join().unwrap();
+        assert!(matches!(
+            closed_handle.try_request(ActorCommand::Shutdown),
+            Err(ClipboardReason::ChannelUnavailable)
+        ));
 
         let original = ClipboardData::text(Arc::<[u8]>::from(&b"local"[..])).unwrap();
         let control = BackendControl::new(original.clone());
@@ -1236,13 +1309,12 @@ mod tests {
                     })
                     .unwrap()
             ),
-            ActorEvent::Skipped {
+            ActorEvent::BackendUnavailable {
                 reason: ClipboardReason::BackendUnavailable,
                 ..
             }
         ));
         assert_eq!(control.state.0.lock().unwrap().data, original);
-        recv(actor.handle.try_request(ActorCommand::Shutdown).unwrap());
         actor.join().unwrap();
     }
 
@@ -1356,6 +1428,65 @@ mod tests {
                     .unwrap()
             ),
             ActorEvent::Captured { .. }
+        ));
+        recv(actor.handle.try_request(ActorCommand::Shutdown).unwrap());
+        actor.join().unwrap();
+    }
+
+    #[test]
+    fn authority_synchronization_fences_old_actor_state_before_new_work() {
+        let control = BackendControl::new(ClipboardData::Empty);
+        let old_token = token("remote", 1);
+        let actor = spawn_actor(
+            "clipboard-test",
+            control.backend(),
+            ProcessSessionId::new(5),
+            HostId::from("remote"),
+            old_token.clone(),
+        )
+        .unwrap();
+        recv(
+            actor
+                .handle
+                .try_request(ActorCommand::CaptureProvisional {
+                    source_token: old_token,
+                    max_bytes: 16,
+                })
+                .unwrap(),
+        );
+        let mut current_token = token("server", 8);
+        current_token.authority_session_id = AuthoritySessionId::new(2);
+
+        assert_eq!(
+            recv(
+                actor
+                    .handle
+                    .try_request(ActorCommand::SynchronizeAuthority {
+                        current_token: current_token.clone(),
+                    })
+                    .unwrap()
+            ),
+            ActorEvent::AuthoritySynchronized {
+                current_token: current_token.clone(),
+            }
+        );
+        let mut target_token = token("remote", 9);
+        target_token.authority_session_id = AuthoritySessionId::new(2);
+        let new_handoff = HandoffId {
+            authority_session_id: AuthoritySessionId::new(2),
+            handoff_epoch: HandoffEpoch::new(3),
+        };
+        assert!(matches!(
+            recv(
+                actor
+                    .handle
+                    .try_request(ActorCommand::PrepareTarget {
+                        handoff_id: new_handoff,
+                        target_token,
+                    })
+                    .unwrap()
+            ),
+            ActorEvent::Prepared { .. }
         ));
         recv(actor.handle.try_request(ActorCommand::Shutdown).unwrap());
         actor.join().unwrap();

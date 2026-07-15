@@ -8,6 +8,8 @@ mod types;
 
 pub use actor::{ActorCommand, ActorEvent, ActorHandle, ActorPayload, SpawnedActor, spawn_actor};
 pub use backend::ClipboardBackend;
+#[cfg(target_os = "linux")]
+pub use backend::LinuxClipboardBackend;
 pub use coordinator::{
     ActiveHandoff, BeginHandoff, Coordinator, CoordinatorCommand, CoordinatorError, HandoffPhase,
     SnapshotMetadata, TargetPreparation,

@@ -1,5 +1,15 @@
 use crate::{ClipboardData, ClipboardReason, NativeGeneration};
 
+#[cfg(target_os = "linux")]
+mod linux;
+#[cfg(target_os = "linux")]
+mod wayland;
+#[cfg(target_os = "linux")]
+mod x11;
+
+#[cfg(target_os = "linux")]
+pub use linux::LinuxClipboardBackend;
+
 /// Synchronous contract owned and called by one thread-affine clipboard actor.
 pub trait ClipboardBackend: Send + 'static {
     fn generation(&mut self) -> Result<NativeGeneration, ClipboardReason>;

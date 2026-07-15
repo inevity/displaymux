@@ -116,6 +116,7 @@ pub(crate) enum ClipboardTransportRole {
     },
 }
 
+#[derive(Clone)]
 pub(crate) struct ClipboardTransportConfig {
     pub(crate) enabled: bool,
     pub(crate) local_host: HostId,
