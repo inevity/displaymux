@@ -697,6 +697,22 @@ XWayland is not a generic fallback for the Wayland-native clipboard.
 
 `arboard` is useful reference code and may be usable for selected writes. It is not the V1 abstraction because the checked Wayland path may read to completion before an application-level cap can reject the payload, and the design needs platform generation, private-format inspection, target preparation, and persistent ownership semantics.
 
+### 12.6 Native Replacement Refinement Boundary
+
+The model's `ApplySnapshot` action represents one successful serialized native
+replacement and the immediately recorded applied identity. The implementation
+must complete every fallible conversion, allocation, permission check, and
+destination-generation check before the first destructive native call.
+
+Windows still requires `EmptyClipboard` followed by one or more
+`SetClipboardData` calls, and macOS requires `clearContents` followed by
+`writeObjects`. Neither platform API provides a transaction or rollback if the
+process or OS fails between those calls. This unavoidable native failure window
+is outside the successful `ApplySnapshot` refinement; it must not be described
+as platform-transactional behavior. During normal process execution the
+dedicated actor admits no await, cancellation point, or competing clipboard
+operation between clear, set, and applied-identity recording.
+
 ## 13. Race and Failure Analysis
 
 ### 13.1 Source Changes During Read
@@ -1011,6 +1027,7 @@ integrity_failed
 invalid_utf8
 canceled
 queue_full
+identity_exhausted
 ```
 
 ### 19.3 Notifications

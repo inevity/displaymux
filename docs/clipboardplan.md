@@ -2,7 +2,7 @@
 
 ## Plan Control
 
-- Status: in progress. P0 through P6 are complete; P7 is the next action.
+- Status: in progress. P0 through P7 are complete; P8 is the next action.
 - Plan type: scoped child implementation plan. The requested filename is
   `docs/clipboardplan.md`; this is not a replacement root objective and
   therefore does not supersede
@@ -1038,7 +1038,8 @@ the capability; input remains usable.
 
 ## P7: Cross-Platform Hardening and Observability
 
-Status: pending. Depends on P4, P5, and P6.
+Status: completed 2026-07-15 in Lan Mouse commit `852f51e`. Depends on P4,
+P5, and P6.
 
 ### Structured Tracing
 
@@ -1071,6 +1072,7 @@ unsupported_format oversize source_changed target_not_prepared
 destination_changed stale_authority_session stale_peer_session stale_handoff
 stale_owner_token duplicate channel_unavailable transfer_timeout
 protocol_error integrity_failed invalid_utf8 canceled queue_full
+identity_exhausted
 ```
 
 Notify only persistent actionable backend failures. Per-handoff transient
@@ -1114,6 +1116,58 @@ Run formatting, all no-GTK workspace checks/tests, current Linux feature
 checks/tests, focused fault tests, and clippy for all targets that can build on
 the current host. Resolve new warnings in touched code; record unrelated
 baseline warnings separately.
+
+Completed verification:
+
+- `cargo fmt --all -- --check`: passed.
+- locked no-GTK workspace `cargo check` and `cargo test`: passed; the
+  clipboard crate ran 67 tests successfully with two interactive Wayland/X11
+  probes intentionally ignored.
+- locked current Linux production-feature `cargo check` and `cargo test` with
+  `layer_shell_capture,libei_capture,x11_capture,wlroots_emulation,libei_emulation,x11_emulation,rdp_emulation`:
+  passed.
+- focused lost-apply-result supersession and full actor-completion-queue
+  backpressure tests: passed.
+- no-GTK all-target clippy: passed with no new warning in the P7 delta. The
+  existing baseline remains unused `display_selector`, unused
+  `start_service`, large enum variants, `len_without_is_empty`, and existing
+  argument-count warnings.
+
+Direct refinement evidence:
+
+| Obligation | Model evidence | Direct Rust evidence |
+|---|---|---|
+| C1 InputOwnershipAtomic | `InputOwnershipAtomic` | `valid_commit_moves_the_whole_bundle_to_remote_owned` |
+| C2 InputIndependence | `InputIndependence`, commit/fallback enabledness | `full_or_closed_hook_queue_never_blocks_input_caller`, `malformed_clipboard_reader_exits_while_independent_input_progresses` |
+| C3 ActiveSourceOnly | `PendingSwitchWellFormed`, `ActiveHandoffFenced` | `provisional_capture_binds_only_matching_source_token` |
+| C4 PreparedBeforeActivation | `PreparedBeforeActivated` | `activation_without_completed_prepare_skips_without_blocking_owner_commit` |
+| C5 NoStaleApply | `ActiveHandoffFenced`, `StageIdentityBound` | `target_identity_checks_allow_new_server_epoch_and_reject_wrong_host_or_authority` |
+| C6 DestinationPreservation | `ApplySnapshot` generation guard | `destination_change_prevents_apply_and_preserves_value` plus native backend race tests |
+| C7 AtMostOnceApply | `AtMostOnceStaging`, `AppliedIdentityRecorded` | `explicit_empty_applies_once_and_unavailable_never_clears_target`, `lost_apply_result_is_superseded_without_retrying_native_apply` |
+| C8 BoundedMemory | `PayloadBounded`, singular handoff/wire/stage | `exact_limit_is_accepted_and_one_byte_over_is_rejected`, `control_queue_saturation_is_bounded_and_payloads_cannot_enter_it` |
+| C9 NoPrivateExport | `NoPrivatePayload` | `source_filtering_never_publishes_private_unsupported_oversized_or_invalid_text` plus platform marker tests |
+| C10 NoFailureClear | `FailurePreservesNativeClipboard`, `SnapshotKindMatches` | `explicit_empty_applies_once_and_unavailable_never_clears_target` |
+| C11 SessionFreshness | restart actions and active/stage fencing | `process_restart_cancels_matching_handoff`, target identity tests |
+| C12 OneActiveHandoff | singular handoff/wire/stage/retired state | `supersession_reports_cancel_before_new_work_and_never_reuses_epochs` |
+
+Deadlock, performance, and privacy audit result:
+
+- payload-slot mutex guards are released before notification or network await;
+  authority-session read/write guards exist only in synchronous validation;
+  native clipboard handles remain on one synchronous actor thread;
+- actor completions use bounded async backpressure, while input-transition
+  hooks retain bounded non-blocking `try_send`; no queue is unbounded and no
+  clipboard result is needed to commit or fall back input;
+- pointer/keyboard forwarding contains no clipboard payload operation. The
+  only service calls are fixed-size begin/activate/cancel notices at ownership
+  transitions and release events;
+- Windows and macOS preflight fallible conversion/allocation, permission, and
+  destination-generation work before clear. The design and model now document
+  the unavoidable native clear/set process-failure window instead of claiming
+  an OS transaction;
+- stable lifecycle logs contain only the allowed host, identity, epoch, byte,
+  duration, and reason fields. Platform diagnostics contain no clipboard
+  bytes, digest, MIME value, application identity, or text-derived metadata.
 
 P7 exit gate: every C1-C12 invariant has at least one direct Rust test and one
 model/refinement-ledger reference, and the deadlock/performance audit has no
@@ -1301,6 +1355,6 @@ must not be collapsed before their individual gates pass.
 - P5 Windows native actor: completed 2026-07-15; positive live mutation remains
   part of P8 acceptance
 - P6 macOS native actor: completed in `8c5f40e`
-- P7 Cross-platform hardening and observability: pending, next action
-- P8 Native build and deployment: pending
+- P7 Cross-platform hardening and observability: completed in `852f51e`
+- P8 Native build and deployment: pending, next action
 - P9 Final refinement and acceptance: pending

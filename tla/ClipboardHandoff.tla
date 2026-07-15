@@ -938,6 +938,9 @@ SkipUnpreparedAfterCommit ==
                     applied_session, applied_handoff_epoch>>
 
 ApplySnapshot ==
+    \* Abstracts one successful serialized native replacement plus recording
+    \* its applied identity. Native APIs may have an unavoidable clear/set
+    \* process-failure window; failed native calls are not ApplySnapshot steps.
     /\ handoff.phase = "staged"
     /\ stage.valid
     /\ StageMatchesHandoff
