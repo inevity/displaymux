@@ -53,22 +53,6 @@ fn backend_operation_failed(
     reason
 }
 
-fn clipboard_sequence(operation: &'static str) -> Result<u32, ClipboardReason> {
-    let sequence = unsafe { GetClipboardSequenceNumber() };
-    if sequence == 0 {
-        tracing::warn!(
-            event = "clipboard_backend_operation_failed",
-            backend = "windows",
-            operation,
-            reason = ClipboardReason::BackendUnavailable.code(),
-            required_access = "WINSTA_ACCESSCLIPBOARD",
-            "Windows clipboard sequence number is unavailable"
-        );
-        return Err(ClipboardReason::BackendUnavailable);
-    }
-    Ok(sequence)
-}
-
 #[derive(Default)]
 struct GenerationTracker {
     last_raw: Option<u32>,
@@ -79,9 +63,6 @@ struct GenerationTracker {
 
 impl GenerationTracker {
     fn observe(&mut self, raw: u32) -> Result<NativeGeneration, ClipboardReason> {
-        if raw == 0 {
-            return Err(ClipboardReason::BackendUnavailable);
-        }
         if self.last_raw.is_some_and(|previous| raw < previous) {
             self.wrap_base = self
                 .wrap_base
@@ -223,7 +204,7 @@ impl WindowsClipboardBackend {
         let mut message = MSG::default();
         while unsafe { PeekMessageW(&mut message, Some(window), 0, 0, PM_REMOVE) }.as_bool() {
             if message.message == WM_CLIPBOARDUPDATE {
-                let raw = clipboard_sequence("observe_notification")?;
+                let raw = unsafe { GetClipboardSequenceNumber() };
                 self.generation.observe_notification(raw)?;
             }
             unsafe {
@@ -237,7 +218,7 @@ impl WindowsClipboardBackend {
     fn current_generation(&mut self) -> Result<NativeGeneration, ClipboardReason> {
         self.pump_notifications()?;
         self.generation
-            .observe(clipboard_sequence("read_generation")?)
+            .observe(unsafe { GetClipboardSequenceNumber() })
     }
 
     fn capture_text(&mut self, max_bytes: usize) -> Result<ClipboardData, ClipboardReason> {
@@ -305,7 +286,7 @@ impl WindowsClipboardBackend {
                 ),
             }
         }
-        let raw = clipboard_sequence("read_generation_after_apply")?;
+        let raw = unsafe { GetClipboardSequenceNumber() };
         self.generation.mark_self_write(raw);
         Ok(raw)
     }
@@ -542,6 +523,22 @@ mod tests {
         assert_eq!(tracker.suppressed_self_notifications, 1);
         assert!(tracker.self_write_raw.is_none());
         assert_eq!(tracker.observe(10).unwrap(), NativeGeneration::new(10));
+    }
+
+    #[test]
+    fn zero_sequence_is_valid_initially_and_after_wrap() {
+        let mut initial = GenerationTracker::default();
+        assert_eq!(initial.observe(0).unwrap(), NativeGeneration::new(0));
+
+        let mut wrapped = GenerationTracker::default();
+        assert_eq!(
+            wrapped.observe(u32::MAX).unwrap(),
+            NativeGeneration::new(u64::from(u32::MAX))
+        );
+        assert_eq!(
+            wrapped.observe(0).unwrap(),
+            NativeGeneration::new(1_u64 << 32)
+        );
     }
 
     #[test]
