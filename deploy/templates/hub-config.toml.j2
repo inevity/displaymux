@@ -8,6 +8,10 @@ release_bind = [ "KeyA", "KeyS", "KeyD", "KeyF" ]
 port = {{ lan_mouse_port }}
 emulation_display = "{{ lan_mouse_emulation_displays[lan_mouse_server_host] }}"
 
+[clipboard]
+enabled = {{ lan_mouse_clipboard_enabled | lower }}
+max_bytes = {{ lan_mouse_clipboard_max_bytes }}
+
 [switch_controller]
 url = "http://{{ hostvars[groups['linux_desktop'][0]].ansible_host }}:{{ daemon_port }}"
 token = "{{ lookup('ansible.builtin.file', lan_mouse_controller_token_file) | trim }}"

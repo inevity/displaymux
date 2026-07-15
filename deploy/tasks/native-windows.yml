@@ -146,7 +146,8 @@
       ansible.windows.win_shell: |
         $env:RUSTUP_TOOLCHAIN = "{{ lan_mouse_rust_toolchain }}"
         $env:CARGO_TARGET_DIR = "{{ win_target_dir }}"
-        $command = "call `"{{ win_vs_installation.stdout | trim }}\Common7\Tools\VsDevCmd.bat`" -arch=x64 -host_arch=x64 >nul && cargo test --frozen --workspace --exclude lan-mouse-gtk --no-default-features"
+        $env:CARGO_INCREMENTAL = "0"
+        $command = "call `"{{ win_vs_installation.stdout | trim }}\Common7\Tools\VsDevCmd.bat`" -arch=x64 -host_arch=x64 >nul && cargo test --frozen --target-dir `"{{ win_target_dir }}`" --workspace --exclude lan-mouse-gtk --no-default-features"
         cmd.exe /d /c $command
         exit $LASTEXITCODE
       args:
@@ -159,14 +160,59 @@
       ansible.windows.win_shell: |
         $env:RUSTUP_TOOLCHAIN = "{{ lan_mouse_rust_toolchain }}"
         $env:CARGO_TARGET_DIR = "{{ win_target_dir }}"
-        $command = "call `"{{ win_vs_installation.stdout | trim }}\Common7\Tools\VsDevCmd.bat`" -arch=x64 -host_arch=x64 >nul && cargo build --frozen --release --bin lan-mouse --no-default-features"
+        $env:CARGO_INCREMENTAL = "0"
+        $command = "call `"{{ win_vs_installation.stdout | trim }}\Common7\Tools\VsDevCmd.bat`" -arch=x64 -host_arch=x64 >nul && cargo build --frozen --target-dir `"{{ win_target_dir }}`" --release --bin lan-mouse --no-default-features"
         cmd.exe /d /c $command
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+        if (-not (Test-Path "{{ win_target_dir }}\release\lan-mouse.exe")) {
+          throw "cargo succeeded without producing {{ win_target_dir }}\release\lan-mouse.exe"
+        }
         exit $LASTEXITCODE
       args:
         chdir: "{{ win_source_dir }}"
       changed_when: true
       async: 3600
       poll: 5
+
+    - name: Require built Windows release artifact before stopping the daemon
+      ansible.windows.win_stat:
+        path: '{{ win_target_dir }}\release\lan-mouse.exe'
+      register: win_release_artifact
+
+    - name: Validate built Windows release artifact
+      ansible.builtin.assert:
+        that:
+          - win_release_artifact.stat.exists
+          - win_release_artifact.stat.size | int > 0
+
+    - name: Check Windows interactive desktop before binary replacement
+      ansible.windows.win_shell: |
+        $targetUser = "{{ ansible_user }}"
+        $active = Get-CimInstance Win32_Process -Filter "Name = 'explorer.exe'" |
+          ForEach-Object {
+            $owner = Invoke-CimMethod -InputObject $_ -MethodName GetOwner
+            if ($owner.User -ieq $targetUser) { $true }
+          }
+        if ($active -contains $true) { Write-Output "active" }
+      register: win_interactive_before_replace
+      changed_when: false
+
+    - name: Check existing Windows lan-mouse process before binary replacement
+      ansible.windows.win_shell: |
+        $expected = [System.IO.Path]::GetFullPath("{{ win_installed_binary }}")
+        $process = Get-CimInstance Win32_Process -Filter "Name = 'lan-mouse.exe'" |
+          Where-Object { $_.ExecutablePath -and [System.IO.Path]::GetFullPath($_.ExecutablePath) -eq $expected }
+        if ($process) { Write-Output "running" }
+      register: win_process_before_replace
+      changed_when: false
+
+    - name: Require a replacement desktop before stopping a running Windows daemon
+      ansible.builtin.assert:
+        that:
+          - "'running' not in win_process_before_replace.stdout or 'active' in win_interactive_before_replace.stdout"
+        fail_msg: >-
+          Refusing to stop the running Windows lan-mouse daemon because the deployment user
+          has no interactive desktop in which the replacement process can start.
 
     - name: Stop existing lan-mouse scheduled task before binary replacement
       ansible.windows.win_shell: |
@@ -247,6 +293,22 @@
     restart_interval: PT1M
   register: win_scheduled_task
 
+- name: Detect Windows interactive desktop for the deployment user
+  ansible.windows.win_shell: |
+    $targetUser = "{{ ansible_user }}"
+    $active = Get-CimInstance Win32_Process -Filter "Name = 'explorer.exe'" |
+      ForEach-Object {
+        $owner = Invoke-CimMethod -InputObject $_ -MethodName GetOwner
+        if ($owner.User -ieq $targetUser) { $true }
+      }
+    if ($active -contains $true) { Write-Output "active" }
+  register: win_interactive_desktop
+  changed_when: false
+
+- name: Record Windows interactive desktop availability
+  ansible.builtin.set_fact:
+    win_interactive_desktop_available: "{{ 'active' in win_interactive_desktop.stdout }}"
+
 - name: Decide whether Windows daemon restart is required
   ansible.builtin.set_fact:
     win_runtime_changed: >-
@@ -261,7 +323,9 @@
     Start-Sleep 2
     schtasks /run /tn LanMouseDaemon
     exit $LASTEXITCODE
-  when: win_runtime_changed
+  when:
+    - win_runtime_changed
+    - win_interactive_desktop_available
   changed_when: true
 
 - name: Ensure Windows lan-mouse is running when inputs are unchanged
@@ -275,7 +339,9 @@
       Write-Output "started"
     }
   register: win_ensure_running
-  when: not win_runtime_changed
+  when:
+    - not win_runtime_changed
+    - win_interactive_desktop_available
   changed_when: "'started' in win_ensure_running.stdout"
 
 - name: Wait for Windows lan-mouse process
@@ -289,6 +355,7 @@
   retries: 10
   delay: 1
   until: win_process.rc == 0
+  when: win_interactive_desktop_available
   changed_when: false
 
 - name: Verify persistent Windows log files exist
@@ -317,3 +384,13 @@
     }
   register: win_firewall
   changed_when: "'created' in win_firewall.stdout"
+
+- name: Open Windows Firewall for authenticated clipboard (TCP {{ lan_mouse_port }})
+  ansible.windows.win_shell: |
+    $existing = Get-NetFirewallRule -Name lan-mouse-clipboard -ErrorAction SilentlyContinue
+    if (-not $existing) {
+      New-NetFirewallRule -Name lan-mouse-clipboard -DisplayName "lan-mouse authenticated clipboard" -Enabled True -Profile Any -Direction Inbound -Protocol TCP -Action Allow -LocalPort {{ lan_mouse_port }} | Out-Null
+      Write-Output "created"
+    }
+  register: win_clipboard_firewall
+  changed_when: "'created' in win_clipboard_firewall.stdout"

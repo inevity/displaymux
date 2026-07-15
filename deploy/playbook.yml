@@ -311,12 +311,14 @@
         argv: [cargo, test, --frozen]
         chdir: "{{ playbook_dir }}/../tv-multiview"
       changed_when: false
+      tags: [tv_multiview_mutation]
 
     - name: Build tv-multiview daemon
       ansible.builtin.command:
         argv: [cargo, build, --frozen, --release]
         chdir: "{{ playbook_dir }}/../tv-multiview"
       changed_when: false
+      tags: [tv_multiview_mutation]
 
     - name: Install tv-multiview binary
       ansible.builtin.copy:
@@ -325,6 +327,7 @@
         mode: "0755"
         remote_src: false
       register: tv_multiview_binary_install
+      tags: [tv_multiview_mutation]
 
     - name: Ensure lingering is enabled (so user services survive without an active login)
       become: true
@@ -352,16 +355,19 @@
         path: "{{ ansible_facts.env.HOME }}/.config/tv-multiview"
         state: directory
         mode: "0700"
+      tags: [tv_multiview_mutation]
 
     - name: Verify shared LG client-key database exists
       ansible.builtin.stat:
         path: "{{ tv_multiview_client_key_path }}"
       register: tv_client_key
+      tags: [tv_multiview_mutation]
 
     - name: Require existing LG client-key database
       ansible.builtin.assert:
         that: tv_client_key.stat.exists
         fail_msg: "Missing LG client-key database at {{ tv_multiview_client_key_path }}"
+      tags: [tv_multiview_mutation]
 
     - name: Deploy authenticated tv-multiview configuration
       ansible.builtin.template:
@@ -370,6 +376,7 @@
         mode: "0600"
       register: daemon_config_template
       no_log: true
+      tags: [tv_multiview_mutation]
 
     - name: Deploy lan-mouse hub configuration
       ansible.builtin.template:
@@ -402,48 +409,57 @@
       vars:
         tv_multiview_binary: "{{ ansible_facts.env.HOME }}/.local/bin/tv-multiview"
       register: daemon_service_template
+      tags: [tv_multiview_mutation]
 
-    - name: Reload systemd user daemon and restart changed services
-      when: >
-        linux_build_required
-        or hub_config_template.changed
-        or lm_service_template.changed
-        or tv_multiview_binary_install.changed
-        or daemon_config_template.changed
-        or daemon_service_template.changed
-      block:
-        - name: Reload systemd user daemon
-          ansible.builtin.systemd:
-            scope: user
-            daemon_reload: true
-          environment:
-            XDG_RUNTIME_DIR: "/run/user/{{ ansible_facts.user_uid }}"
+    - name: Define Linux runtime change boundaries
+      ansible.builtin.set_fact:
+        lan_mouse_linux_runtime_changed: >-
+          {{ linux_build_required
+             or hub_config_template.changed
+             or lm_service_template.changed }}
+        tv_multiview_runtime_changed: >-
+          {{ (tv_multiview_binary_install.changed | default(false))
+             or (daemon_config_template.changed | default(false))
+             or (daemon_service_template.changed | default(false)) }}
 
-        - name: Stop lan-mouse before replacing the TV control plane
-          ansible.builtin.systemd:
-            name: lan-mouse.service
-            scope: user
-            state: stopped
-          environment:
-            XDG_RUNTIME_DIR: "/run/user/{{ ansible_facts.user_uid }}"
+    - name: Reload systemd user daemon for changed units
+      ansible.builtin.systemd:
+        scope: user
+        daemon_reload: true
+      environment:
+        XDG_RUNTIME_DIR: "/run/user/{{ ansible_facts.user_uid }}"
+      when: >-
+        lm_service_template.changed
+        or (daemon_service_template.changed | default(false))
 
-        - name: Restart tv-multiview with input local
-          ansible.builtin.systemd:
-            name: tv-multiview.service
-            scope: user
-            enabled: true
-            state: restarted
-          environment:
-            XDG_RUNTIME_DIR: "/run/user/{{ ansible_facts.user_uid }}"
+    - name: Stop lan-mouse before replacing the TV control plane
+      ansible.builtin.systemd:
+        name: lan-mouse.service
+        scope: user
+        state: stopped
+      environment:
+        XDG_RUNTIME_DIR: "/run/user/{{ ansible_facts.user_uid }}"
+      when: tv_multiview_runtime_changed
 
-        - name: Start lan-mouse after tv-multiview restart succeeds
-          ansible.builtin.systemd:
-            name: lan-mouse.service
-            scope: user
-            enabled: true
-            state: started
-          environment:
-            XDG_RUNTIME_DIR: "/run/user/{{ ansible_facts.user_uid }}"
+    - name: Restart changed tv-multiview with input local
+      ansible.builtin.systemd:
+        name: tv-multiview.service
+        scope: user
+        enabled: true
+        state: restarted
+      environment:
+        XDG_RUNTIME_DIR: "/run/user/{{ ansible_facts.user_uid }}"
+      when: tv_multiview_runtime_changed
+
+    - name: Restart lan-mouse for changed Lan Mouse or TV runtime inputs
+      ansible.builtin.systemd:
+        name: lan-mouse.service
+        scope: user
+        enabled: true
+        state: restarted
+      environment:
+        XDG_RUNTIME_DIR: "/run/user/{{ ansible_facts.user_uid }}"
+      when: lan_mouse_linux_runtime_changed or tv_multiview_runtime_changed
 
     - name: Ensure both Linux services are enabled and started
       ansible.builtin.systemd:
@@ -498,7 +514,8 @@
       no_log: true
 
     # Firewall policy remains externally owned. The Linux host must admit UDP
-    # {{ lan_mouse_port }} and authenticated TCP {{ daemon_port }} from this LAN.
+    # and TCP {{ lan_mouse_port }}, plus authenticated controller TCP
+    # {{ daemon_port }}, from this LAN.
 
 - name: Build and deploy lan-mouse spokes in parallel
   hosts: mac_desktop:windows_desktop

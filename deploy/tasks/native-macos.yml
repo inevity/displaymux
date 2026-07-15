@@ -138,6 +138,7 @@
   when: mac_build_required
   environment:
     CARGO_TARGET_DIR: "{{ mac_target_dir }}"
+    CARGO_INCREMENTAL: "0"
     PATH: "{{ mac_cargo.stdout | trim | dirname }}:{{ ansible_facts.env.PATH }}"
   block:
     - name: Run no-GTK macOS workspace tests
