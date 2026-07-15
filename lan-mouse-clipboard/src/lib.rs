@@ -10,6 +10,8 @@ pub use actor::{ActorCommand, ActorEvent, ActorHandle, ActorPayload, SpawnedActo
 pub use backend::ClipboardBackend;
 #[cfg(target_os = "linux")]
 pub use backend::LinuxClipboardBackend;
+#[cfg(target_os = "macos")]
+pub use backend::MacOsClipboardBackend;
 #[cfg(target_os = "windows")]
 pub use backend::WindowsClipboardBackend;
 pub use coordinator::{

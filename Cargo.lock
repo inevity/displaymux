@@ -2109,6 +2109,9 @@ name = "lan-mouse-clipboard"
 version = "0.1.0"
 dependencies = [
  "arboard",
+ "objc2",
+ "objc2-app-kit",
+ "objc2-foundation",
  "rcgen",
  "rustix",
  "rustls",

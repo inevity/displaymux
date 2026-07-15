@@ -5,6 +5,7 @@ use tokio::task::{spawn_blocking, spawn_local};
 #[derive(Clone)]
 pub(crate) struct SystemNotifier {
     enabled: bool,
+    local_host: Option<SwitchHost>,
     server_host: SwitchHost,
 }
 
@@ -19,6 +20,7 @@ impl SystemNotifier {
     pub(crate) fn new(local_host: SwitchHost, server_host: SwitchHost) -> Self {
         Self {
             enabled: local_host == server_host,
+            local_host: Some(local_host),
             server_host,
         }
     }
@@ -26,6 +28,7 @@ impl SystemNotifier {
     pub(crate) fn disabled() -> Self {
         Self {
             enabled: false,
+            local_host: None,
             server_host: SwitchHost::Linux,
         }
     }
@@ -46,6 +49,17 @@ impl SystemNotifier {
 
         let notification =
             switch_failure_notification(target, self.server_host, reason, detail.into());
+        self.show(notification);
+    }
+
+    pub(crate) fn clipboard_permission_denied(&self) {
+        let Some(local_host) = self.local_host else {
+            return;
+        };
+        self.show(clipboard_permission_notification(local_host));
+    }
+
+    fn show(&self, notification: Notification) {
         spawn_local(async move {
             let title = notification.title.clone();
             match send_notification(notification).await {
@@ -53,6 +67,17 @@ impl SystemNotifier {
                 Err(error) => log::warn!("failed to send system notification: {error}"),
             }
         });
+    }
+}
+
+fn clipboard_permission_notification(local_host: SwitchHost) -> Notification {
+    Notification {
+        title: "Lan Mouse: clipboard access denied".to_string(),
+        body: format!(
+            "Clipboard handoff is unavailable on {}. Input switching still works. Set Lan Mouse pasteboard access to Always Allow in System Settings.",
+            host_label(local_host)
+        ),
+        timeout: Timeout::Never,
     }
 }
 
@@ -182,6 +207,15 @@ mod tests {
         assert!(notification.body.contains("keyboard and pointer bundle"));
         assert!(notification.body.contains("Input remains on macOS"));
         assert!(notification.body.contains("peer_bundle_not_ready"));
+        assert_eq!(notification.timeout, Timeout::Never);
+    }
+
+    #[test]
+    fn clipboard_permission_notification_is_actionable_and_preserves_input() {
+        let notification = clipboard_permission_notification(SwitchHost::Mac);
+        assert!(notification.body.contains("Always Allow"));
+        assert!(notification.body.contains("Input switching still works"));
+        assert!(notification.body.contains("macOS"));
         assert_eq!(notification.timeout, Timeout::Never);
     }
 }

@@ -198,6 +198,7 @@ impl Service {
             clipboard_tls_identity.clone(),
             config.clients(),
             config.authorized_fingerprints(),
+            system_notifier.clone(),
         );
 
         // create frontend communication adapter, exit if already running
@@ -678,6 +679,7 @@ impl Service {
             self.clipboard_tls_identity.clone(),
             self.config.clients(),
             self.config.authorized_fingerprints(),
+            self.system_notifier.clone(),
         );
     }
 

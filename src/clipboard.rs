@@ -1,4 +1,4 @@
-#[cfg(any(target_os = "linux", target_os = "windows"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 use std::thread;
 use std::{
     collections::HashMap,
@@ -16,6 +16,8 @@ use lan_mouse_clipboard::{
 };
 #[cfg(target_os = "linux")]
 use lan_mouse_clipboard::{LinuxClipboardBackend, spawn_actor};
+#[cfg(target_os = "macos")]
+use lan_mouse_clipboard::{MacOsClipboardBackend, spawn_actor};
 #[cfg(target_os = "windows")]
 use lan_mouse_clipboard::{WindowsClipboardBackend, spawn_actor};
 use lan_mouse_ipc::SwitchHost;
@@ -30,6 +32,7 @@ use crate::{
         ClipboardTransportRole, configured_peers, host_id, text_v1_capability,
     },
     config::{ClipboardConfig, ConfigClient},
+    notification::SystemNotifier,
 };
 
 // The service loop can have one pending notice from each transition class:
@@ -134,6 +137,7 @@ impl ClipboardRuntime {
         identity: Option<TlsIdentity>,
         clients: Vec<ConfigClient>,
         authorized_fingerprints: HashMap<String, String>,
+        system_notifier: SystemNotifier,
     ) -> Self {
         let (hook_tx, hook_rx) = mpsc::channel(SERVICE_HOOK_CLASS_COUNT);
         let handle = ClipboardHandle { hook_tx };
@@ -193,6 +197,7 @@ impl ClipboardRuntime {
             transport_config,
             actor_init,
             actor_completion_rx,
+            system_notifier,
         ));
         Self {
             handle,
@@ -224,10 +229,12 @@ async fn run(
     mut transport_config: Option<ClipboardTransportConfig>,
     mut actor_init: Option<oneshot::Receiver<Result<SpawnedActor, ClipboardReason>>>,
     mut actor_completion_rx: mpsc::Receiver<(ActorCommand, ActorEvent)>,
+    system_notifier: SystemNotifier,
 ) {
     let mut transport = transport_config.clone().map(ClipboardTransport::start);
     let mut actor = None;
     let mut actor_retry = None;
+    let mut actor_unavailable_reason: Option<ClipboardReason> = None;
     loop {
         tokio::select! {
             hook = hook_rx.recv() => {
@@ -248,6 +255,13 @@ async fn run(
                 actor_init = None;
                 match initialized {
                     Ok(spawned) => {
+                        if let Some(previous_reason) = actor_unavailable_reason.take() {
+                            tracing::info!(
+                                event = "clipboard_backend_ready",
+                                previous_reason = previous_reason.code(),
+                                "native clipboard actor recovered"
+                            );
+                        }
                         core.install_actor(spawned.handle.clone());
                         actor = Some(spawned);
                         if let Some(config) = transport_config.as_mut() {
@@ -258,10 +272,10 @@ async fn run(
                             transport = Some(ClipboardTransport::start(config.clone()));
                         }
                     }
-                    Err(reason) => tracing::warn!(
-                        event = "clipboard_backend_unavailable",
-                        reason = reason.code(),
-                        "native clipboard actor initialization failed; input remains available"
+                    Err(reason) => record_backend_unavailable(
+                        &mut actor_unavailable_reason,
+                        &system_notifier,
+                        reason,
                     ),
                 }
                 if actor.is_none() {
@@ -291,6 +305,13 @@ async fn run(
             }
             completion = actor_completion_rx.recv() => {
                 if let Some((command, event)) = completion {
+                    if let ActorEvent::BackendUnavailable { reason, .. } = &event {
+                        record_backend_unavailable(
+                            &mut actor_unavailable_reason,
+                            &system_notifier,
+                            *reason,
+                        );
+                    }
                     core.handle_actor_event(command, event);
                 }
             }
@@ -298,6 +319,30 @@ async fn run(
     }
     if let Some(mut transport) = transport {
         transport.shutdown();
+    }
+}
+
+fn record_backend_unavailable(
+    current_reason: &mut Option<ClipboardReason>,
+    system_notifier: &SystemNotifier,
+    reason: ClipboardReason,
+) {
+    if *current_reason == Some(reason) {
+        tracing::debug!(
+            event = "clipboard_backend_unavailable",
+            reason = reason.code(),
+            "native clipboard actor remains unavailable; input remains available"
+        );
+        return;
+    }
+    *current_reason = Some(reason);
+    tracing::warn!(
+        event = "clipboard_backend_unavailable",
+        reason = reason.code(),
+        "native clipboard actor is unavailable; input remains available"
+    );
+    if reason == ClipboardReason::PermissionDenied {
+        system_notifier.clipboard_permission_denied();
     }
 }
 
@@ -357,7 +402,36 @@ fn initialize_native_actor(
     receiver
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+#[cfg(target_os = "macos")]
+fn initialize_native_actor(
+    process_session_id: ProcessSessionId,
+    local_host: HostId,
+    initial_token: OwnershipToken,
+) -> oneshot::Receiver<Result<SpawnedActor, ClipboardReason>> {
+    let (completion, receiver) = oneshot::channel();
+    let _ = thread::Builder::new()
+        .name("lan-mouse-clipboard-init".to_string())
+        .spawn(move || {
+            let actor = MacOsClipboardBackend::connect().and_then(|backend| {
+                let spawned = spawn_actor(
+                    "lan-mouse-clipboard",
+                    backend,
+                    process_session_id,
+                    local_host,
+                    initial_token,
+                )?;
+                tracing::info!(
+                    event = "clipboard_backend_ready",
+                    backend = "macos_pasteboard"
+                );
+                Ok(spawned)
+            });
+            let _ = completion.send(actor);
+        });
+    receiver
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 fn initialize_native_actor(
     _process_session_id: ProcessSessionId,
     _local_host: HostId,
