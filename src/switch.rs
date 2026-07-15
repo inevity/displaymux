@@ -94,6 +94,10 @@ impl EdgeIntentGate {
 
     pub(crate) fn retreat(&mut self, handle: ClientHandle, now: Instant) -> bool {
         self.expire(now);
+        let Some(expires_at) = now.checked_add(self.valid_for) else {
+            self.intent = None;
+            return false;
+        };
         let Some(intent) = self.intent.as_mut() else {
             return false;
         };
@@ -101,6 +105,7 @@ impl EdgeIntentGate {
             return false;
         }
         intent.rearmed = true;
+        intent.expires_at = expires_at;
         true
     }
 
@@ -1107,6 +1112,23 @@ mod tests {
                 now.checked_add(Duration::from_millis(10)).unwrap(),
             ),
             EdgeIntentDecision::Primed
+        );
+    }
+
+    #[test]
+    fn retreat_starts_a_fresh_confirmation_window() {
+        let now = Instant::now();
+        let valid_for = Duration::from_millis(500);
+        let mut gate = EdgeIntentGate::new(valid_for);
+        let key = edge_key(4, 22);
+        let retreat_at = now.checked_add(Duration::from_millis(499)).unwrap();
+        let confirm_at = now.checked_add(Duration::from_millis(998)).unwrap();
+
+        assert_eq!(gate.candidate(key, now), EdgeIntentDecision::Primed);
+        assert!(gate.retreat(4, retreat_at));
+        assert_eq!(
+            gate.candidate(key, confirm_at),
+            EdgeIntentDecision::Confirmed
         );
     }
 
