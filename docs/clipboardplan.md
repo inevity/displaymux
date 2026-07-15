@@ -2,10 +2,11 @@
 
 ## Plan Control
 
-- Status: blocked on explicit approval to restart the user-stopped Linux Lan
-  Mouse and `tv-multiview` services. P0 through P7 are complete, P8 has
-  deployed one exact revision, and P9 verification is complete but remains
-  dependent on P8 runtime acceptance.
+- Status: corrective P9 model and local Rust verification completed on
+  2026-07-15 after normal-use runtime acceptance exposed an OS-independent
+  prepare-acknowledgement race. P0 through P8 remain complete for the
+  previously deployed revision; native builds and deployment of the corrected
+  revision remain pending.
 - Plan type: scoped child implementation plan. The requested filename is
   `docs/clipboardplan.md`; this is not a replacement root objective and
   therefore does not supersede
@@ -151,9 +152,11 @@ These are implementation acceptance criteria, not comments.
    condition.
 3. **ActiveSourceOnly**: only the host and ownership token that were current
    when the authority began a real handoff may originate its snapshot.
-4. **PreparedBeforeActivation**: a trustworthy target native generation is
-   recorded before that target ownership token becomes active. A preparation
-   still pending at input commit is not retroactively valid.
+4. **PreparedBeforeActivation**: a trustworthy process-session-scoped target
+   generation is observed before the handoff, and the target actor processes
+   preparation before clipboard activation. The authority may accept that
+   preparation acknowledgement after input commit; it may not sample a new
+   baseline after commit.
 5. **NoStaleApply**: apply requires matching authority session, source and
    target process sessions, handoff ID, source token, target token, current
    owner host, and authenticated peer identity.
@@ -228,7 +231,7 @@ property enforceable in Rust.
 | `Init` | Process startup creates random process session; authority creates random authority session and server owner token | Clipboard initialization failure reports unavailable and leaves input startup unchanged |
 | `BeginRemote` | `handle_capture_candidate` after successful bundle reservation | `try_send` failure records `queue_full`; controller preparation still continues |
 | `BeginFallback` | Authority handles `PeerReleaseStarted` for the current remote owner | Release continues immediately; stale peer/token is ignored |
-| `PrepareTarget` | Target actor returns a baseline for the exact target token before activation | Late or mismatched completion is discarded |
+| `PrepareTarget` | Target actor binds its pre-switch observed generation to the exact target token before clipboard activation | Matching late acknowledgement is accepted; stale session/token completion is discarded |
 | `PrepareFailure` | Backend/channel/session cannot prepare | Set terminal `Skipped(reason)` only |
 | `CaptureSuccess` | Source actor returns stable `Text` or explicit `Empty` | Payload remains in actor/transport ownership |
 | `RetrySourceChanged` | Source actor observes generation change while the source token is still current | Retry only within the fixed, justified actor budget |
@@ -242,9 +245,8 @@ property enforceable in Rust.
 | `DeliverRetired` | Delayed old-frame test | Reject by authority/session/handoff/token fences |
 | `ReceiveSnapshot` | Validated frame becomes one target stage | Validate all lengths, hash, UTF-8, identity, and preparation first |
 | `RejectSnapshot` | Any parser, identity, capability, size, or duplicate mismatch | Target unchanged; stable reason code |
-| `ActivateTarget` | Coordinator records committed owner and sends exact target token | Only a completed pre-activation preparation is eligible |
+| `ActivateTarget` | Coordinator records committed input owner and sends the exact target token after the queued preparation command | Actor FIFO preserves preparation-before-clipboard-activation even when its acknowledgement is delayed |
 | `ActivationFailure` | Process/session/channel changed before activation | Skip; input remains committed |
-| `SkipUnpreparedAfterCommit` | Input commit occurs without completed valid preparation | Terminal `target_not_prepared`; no late baseline |
 | `ApplySnapshot` | Target actor rechecks owner/token/session/baseline and writes once | Record applied identity before publishing success |
 | `DropStage` | Destination changed, backend failed, handoff superseded, or token stale | Drop bytes; native clipboard unchanged |
 | `StaleHandoffFailure` | New handoff or owner supersedes old work | Old completions become no-ops with reason metadata |
@@ -511,7 +513,9 @@ Required behavior:
 
 - begin only from the current owner token;
 - allocate source/target identities once;
-- record preparation completion before activation;
+- retain a process-session-scoped generation observed before each handoff;
+- accept a matching preparation acknowledgement after input activation without
+  taking a new baseline;
 - accept source completion after owner commit only if it was started by the
   recorded source token;
 - make superseded completion events idempotent no-ops;
@@ -566,7 +570,8 @@ generation read, content read, preparation, stage, write, and shutdown point.
 - old authority and process sessions rejected;
 - authenticated source host mismatch rejected;
 - inactive source token rejected;
-- target prepare completion after activation rejected;
+- target prepare acknowledgement after input activation remains valid only for
+  the pre-switch observed generation;
 - destination generation mismatch drops stage;
 - duplicate apply is idempotent;
 - explicit empty writes empty; every unavailable reason preserves content;
@@ -770,8 +775,9 @@ Server-to-remote sequence:
    clipboard outcome.
 4. After `BundleLeaseManager::commit` succeeds, publish
    `OwnershipActivated(target_token)`.
-5. If a valid target preparation was not completed before this commit, settle
-   the handoff as `target_not_prepared`; do not record a late baseline.
+5. If the target preparation acknowledgement is still pending at input commit,
+   retain the handoff. Accept only the generation observed before the handoff;
+   never record a new post-commit baseline.
 
 Remote-to-server sequence:
 
@@ -1143,7 +1149,7 @@ Direct refinement evidence:
 | C1 InputOwnershipAtomic | `InputOwnershipAtomic` | `valid_commit_moves_the_whole_bundle_to_remote_owned` |
 | C2 InputIndependence | `InputIndependence`, commit/fallback enabledness | `full_or_closed_hook_queue_never_blocks_input_caller`, `malformed_clipboard_reader_exits_while_independent_input_progresses` |
 | C3 ActiveSourceOnly | `PendingSwitchWellFormed`, `ActiveHandoffFenced` | `provisional_capture_binds_only_matching_source_token` |
-| C4 PreparedBeforeActivation | `PreparedBeforeActivated` | `activation_without_completed_prepare_skips_without_blocking_owner_commit` |
+| C4 PreparedBeforeActivation | `PreparedBeforeActivated` | `activation_before_prepare_ack_keeps_handoff_and_accepts_late_ack`, `prepare_uses_generation_observed_before_handoff` |
 | C5 NoStaleApply | `ActiveHandoffFenced`, `StageIdentityBound` | `target_identity_checks_allow_new_server_epoch_and_reject_wrong_host_or_authority` |
 | C6 DestinationPreservation | `ApplySnapshot` generation guard | `destination_change_prevents_apply_and_preserves_value` plus native backend race tests |
 | C7 AtMostOnceApply | `AtMostOnceStaging`, `AppliedIdentityRecorded` | `explicit_empty_applies_once_and_unavailable_never_clears_target`, `lost_apply_result_is_superseded_without_retrying_native_apply` |
@@ -1293,16 +1299,16 @@ the P8 all-host runtime and normal-use acceptance gate. Depends on P8.
 
 P9 evidence:
 
-- `ClipboardHandoff.cfg`: no error after 32,357,094 generated states and
+- `ClipboardHandoff.cfg`: no error after 32,390,334 generated states and
   1,525,938 distinct states;
 - `ClipboardHandoff-capability-disabled.cfg`: no error after 467 generated
   states and 16 distinct states;
-- `ClipboardHandoff-liveness.cfg`: no error after 70,107,300 generated states,
+- `ClipboardHandoff-liveness.cfg`: no error after 70,184,420 generated states,
   7,433,184 distinct states, and both temporal-property branches over the
   complete state space;
 - `cargo fmt --all -- --check`, the locked no-GTK workspace check/test, and the
   exact Linux production-feature check/test passed. The no-GTK suite includes
-  67 passing clipboard tests and two intentionally ignored interactive live
+  68 passing clipboard tests and two intentionally ignored interactive live
   display-server probes;
 - no-GTK all-target and Linux production-feature clippy runs passed with only
   the recorded non-fatal warnings; native Windows, macOS, and Linux build/test
@@ -1415,5 +1421,6 @@ must not be collapsed before their individual gates pass.
 - P8 Native build and deployment: blocked; `8a32992` is installed and running
   on all hosts, Windows clipboard readiness is verified, and macOS input awaits
   one Accessibility reauthorization for the rebuilt binary
-- P9 Final refinement and acceptance: verification completed; closure blocked
-  on P8 runtime acceptance
+- P9 Final refinement and acceptance: corrective model and local Rust
+  verification completed; native builds, corrected-revision deployment, and
+  normal-use acceptance remain pending

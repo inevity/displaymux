@@ -309,7 +309,9 @@ Missing clipboard capability sets the handoff to `Skipped(capability_missing)` b
 
 ### 7.3 PrepareTarget
 
-The target actor records its native generation before target ownership activates:
+The target actor retains a process-session-scoped native generation observed
+before the handoff begins. `PrepareTarget` binds that pre-switch observation to
+the exact handoff and target token:
 
 ```text
 TargetPreparation {
@@ -323,13 +325,24 @@ TargetPreparation {
 Preparation is valid only if:
 
 - the target process session still matches
-- the target has not already activated `target_token`
+- the cached generation belongs to the current target process session
 - no newer handoff superseded this one
 - the native backend can provide a trustworthy generation
 
-Input does not wait for preparation. If target ownership commits first and no valid preparation exists, the handoff becomes `Skipped(target_not_prepared)`.
+`PrepareTarget` is enqueued before `OwnershipActivated` on the same ordered
+control channel and serialized actor queue. Input does not wait for the
+preparation acknowledgement. If input ownership commits before that
+acknowledgement returns, the handoff remains active; the late acknowledgement
+is accepted because it reports the pre-switch cached generation, not a new
+post-commit sample. A missing, failed, stale-session, or out-of-order
+preparation still becomes `Skipped(target_not_prepared)`.
 
-This ordering is required. Recording the baseline when payload data arrives would miss target-local changes made between input activation and payload arrival.
+The actor refreshes its cached generation after initialization, stable source
+capture, successful apply, and a detected destination change. A stale cached
+generation is conservative: the final compare detects any intervening target
+change and skips the write. Recording a fresh baseline when payload data
+arrives remains forbidden because it would miss target-local changes made
+while the payload was delayed.
 
 ### 7.4 CaptureSource
 
@@ -729,7 +742,10 @@ Result: drop the stage. The local target value wins.
 
 ### 13.3 Input Commits Before Target Preparation
 
-Result: input commits normally; target refuses late preparation and clipboard skips.
+Result: input commits normally. The already queued target preparation executes
+before target clipboard activation, and its acknowledgement may complete after
+the input commit. The handoff proceeds only with the pre-switch cached
+generation; it never records a new post-commit baseline.
 
 ### 13.4 Snapshot Arrives Before Input Commit
 
@@ -839,7 +855,8 @@ Later completion of a snapshot is authorized by this recorded source token, not 
 
 ```text
 ApplySnapshot
-  => target preparation was recorded before target activation
+  => the target actor processed preparation before clipboard activation
+  AND preparation uses a generation observed before the handoff
 ```
 
 ### C5. NoStaleApply
@@ -1249,9 +1266,14 @@ Rationale: one token is insufficient to prove both authorized origin and fresh d
 
 ### ADR-CB-005: Prepare target before activation
 
-Decision: record target generation before input activation or skip.
+Decision: retain a process-session-scoped generation before the handoff, queue
+target preparation before clipboard activation, and accept a late preparation
+acknowledgement only for that pre-switch observation.
 
-Rationale: a baseline recorded on payload arrival cannot detect a local copy made while the payload was delayed.
+Rationale: input must not wait for clipboard network latency, while a baseline
+recorded after input activation or on payload arrival cannot detect a local copy
+made while clipboard work was delayed. A stale pre-switch observation is safe
+because the final generation comparison converts it into a conservative skip.
 
 ### ADR-CB-006: Platform actors, not one generic clipboard object
 
@@ -1408,3 +1430,43 @@ The first checker passes found specification-definition problems before state ex
   `ConfigurationPreservesNativeClipboard` check those requirements.
 
 No behavioral counterexample or invariant violation remained after those corrections. Interrupted exploratory runs are not counted as verification evidence above.
+
+### 25.5 Late Preparation Acknowledgement Correction
+
+Normal-use acceptance on 2026-07-15 exposed that the authority treated a
+preparation acknowledgement as if the target baseline were sampled when the
+acknowledgement arrived. Input commit could therefore discard an otherwise
+healthy handoff whenever actor work plus the control-channel round trip took
+longer than the input transition. The same coordinator transition covered
+Linux-to-client and client-to-server handoffs, so this was not a macOS-only
+backend failure.
+
+The corrected model records the target baseline in `NewHandoff`, permits
+`PrepareTarget` to acknowledge that pre-switch observation after input commit,
+and keeps `ActivateTarget` guarded by completed actor preparation. It removes
+`SkipUnpreparedAfterCommit`; actual preparation failure, stale identity,
+backend loss, or channel loss still settles to `Skipped` without changing
+input ownership.
+
+TLC 2.19 results for the corrected model:
+
+```text
+ClipboardHandoff.cfg
+  32,390,334 states generated
+  1,525,938 distinct states found
+  complete graph depth 30
+
+ClipboardHandoff-capability-disabled.cfg
+  467 states generated
+  16 distinct states found
+  complete graph depth 7
+
+ClipboardHandoff-liveness.cfg
+  70,184,420 states generated
+  7,433,184 distinct states found
+  complete graph depth 25
+```
+
+All three profiles completed with no error. The first liveness attempt stopped
+on TLC metadata quota exhaustion and is not counted; after removing only TLC
+metadata, the clean rerun completed in 14 minutes 31 seconds.

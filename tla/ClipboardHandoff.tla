@@ -750,22 +750,22 @@ RestartAuthority ==
 
 PrepareTarget ==
     /\ ActiveHandoff
-    /\ PendingMatchesHandoff
+    /\ (PendingMatchesHandoff \/ TargetIsCurrent)
     /\ ~handoff.target_prepared
     /\ HandoffProcessesFresh
     /\ backend_ready[handoff.target]
     /\ (handoff.target = SERVER_HOST \/ channel_up)
-    /\ handoff' = [handoff EXCEPT
-         !.target_prepared = TRUE,
-         !.target_baseline = native_generation[handoff.target]
-       ]
+    \* NewHandoff records the process-session-scoped observed baseline. A late
+    \* completion acknowledges that pre-switch observation; it never samples a
+    \* new baseline after input ownership has committed.
+    /\ handoff' = [handoff EXCEPT !.target_prepared = TRUE]
     /\ UNCHANGED <<inputVars, process_session, clipboard_enabled, channel_up,
                     backend_ready, nativeVars, wire, stage, retired,
                     applied_valid, applied_session, applied_handoff_epoch>>
 
 PrepareFailure ==
     /\ ActiveHandoff
-    /\ PendingMatchesHandoff
+    /\ (PendingMatchesHandoff \/ TargetIsCurrent)
     /\ ~handoff.target_prepared
     /\ (\/ ~HandoffProcessesFresh
         \/ ~backend_ready[handoff.target]
@@ -926,17 +926,6 @@ ActivationFailure ==
                     backend_ready, nativeVars, retired, applied_valid,
                     applied_session, applied_handoff_epoch>>
 
-SkipUnpreparedAfterCommit ==
-    /\ ActiveHandoff
-    /\ TargetIsCurrent
-    /\ ~handoff.target_prepared
-    /\ handoff' = [handoff EXCEPT !.phase = "skipped"]
-    /\ wire' = EmptyWire
-    /\ stage' = EmptyStage
-    /\ UNCHANGED <<inputVars, process_session, clipboard_enabled, channel_up,
-                    backend_ready, nativeVars, retired, applied_valid,
-                    applied_session, applied_handoff_epoch>>
-
 ApplySnapshot ==
     \* Abstracts one successful serialized native replacement plus recording
     \* its applied identity. Native APIs may have an unavoidable clear/set
@@ -1065,7 +1054,6 @@ InternalClipboardProgress ==
     \/ RejectSnapshot
     \/ ActivateTarget
     \/ ActivationFailure
-    \/ SkipUnpreparedAfterCommit
     \/ ApplySnapshot
     \/ DropStage
     \/ StaleHandoffFailure
@@ -1077,7 +1065,6 @@ ClipboardFailure ==
     \/ TransferFailure
     \/ RejectSnapshot
     \/ ActivationFailure
-    \/ SkipUnpreparedAfterCommit
     \/ DropStage
     \/ StaleHandoffFailure
     \/ HandoffProcessFailure
