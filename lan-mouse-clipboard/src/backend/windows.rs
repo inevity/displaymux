@@ -19,7 +19,7 @@ use ::windows::{
             TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLIPBOARDUPDATE, WNDCLASSW,
         },
     },
-    core::w,
+    core::{Error as WindowsError, w},
 };
 use std::{
     ffi::c_void,
@@ -36,6 +36,38 @@ const OPEN_DEADLINE: Duration = Duration::from_millis(200);
 const OPEN_RETRY_DELAY: Duration = Duration::from_millis(5);
 
 static WINDOW_CLASS_REGISTERED: AtomicBool = AtomicBool::new(false);
+
+fn backend_operation_failed(
+    operation: &'static str,
+    reason: ClipboardReason,
+    error: &WindowsError,
+) -> ClipboardReason {
+    tracing::warn!(
+        event = "clipboard_backend_operation_failed",
+        backend = "windows",
+        operation,
+        reason = reason.code(),
+        error = %error,
+        "Windows clipboard backend operation failed"
+    );
+    reason
+}
+
+fn clipboard_sequence(operation: &'static str) -> Result<u32, ClipboardReason> {
+    let sequence = unsafe { GetClipboardSequenceNumber() };
+    if sequence == 0 {
+        tracing::warn!(
+            event = "clipboard_backend_operation_failed",
+            backend = "windows",
+            operation,
+            reason = ClipboardReason::BackendUnavailable.code(),
+            required_access = "WINSTA_ACCESSCLIPBOARD",
+            "Windows clipboard sequence number is unavailable"
+        );
+        return Err(ClipboardReason::BackendUnavailable);
+    }
+    Ok(sequence)
+}
 
 #[derive(Default)]
 struct GenerationTracker {
@@ -109,8 +141,13 @@ impl WindowsClipboardBackend {
         if let Ok(window) = self.hwnd() {
             return Ok(window);
         }
-        let instance =
-            unsafe { GetModuleHandleW(None) }.map_err(|_| ClipboardReason::BackendUnavailable)?;
+        let instance = unsafe { GetModuleHandleW(None) }.map_err(|error| {
+            backend_operation_failed(
+                "get_module_handle",
+                ClipboardReason::BackendUnavailable,
+                &error,
+            )
+        })?;
         if WINDOW_CLASS_REGISTERED
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
             .is_ok()
@@ -122,8 +159,13 @@ impl WindowsClipboardBackend {
                 ..Default::default()
             };
             if unsafe { RegisterClassW(&class) } == 0 {
+                let error = WindowsError::from_win32();
                 WINDOW_CLASS_REGISTERED.store(false, Ordering::SeqCst);
-                return Err(ClipboardReason::BackendUnavailable);
+                return Err(backend_operation_failed(
+                    "register_window_class",
+                    ClipboardReason::BackendUnavailable,
+                    &error,
+                ));
             }
         }
         let window = unsafe {
@@ -142,17 +184,33 @@ impl WindowsClipboardBackend {
                 None,
             )
         }
-        .map_err(|_| ClipboardReason::BackendUnavailable)?;
-        unsafe { AddClipboardFormatListener(window) }
-            .map_err(|_| ClipboardReason::PermissionDenied)?;
+        .map_err(|error| {
+            backend_operation_failed(
+                "create_message_window",
+                ClipboardReason::BackendUnavailable,
+                &error,
+            )
+        })?;
+        unsafe { AddClipboardFormatListener(window) }.map_err(|error| {
+            backend_operation_failed(
+                "add_format_listener",
+                ClipboardReason::PermissionDenied,
+                &error,
+            )
+        })?;
         let private_format =
             unsafe { RegisterClipboardFormatW(w!("ExcludeClipboardContentFromMonitorProcessing")) };
         let self_write_format =
             unsafe { RegisterClipboardFormatW(w!("LanMouseClipboardSelfWriteV1")) };
         if private_format == 0 || self_write_format == 0 {
+            let error = WindowsError::from_win32();
             let _ = unsafe { RemoveClipboardFormatListener(window) };
             let _ = unsafe { DestroyWindow(window) };
-            return Err(ClipboardReason::BackendUnavailable);
+            return Err(backend_operation_failed(
+                "register_clipboard_formats",
+                ClipboardReason::BackendUnavailable,
+                &error,
+            ));
         }
         self.window = Some(window.0 as isize);
         self.private_format = private_format;
@@ -165,7 +223,7 @@ impl WindowsClipboardBackend {
         let mut message = MSG::default();
         while unsafe { PeekMessageW(&mut message, Some(window), 0, 0, PM_REMOVE) }.as_bool() {
             if message.message == WM_CLIPBOARDUPDATE {
-                let raw = unsafe { GetClipboardSequenceNumber() };
+                let raw = clipboard_sequence("observe_notification")?;
                 self.generation.observe_notification(raw)?;
             }
             unsafe {
@@ -179,7 +237,7 @@ impl WindowsClipboardBackend {
     fn current_generation(&mut self) -> Result<NativeGeneration, ClipboardReason> {
         self.pump_notifications()?;
         self.generation
-            .observe(unsafe { GetClipboardSequenceNumber() })
+            .observe(clipboard_sequence("read_generation")?)
     }
 
     fn capture_text(&mut self, max_bytes: usize) -> Result<ClipboardData, ClipboardReason> {
@@ -247,10 +305,7 @@ impl WindowsClipboardBackend {
                 ),
             }
         }
-        let raw = unsafe { GetClipboardSequenceNumber() };
-        if raw == 0 {
-            return Err(ClipboardReason::BackendUnavailable);
-        }
+        let raw = clipboard_sequence("read_generation_after_apply")?;
         self.generation.mark_self_write(raw);
         Ok(raw)
     }
