@@ -20,8 +20,8 @@ pub use windows::WindowsClipboardBackend;
 
 /// Synchronous contract owned and called by one thread-affine clipboard actor.
 pub trait ClipboardBackend: Send + 'static {
-    fn initialize(&mut self) -> Result<(), ClipboardReason> {
-        Ok(())
+    fn initialize(&mut self) -> Result<NativeGeneration, ClipboardReason> {
+        self.generation()
     }
 
     fn generation(&mut self) -> Result<NativeGeneration, ClipboardReason>;

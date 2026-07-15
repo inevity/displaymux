@@ -106,13 +106,13 @@ impl MacOsClipboardBackend {
 }
 
 impl ClipboardBackend for MacOsClipboardBackend {
-    fn initialize(&mut self) -> Result<(), ClipboardReason> {
+    fn initialize(&mut self) -> Result<NativeGeneration, ClipboardReason> {
         autoreleasepool(|_| {
             let pasteboard = Self::pasteboard()?;
             if access_is_denied(&pasteboard) {
                 return Err(ClipboardReason::PermissionDenied);
             }
-            Self::generation_for(&pasteboard).map(|_| ())
+            Self::generation_for(&pasteboard)
         })
     }
 

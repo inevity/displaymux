@@ -165,22 +165,24 @@ pub fn spawn_actor<B: ClipboardBackend>(
     let thread = thread::Builder::new()
         .name(name.to_string())
         .spawn(move || {
-            let mut actor = Actor::new(
-                backend,
-                process_session_id,
-                local_host_id,
-                initial_token,
-                request_rx,
-                payload_tx,
-            );
-            match actor.backend.initialize() {
-                Ok(()) => {
+            let mut backend = backend;
+            match backend.initialize() {
+                Ok(observed_generation) => {
                     let _ = ready_tx.send(Ok(()));
+                    let actor = Actor::new(
+                        backend,
+                        process_session_id,
+                        local_host_id,
+                        initial_token,
+                        observed_generation,
+                        request_rx,
+                        payload_tx,
+                    );
                     actor.run();
                 }
                 Err(reason) => {
                     let _ = ready_tx.send(Err(reason));
-                    actor.backend.shutdown();
+                    backend.shutdown();
                 }
             }
         })
@@ -211,6 +213,7 @@ struct Actor<B> {
     process_session_id: ProcessSessionId,
     local_host_id: HostId,
     current_token: OwnershipToken,
+    observed_generation: NativeGeneration,
     next_snapshot_sequence: SnapshotSequence,
     preparation: Option<(HandoffId, OwnershipToken, NativeGeneration)>,
     source_snapshot: Option<StoredSnapshot>,
@@ -226,6 +229,7 @@ impl<B: ClipboardBackend> Actor<B> {
         process_session_id: ProcessSessionId,
         local_host_id: HostId,
         current_token: OwnershipToken,
+        observed_generation: NativeGeneration,
         request_rx: mpsc::Receiver<ActorRequest>,
         payload_tx: mpsc::Sender<ActorPayload>,
     ) -> Self {
@@ -234,6 +238,7 @@ impl<B: ClipboardBackend> Actor<B> {
             process_session_id,
             local_host_id,
             current_token,
+            observed_generation,
             next_snapshot_sequence: SnapshotSequence::new(0),
             preparation: None,
             source_snapshot: None,
@@ -266,7 +271,10 @@ impl<B: ClipboardBackend> Actor<B> {
                 self.synchronize_authority(current_token)
             }
             ActorCommand::ObserveGeneration => match self.backend.generation() {
-                Ok(generation) => ActorEvent::Generation(generation),
+                Ok(generation) => {
+                    self.observed_generation = generation;
+                    ActorEvent::Generation(generation)
+                }
                 Err(reason) => Self::native_failure(None, reason),
             },
             ActorCommand::PrepareTarget {
@@ -327,10 +335,7 @@ impl<B: ClipboardBackend> Actor<B> {
             return Self::skipped(Some(handoff_id), ClipboardReason::StaleAuthoritySession);
         }
         if target_token.owner_host_id == self.local_host_id && target_token != self.current_token {
-            let baseline_generation = match self.backend.generation() {
-                Ok(generation) => generation,
-                Err(reason) => return Self::native_failure(Some(handoff_id), reason),
-            };
+            let baseline_generation = self.observed_generation;
             self.preparation = Some((handoff_id, target_token.clone(), baseline_generation));
             ActorEvent::Prepared {
                 handoff_id,
@@ -420,6 +425,7 @@ impl<B: ClipboardBackend> Actor<B> {
                 return Err(ActorFailure::Handoff(ClipboardReason::Oversize));
             }
             let after = self.backend.generation().map_err(ActorFailure::Native)?;
+            self.observed_generation = after;
             if before == after {
                 return Ok(data);
             }
@@ -582,8 +588,15 @@ impl<B: ClipboardBackend> Actor<B> {
         // The native write and applied-identity record are synchronous in this
         // serialized actor, with no await or cancellation point between them.
         match self.backend.apply(stage.baseline_generation, &stage.data) {
-            Ok(_) => {}
-            Err(reason) => return Self::native_failure(Some(stage.handoff_id), reason),
+            Ok(generation) => self.observed_generation = generation,
+            Err(reason) => {
+                if reason == ClipboardReason::DestinationChanged {
+                    if let Ok(generation) = self.backend.generation() {
+                        self.observed_generation = generation;
+                    }
+                }
+                return Self::native_failure(Some(stage.handoff_id), reason);
+            }
         }
         self.applied = Some(identity);
         self.preparation = None;
@@ -747,18 +760,11 @@ mod tests {
     }
 
     impl ClipboardBackend for FakeBackend {
-        fn initialize(&mut self) -> Result<(), ClipboardReason> {
-            match self
-                .control
-                .state
-                .0
-                .lock()
-                .unwrap()
-                .initialize_failure
-                .take()
-            {
+        fn initialize(&mut self) -> Result<NativeGeneration, ClipboardReason> {
+            let mut state = self.control.state.0.lock().unwrap();
+            match state.initialize_failure.take() {
                 Some(reason) => Err(reason),
-                None => Ok(()),
+                None => Ok(state.generation),
             }
         }
 
@@ -943,6 +949,66 @@ mod tests {
             }
         );
         assert_eq!(control.state.0.lock().unwrap().data, original);
+        let ActorEvent::Prepared {
+            baseline_generation,
+            ..
+        } = recv(
+            actor
+                .handle
+                .try_request(ActorCommand::PrepareTarget {
+                    handoff_id: handoff(2),
+                    target_token: token("remote", 2),
+                })
+                .unwrap(),
+        )
+        else {
+            panic!("target did not refresh its conservative baseline")
+        };
+        assert_eq!(baseline_generation, NativeGeneration::new(1));
+        recv(actor.handle.try_request(ActorCommand::Shutdown).unwrap());
+        actor.join().unwrap();
+    }
+
+    #[test]
+    fn prepare_uses_generation_observed_before_handoff() {
+        let control = BackendControl::new(ClipboardData::Empty);
+        control.set_generation(3);
+        let actor = spawn_actor(
+            "clipboard-test",
+            control.backend(),
+            ProcessSessionId::new(5),
+            HostId::from("remote"),
+            token("server", 0),
+        )
+        .unwrap();
+        control.script_generations([Ok(NativeGeneration::new(9))]);
+
+        let ActorEvent::Prepared {
+            baseline_generation,
+            ..
+        } = recv(
+            actor
+                .handle
+                .try_request(ActorCommand::PrepareTarget {
+                    handoff_id: handoff(1),
+                    target_token: token("remote", 1),
+                })
+                .unwrap(),
+        )
+        else {
+            panic!("target did not prepare")
+        };
+        assert_eq!(baseline_generation, NativeGeneration::new(3));
+        assert_eq!(
+            recv(
+                actor
+                    .handle
+                    .try_request(ActorCommand::ObserveGeneration)
+                    .unwrap()
+            ),
+            ActorEvent::Generation(NativeGeneration::new(9))
+        );
+
         recv(actor.handle.try_request(ActorCommand::Shutdown).unwrap());
         actor.join().unwrap();
     }

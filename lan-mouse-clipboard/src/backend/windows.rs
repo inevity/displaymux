@@ -293,10 +293,10 @@ impl WindowsClipboardBackend {
 }
 
 impl ClipboardBackend for WindowsClipboardBackend {
-    fn initialize(&mut self) -> Result<(), ClipboardReason> {
+    fn initialize(&mut self) -> Result<NativeGeneration, ClipboardReason> {
         let window = self.ensure_window()?;
         drop(OpenClipboardGuard::open(window, "initialize")?);
-        self.current_generation().map(|_| ())
+        self.current_generation()
     }
 
     fn generation(&mut self) -> Result<NativeGeneration, ClipboardReason> {

@@ -95,8 +95,6 @@ pub enum CoordinatorError {
     StaleOwnerToken,
     #[error("clipboard process session is stale")]
     StaleProcessSession,
-    #[error("clipboard target was not prepared before activation")]
-    TargetNotPrepared,
     #[error("clipboard snapshot is invalid")]
     InvalidSnapshot,
 }
@@ -109,7 +107,6 @@ impl CoordinatorError {
             Self::StaleHandoff => ClipboardReason::StaleHandoff,
             Self::StaleOwnerToken => ClipboardReason::StaleOwnerToken,
             Self::StaleProcessSession => ClipboardReason::StalePeerSession,
-            Self::TargetNotPrepared => ClipboardReason::TargetNotPrepared,
             Self::InvalidSnapshot => ClipboardReason::ProtocolError,
         }
     }
@@ -326,9 +323,6 @@ impl Coordinator {
         if handoff.target_process_session_id != target_process_session_id {
             return Err(CoordinatorError::StaleProcessSession);
         }
-        if handoff.target_activated {
-            return Err(CoordinatorError::TargetNotPrepared);
-        }
         handoff.target_preparation = Some(TargetPreparation {
             process_session_id: target_process_session_id,
             baseline_generation,
@@ -389,15 +383,6 @@ impl Coordinator {
             if handoff.target_process_session_id != target_process_session_id {
                 return Err(CoordinatorError::StaleProcessSession);
             }
-        }
-        if self
-            .active
-            .as_ref()
-            .is_some_and(|handoff| handoff.target_preparation.is_none())
-        {
-            self.active = None;
-            self.last_terminal = Some((handoff_id, Err(ClipboardReason::TargetNotPrepared)));
-            return Err(CoordinatorError::TargetNotPrepared);
         }
         let handoff = self
             .active
@@ -647,28 +632,31 @@ mod tests {
     }
 
     #[test]
-    fn activation_without_completed_prepare_skips_without_blocking_owner_commit() {
+    fn activation_before_prepare_ack_keeps_handoff_and_accepts_late_ack() {
         let (mut coordinator, _, remote, _, remote_process) = fixture();
         let begin = coordinator.begin_handoff(remote).unwrap();
-        assert_eq!(
-            coordinator.ownership_activated(begin.handoff_id, &begin.target_token, remote_process,),
-            Err(CoordinatorError::TargetNotPrepared)
-        );
+        let commands = coordinator
+            .ownership_activated(begin.handoff_id, &begin.target_token, remote_process)
+            .unwrap();
+        assert!(matches!(
+            commands.as_slice(),
+            [CoordinatorCommand::ActivateTarget { .. }]
+        ));
         assert_eq!(coordinator.current_token(), &begin.target_token);
-        assert!(coordinator.active().is_none());
-        assert_eq!(
-            coordinator.last_terminal(),
-            Some(&(begin.handoff_id, Err(ClipboardReason::TargetNotPrepared)))
+        assert!(coordinator.active().is_some());
+        assert!(coordinator.last_terminal().is_none());
+        assert!(
+            coordinator
+                .target_prepared(
+                    begin.handoff_id,
+                    &begin.target_token,
+                    remote_process,
+                    NativeGeneration::new(1),
+                )
+                .unwrap()
+                .is_empty()
         );
-        assert_eq!(
-            coordinator.target_prepared(
-                begin.handoff_id,
-                &begin.target_token,
-                remote_process,
-                NativeGeneration::new(1),
-            ),
-            Err(CoordinatorError::StaleHandoff)
-        );
+        assert!(coordinator.active().unwrap().target_preparation.is_some());
     }
 
     #[test]
@@ -950,10 +938,6 @@ mod tests {
         assert_eq!(
             CoordinatorError::StaleProcessSession.reason(),
             ClipboardReason::StalePeerSession
-        );
-        assert_eq!(
-            CoordinatorError::TargetNotPrepared.reason(),
-            ClipboardReason::TargetNotPrepared
         );
         assert_eq!(
             CoordinatorError::InvalidSnapshot.reason(),

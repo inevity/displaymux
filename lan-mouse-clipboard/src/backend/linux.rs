@@ -28,8 +28,8 @@ impl LinuxClipboardBackend {
 }
 
 impl ClipboardBackend for LinuxClipboardBackend {
-    fn initialize(&mut self) -> Result<(), ClipboardReason> {
-        self.generation().map(|_| ())
+    fn initialize(&mut self) -> Result<NativeGeneration, ClipboardReason> {
+        self.generation()
     }
 
     fn generation(&mut self) -> Result<NativeGeneration, ClipboardReason> {

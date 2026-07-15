@@ -118,7 +118,14 @@ impl ClipboardHandle {
                 );
                 false
             }
-            Err(mpsc::error::TrySendError::Closed(_)) => false,
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                tracing::warn!(
+                    event = "clipboard_backend_unavailable",
+                    reason = ClipboardReason::ChannelUnavailable.code(),
+                    "clipboard runtime hook channel is closed"
+                );
+                false
+            }
         }
     }
 }
@@ -997,14 +1004,6 @@ impl RuntimeCore {
                 self.dispatch(commands);
                 self.publish_authority_state_all();
             }
-            Err(CoordinatorError::TargetNotPrepared) => {
-                self.pending = None;
-                tracing::debug!(
-                    event = "clipboard_snapshot_skipped",
-                    reason = ClipboardReason::TargetNotPrepared.code(),
-                    "clipboard target was not prepared before input activation"
-                );
-            }
             Err(error) => self.log_reducer_error(error),
         }
     }
@@ -1136,11 +1135,13 @@ impl RuntimeCore {
                     let Some(envelope) = self.active_envelope(handoff_id) else {
                         continue;
                     };
-                    self.try_send_control(
+                    if let Err(reason) = self.try_send_control(
                         &target_token.owner_host_id,
                         target_process_session_id,
                         WireMessage::PrepareTarget(envelope),
-                    );
+                    ) {
+                        self.skip(handoff_id, reason);
+                    }
                 }
                 CoordinatorCommand::CaptureSource {
                     handoff_id,
@@ -1214,11 +1215,13 @@ impl RuntimeCore {
                     let Some(envelope) = self.active_envelope(handoff_id) else {
                         continue;
                     };
-                    self.try_send_control(
+                    if let Err(reason) = self.try_send_control(
                         &target_token.owner_host_id,
                         target_process_session_id,
                         WireMessage::OwnershipActivated(envelope),
-                    );
+                    ) {
+                        self.skip(handoff_id, reason);
+                    }
                 }
                 CoordinatorCommand::CancelHandoff { handoff_id } => {
                     self.pending_payload = None;
@@ -1497,7 +1500,15 @@ impl RuntimeCore {
             return;
         };
         if let Some((_, outbound)) = self.network_peers.get(server_host) {
-            let _ = outbound.try_send_control(message);
+            if let Err(error) = outbound.try_send_control(message) {
+                tracing::debug!(
+                    event = "clipboard_transfer_rejected",
+                    host = %server_host,
+                    reason = error.reason().code(),
+                    "clipboard response could not be queued"
+                );
+                outbound.shutdown();
+            }
         }
     }
 
@@ -1506,7 +1517,15 @@ impl RuntimeCore {
             return;
         };
         if let Some((_, outbound)) = self.network_peers.get(server_host) {
-            let _ = outbound.try_send_payload(message);
+            if let Err(error) = outbound.try_send_payload(message) {
+                tracing::debug!(
+                    event = "clipboard_transfer_rejected",
+                    host = %server_host,
+                    reason = error.reason().code(),
+                    "clipboard snapshot offer could not be queued"
+                );
+                outbound.shutdown();
+            }
         }
     }
 
@@ -1515,21 +1534,25 @@ impl RuntimeCore {
         host: &HostId,
         process_session_id: ProcessSessionId,
         message: WireMessage,
-    ) {
+    ) -> Result<(), ClipboardReason> {
         let Some((peer, outbound)) = self.network_peers.get(host) else {
-            return;
+            return Err(ClipboardReason::ChannelUnavailable);
         };
         if peer.process_session_id != process_session_id {
-            return;
+            return Err(ClipboardReason::StalePeerSession);
         }
         if let Err(error) = outbound.try_send_control(message) {
+            let reason = error.reason();
             tracing::debug!(
                 event = "clipboard_transfer_rejected",
                 host = %host,
-                reason = error.reason().code(),
+                reason = reason.code(),
                 "clipboard control message could not be queued"
             );
+            outbound.shutdown();
+            return Err(reason);
         }
+        Ok(())
     }
 
     fn log_reducer_error(&self, error: CoordinatorError) {
@@ -1652,6 +1675,11 @@ mod tests {
     fn server_to_remote_orders_begin_before_activation() {
         let mut core = authority();
         let remote_process = ProcessSessionId::new(30);
+        let (outbound, _receiver) = transport_queues();
+        core.network_peers.insert(
+            HostId::from("windows"),
+            (negotiated_peer("windows", remote_process), outbound),
+        );
         core.peer_session_changed(HostId::from("windows"), remote_process);
         let transition = ClipboardTransitionId::Outgoing { lease_epoch: 7 };
 
@@ -1806,7 +1834,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn framed_handoff_delivers_snapshot_captured_after_remote_activation() {
+    async fn framed_handoff_accepts_prepare_ack_after_remote_activation() {
         let mut core = authority();
         let remote_process = ProcessSessionId::new(30);
         let remote_host = HostId::from("windows");
@@ -1822,13 +1850,6 @@ mod tests {
             target: remote_host,
         });
         let handoff = core.coordinator().unwrap().active().unwrap().clone();
-        core.target_prepared(
-            handoff.id,
-            &handoff.target_token,
-            remote_process,
-            NativeGeneration::new(8),
-        )
-        .unwrap();
         core.handle(ServiceHook::Activate { transition });
 
         let cancellation = CancellationToken::new();
@@ -1858,6 +1879,14 @@ mod tests {
         };
         assert!(matches!(first.0, WireMessage::PrepareTarget(_)));
         assert!(matches!(first.1, WireMessage::OwnershipActivated(_)));
+
+        core.target_prepared(
+            handoff.id,
+            &handoff.target_token,
+            remote_process,
+            NativeGeneration::new(8),
+        )
+        .unwrap();
 
         let snapshot_id = SnapshotId {
             source_process_session_id: ProcessSessionId::new(10),
@@ -1903,35 +1932,57 @@ mod tests {
     }
 
     #[test]
-    fn activation_before_prepare_skips_without_retaining_input_transition() {
+    fn activation_before_prepare_ack_retains_clipboard_handoff() {
         let mut core = authority();
-        core.peer_session_changed(HostId::from("mac"), ProcessSessionId::new(40));
+        let remote_process = ProcessSessionId::new(40);
+        let (outbound, _receiver) = transport_queues();
+        core.network_peers.insert(
+            HostId::from("mac"),
+            (negotiated_peer("mac", remote_process), outbound),
+        );
+        core.peer_session_changed(HostId::from("mac"), remote_process);
         let transition = ClipboardTransitionId::Outgoing { lease_epoch: 8 };
         core.handle(ServiceHook::Begin {
             transition,
             target: HostId::from("mac"),
         });
-        let handoff_id = core.pending.as_ref().unwrap().handoff_id;
         let target_token = core.pending.as_ref().unwrap().target_token.clone();
 
         core.handle(ServiceHook::Activate { transition });
 
-        assert!(core.pending.is_none());
+        assert!(core.pending.as_ref().unwrap().activated);
         let RuntimeRole::Authority(coordinator) = &core.role else {
             unreachable!();
         };
         assert_eq!(coordinator.current_token(), &target_token);
-        assert_eq!(
-            coordinator.last_terminal(),
-            Some(&(handoff_id, Err(ClipboardReason::TargetNotPrepared)))
-        );
+        assert!(coordinator.active().is_some());
+        assert!(coordinator.last_terminal().is_none());
+        assert!(matches!(
+            core.effects.last(),
+            Some(CoordinatorCommand::ActivateTarget { .. })
+        ));
     }
 
     #[test]
     fn stale_cancel_does_not_cancel_newer_handoff() {
         let mut core = authority();
-        core.peer_session_changed(HostId::from("windows"), ProcessSessionId::new(30));
-        core.peer_session_changed(HostId::from("mac"), ProcessSessionId::new(40));
+        let windows_process = ProcessSessionId::new(30);
+        let mac_process = ProcessSessionId::new(40);
+        let (windows_outbound, _windows_receiver) = transport_queues();
+        let (mac_outbound, _mac_receiver) = transport_queues();
+        core.network_peers.insert(
+            HostId::from("windows"),
+            (
+                negotiated_peer("windows", windows_process),
+                windows_outbound,
+            ),
+        );
+        core.network_peers.insert(
+            HostId::from("mac"),
+            (negotiated_peer("mac", mac_process), mac_outbound),
+        );
+        core.peer_session_changed(HostId::from("windows"), windows_process);
+        core.peer_session_changed(HostId::from("mac"), mac_process);
         let old = ClipboardTransitionId::Outgoing { lease_epoch: 1 };
         let new = ClipboardTransitionId::Outgoing { lease_epoch: 2 };
         core.handle(ServiceHook::Begin {
@@ -2049,6 +2100,11 @@ mod tests {
     async fn remote_fallback_publishes_provisional_handoff_before_activation() {
         let mut core = authority();
         let remote_session = ProcessSessionId::new(30);
+        let (outbound, _outgoing_receiver) = transport_queues();
+        core.network_peers.insert(
+            HostId::from("windows"),
+            (negotiated_peer("windows", remote_session), outbound),
+        );
         core.peer_session_changed(HostId::from("windows"), remote_session);
 
         let outgoing = ClipboardTransitionId::Outgoing { lease_epoch: 1 };
