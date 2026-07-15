@@ -582,7 +582,11 @@ EdgeIntentRetreated(host) ==
     /\ protocol.edge_intent_target = host
     /\ ~protocol.edge_intent_rearmed
     /\ protocol.edge_intent_timer > 0
-    /\ protocol' = [protocol EXCEPT !.edge_intent_rearmed = TRUE]
+    \* Retreat completes phase one. Start a fresh bounded window for the
+    \* deliberate second crossing instead of charging retreat time against it.
+    /\ protocol' = [protocol EXCEPT
+                       !.edge_intent_rearmed = TRUE,
+                       !.edge_intent_timer = EDGE_INTENT_TIMEOUT]
     /\ UNCHANGED <<tv_mode, tv_input, cursor, capture, input_owner, ws_state,
                    subscribe_active, daemon_healthy, pending_switch,
                    reconnect_count, switch_timer, wake_timer, input_signal,
@@ -1721,10 +1725,11 @@ must provide a request-correlated commit gate:
    `ResumeIfFocused` is forbidden before this confirmation, so a retained
    layer-shell focus cannot manufacture user intent. The deployment's
    `edge_double_tap_ms` is a stale-intent deadline, not a controller timeout.
-   The initial 500 ms value is deployment policy: it bounds how long the first
-   intent may remain reusable while allowing a deliberate retreat and second
-   push. Expiry always stays local, and the value can be tuned from normal-use
-   timing without weakening the two-contact invariant.
+   Each phase has its own deadline: a proven retreat starts a fresh confirmation
+   window, so pointer travel away from the edge cannot consume the time needed
+   for the second push. The deployment uses 3000 ms, based on observed normal
+   retreat/re-entry timings; expiry always stays local and does not weaken the
+   two-contact invariant.
 6. lan-mouse then creates one `/enter/{target}` request and stores its request ID,
    epoch, and deadline. `409 busy` never means allow.
 7. If the request is waking, lan-mouse keeps both input paths local and polls
