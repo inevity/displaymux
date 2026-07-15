@@ -82,6 +82,16 @@ fn edge_retreat_observed(
     }
 }
 
+fn lan_mouse_event_drives_return_barrier(
+    event_type: CGEventType,
+    source_user_data: i64,
+    capture_active: bool,
+) -> bool {
+    source_user_data == LAN_MOUSE_EVENT_SOURCE_USER_DATA
+        && !capture_active
+        && matches!(event_type, CGEventType::MouseMoved)
+}
+
 #[derive(Debug)]
 struct InputCaptureState {
     /// active capture positions
@@ -581,9 +591,14 @@ fn create_event_tap<'a>(
             return CallbackResult::Keep;
         }
 
-        if cg_ev.get_integer_value_field(EventField::EVENT_SOURCE_USER_DATA)
-            == LAN_MOUSE_EVENT_SOURCE_USER_DATA
-        {
+        let source_user_data = cg_ev.get_integer_value_field(EventField::EVENT_SOURCE_USER_DATA);
+        let lan_mouse_event = source_user_data == LAN_MOUSE_EVENT_SOURCE_USER_DATA;
+        let drives_return_barrier = lan_mouse_event_drives_return_barrier(
+            event_type,
+            source_user_data,
+            state.current_pos.is_some(),
+        );
+        if lan_mouse_event && !drives_return_barrier {
             return CallbackResult::Keep;
         }
 
@@ -629,7 +644,11 @@ fn create_event_tap<'a>(
             }
         }
 
-        if let Some(pos) = capture_position {
+        if lan_mouse_event {
+            // Remote pointer motion must remain visible to macOS while also
+            // allowing the spoke's local edge to request a return to its server.
+            CallbackResult::Keep
+        } else if let Some(pos) = capture_position {
             res_events.iter().for_each(|e| {
                 // error must be ignored, since the event channel
                 // may already be closed when the InputCapture instance is dropped.
@@ -1007,6 +1026,30 @@ mod tests {
             CGPoint::new(97.0, 50.0),
             1.0,
             0.0,
+        ));
+    }
+
+    #[test]
+    fn only_idle_lan_mouse_motion_drives_return_barrier() {
+        assert!(lan_mouse_event_drives_return_barrier(
+            CGEventType::MouseMoved,
+            LAN_MOUSE_EVENT_SOURCE_USER_DATA,
+            false,
+        ));
+        assert!(!lan_mouse_event_drives_return_barrier(
+            CGEventType::MouseMoved,
+            LAN_MOUSE_EVENT_SOURCE_USER_DATA,
+            true,
+        ));
+        assert!(!lan_mouse_event_drives_return_barrier(
+            CGEventType::LeftMouseDown,
+            LAN_MOUSE_EVENT_SOURCE_USER_DATA,
+            false,
+        ));
+        assert!(!lan_mouse_event_drives_return_barrier(
+            CGEventType::MouseMoved,
+            0,
+            false,
         ));
     }
 }
