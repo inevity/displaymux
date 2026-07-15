@@ -1,12 +1,12 @@
 use crate::{
-    AuthenticatedPeer, AuthoritySessionId, ClipboardHello, ClipboardPayload, FrameError,
-    FrameMetadata, HandoffEnvelope, HandoffId, HostId, ProcessSessionId, WireMessage,
+    AuthenticatedPeer, AuthoritySessionId, ClipboardHello, ClipboardPayload, ClipboardReason,
+    FrameError, FrameMetadata, HandoffEnvelope, HandoffId, HostId, ProcessSessionId, WireMessage,
     authenticate_hello, encode_message, read_frame_validated, write_frame,
 };
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex},
-    time::Duration,
+    time::{Duration, Instant},
 };
 use thiserror::Error;
 use tokio::{
@@ -249,6 +249,24 @@ pub enum TransportError {
     MissingIdentity,
 }
 
+impl TransportError {
+    pub const fn reason(&self) -> ClipboardReason {
+        match self {
+            Self::Frame(error) => error.reason(),
+            Self::Tls(_) => ClipboardReason::ProtocolError,
+            Self::IdentityExhausted => ClipboardReason::IdentityExhausted,
+            Self::QueueFull => ClipboardReason::QueueFull,
+            Self::ChannelClosed => ClipboardReason::ChannelUnavailable,
+            Self::StalePeerSession => ClipboardReason::StalePeerSession,
+            Self::StaleAuthoritySession => ClipboardReason::StaleAuthoritySession,
+            Self::PayloadOnControlQueue
+            | Self::ControlInPayloadSlot
+            | Self::AuthenticatedHostMismatch
+            | Self::MissingIdentity => ClipboardReason::ProtocolError,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct TransportHandle {
     control_tx: mpsc::Sender<WireMessage>,
@@ -441,27 +459,73 @@ pub async fn run_writer<W: AsyncWrite + Unpin>(
     transfer_budget: Duration,
 ) -> Result<(), TransportError> {
     while let Some(outbound) = receiver.next().await {
+        let payload_trace = match &outbound.message {
+            WireMessage::SnapshotOffer(payload) | WireMessage::SnapshotDeliver(payload) => Some((
+                payload.handoff.handoff_id.handoff_epoch.get(),
+                payload.snapshot_id.sequence.get(),
+                payload.data.len(),
+            )),
+            _ => None,
+        };
         let frame = match encode_message(&outbound.message, max_payload_bytes) {
             Ok(frame) => frame,
             Err(error) => {
+                if let Some((handoff_epoch, snapshot_sequence, bytes)) = payload_trace {
+                    tracing::debug!(
+                        event = "clipboard_transfer_rejected",
+                        handoff_epoch,
+                        snapshot_sequence,
+                        bytes,
+                        reason = error.reason().code(),
+                        "clipboard payload encoding was rejected"
+                    );
+                }
                 if let Some(handoff_id) = outbound.handoff_id {
                     receiver.complete_payload(handoff_id);
                 }
                 return Err(error.into());
             }
         };
+        let started = Instant::now();
+        if let Some((handoff_epoch, snapshot_sequence, bytes)) = payload_trace {
+            tracing::debug!(
+                event = "clipboard_transfer_started",
+                handoff_epoch,
+                snapshot_sequence,
+                bytes,
+                "clipboard payload transfer started"
+            );
+        }
         let write_result =
             write_frame(writer, &frame, transfer_budget, &outbound.cancellation).await;
         if let Some(handoff_id) = outbound.handoff_id {
             receiver.complete_payload(handoff_id);
         }
-        write_result?;
-        tracing::debug!(
-            event = "clipboard_transfer_completed",
-            message_type = ?outbound.message.message_type(),
-            bytes = frame.encoded_len(),
-            "clipboard transport wrote frame"
-        );
+        let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        if let Err(error) = write_result {
+            if let Some((handoff_epoch, snapshot_sequence, bytes)) = payload_trace {
+                tracing::debug!(
+                    event = "clipboard_transfer_rejected",
+                    handoff_epoch,
+                    snapshot_sequence,
+                    bytes,
+                    duration_ms,
+                    reason = error.reason().code(),
+                    "clipboard payload transfer failed"
+                );
+            }
+            return Err(error.into());
+        }
+        if let Some((handoff_epoch, snapshot_sequence, bytes)) = payload_trace {
+            tracing::debug!(
+                event = "clipboard_transfer_completed",
+                handoff_epoch,
+                snapshot_sequence,
+                bytes,
+                duration_ms,
+                "clipboard payload transfer completed"
+            );
+        }
     }
     Ok(())
 }
@@ -881,5 +945,29 @@ mod tests {
         });
         assert!(!result.is_payload());
         assert_eq!(ClipboardKind::Empty as u8, 1);
+    }
+
+    #[test]
+    fn transport_failures_map_to_stable_public_reasons() {
+        assert_eq!(
+            TransportError::Frame(FrameError::TransferTimeout).reason(),
+            ClipboardReason::TransferTimeout
+        );
+        assert_eq!(
+            TransportError::QueueFull.reason(),
+            ClipboardReason::QueueFull
+        );
+        assert_eq!(
+            TransportError::ChannelClosed.reason(),
+            ClipboardReason::ChannelUnavailable
+        );
+        assert_eq!(
+            TransportError::StalePeerSession.reason(),
+            ClipboardReason::StalePeerSession
+        );
+        assert_eq!(
+            TransportError::AuthenticatedHostMismatch.reason(),
+            ClipboardReason::ProtocolError
+        );
     }
 }

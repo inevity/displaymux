@@ -101,6 +101,20 @@ pub enum CoordinatorError {
     InvalidSnapshot,
 }
 
+impl CoordinatorError {
+    pub const fn reason(&self) -> ClipboardReason {
+        match self {
+            Self::IdentityExhausted => ClipboardReason::IdentityExhausted,
+            Self::SameHost => ClipboardReason::Canceled,
+            Self::StaleHandoff => ClipboardReason::StaleHandoff,
+            Self::StaleOwnerToken => ClipboardReason::StaleOwnerToken,
+            Self::StaleProcessSession => ClipboardReason::StalePeerSession,
+            Self::TargetNotPrepared => ClipboardReason::TargetNotPrepared,
+            Self::InvalidSnapshot => ClipboardReason::ProtocolError,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct Coordinator {
     enabled: bool,
@@ -788,6 +802,61 @@ mod tests {
     }
 
     #[test]
+    fn lost_apply_result_is_superseded_without_retrying_native_apply() {
+        let (mut coordinator, server, remote, server_process, remote_process) = fixture();
+        let first = coordinator.begin_handoff(remote).unwrap();
+        coordinator
+            .target_prepared(
+                first.handoff_id,
+                &first.target_token,
+                remote_process,
+                NativeGeneration::new(4),
+            )
+            .unwrap();
+        coordinator
+            .source_captured(
+                first.handoff_id,
+                &first.source_token,
+                server_process,
+                snapshot(server_process, 1),
+            )
+            .unwrap();
+        coordinator
+            .ownership_activated(first.handoff_id, &first.target_token, remote_process)
+            .unwrap();
+        coordinator.snapshot_staged(first.handoff_id).unwrap();
+
+        // Model a successful native write whose ApplyResult message is lost.
+        let second = coordinator.begin_handoff(server).unwrap();
+
+        assert_eq!(
+            second.commands.first(),
+            Some(&CoordinatorCommand::CancelHandoff {
+                handoff_id: first.handoff_id,
+            })
+        );
+        assert_eq!(
+            second
+                .commands
+                .iter()
+                .filter(|command| matches!(command, CoordinatorCommand::CancelHandoff { .. }))
+                .count(),
+            1
+        );
+        assert!(matches!(
+            second.commands.as_slice(),
+            [
+                CoordinatorCommand::CancelHandoff { .. },
+                CoordinatorCommand::PrepareTarget { .. },
+                CoordinatorCommand::CaptureSource { .. }
+            ]
+        ));
+        assert_eq!(coordinator.current_token(), &first.target_token);
+        assert_eq!(coordinator.active().unwrap().id, second.handoff_id);
+        assert!(second.handoff_id.handoff_epoch > first.handoff_id.handoff_epoch);
+    }
+
+    #[test]
     fn process_restart_cancels_matching_handoff() {
         let (mut coordinator, _, remote, _, remote_process) = fixture();
         let begin = coordinator.begin_handoff(remote.clone()).unwrap();
@@ -870,5 +939,25 @@ mod tests {
         let fallback = coordinator.begin_handoff(server).unwrap();
         assert!(fallback.handoff_id.handoff_epoch > begin.handoff_id.handoff_epoch);
         assert!(fallback.target_token.ownership_epoch > begin.target_token.ownership_epoch);
+    }
+
+    #[test]
+    fn coordinator_failures_map_to_stable_public_reasons() {
+        assert_eq!(
+            CoordinatorError::IdentityExhausted.reason(),
+            ClipboardReason::IdentityExhausted
+        );
+        assert_eq!(
+            CoordinatorError::StaleProcessSession.reason(),
+            ClipboardReason::StalePeerSession
+        );
+        assert_eq!(
+            CoordinatorError::TargetNotPrepared.reason(),
+            ClipboardReason::TargetNotPrepared
+        );
+        assert_eq!(
+            CoordinatorError::InvalidSnapshot.reason(),
+            ClipboardReason::ProtocolError
+        );
     }
 }

@@ -390,13 +390,23 @@ fn start_connection(
                 _ = task_cancellation.cancelled() => break,
                 result = &mut reader_task => {
                     if let Ok(Err(error)) = result {
-                        tracing::debug!(event = "clipboard_transfer_rejected", host = %host_id, error = %error);
+                        tracing::debug!(
+                            event = "clipboard_transfer_rejected",
+                            host = %host_id,
+                            reason = error.reason().code(),
+                            "clipboard reader stopped"
+                        );
                     }
                     break;
                 }
                 result = &mut writer_task => {
                     if let Ok(Err(error)) = result {
-                        tracing::debug!(event = "clipboard_transfer_rejected", host = %host_id, error = %error);
+                        tracing::debug!(
+                            event = "clipboard_transfer_rejected",
+                            host = %host_id,
+                            reason = error.reason().code(),
+                            "clipboard writer stopped"
+                        );
                     }
                     break;
                 }
@@ -561,8 +571,12 @@ async fn run_connector(
 ) {
     let config = match client_config(&identity, peer.fingerprint) {
         Ok(config) => config,
-        Err(error) => {
-            tracing::warn!(event = "clipboard_backend_unavailable", host = %peer.host_id, error = %error);
+        Err(_) => {
+            tracing::warn!(
+                event = "clipboard_backend_unavailable",
+                host = %peer.host_id,
+                reason = ClipboardReason::ProtocolError.code()
+            );
             return;
         }
     };
@@ -602,7 +616,7 @@ async fn run_connector(
             Err(error) => tracing::debug!(
                 event = "clipboard_backend_unavailable",
                 host = %peer.host_id,
-                error = %error,
+                reason = error.reason().code(),
                 "clipboard peer connection failed"
             ),
         }
@@ -679,15 +693,21 @@ async fn run_listener(
 ) {
     let config = match server_config(&identity, authorized_peers.clone()) {
         Ok(config) => config,
-        Err(error) => {
-            tracing::warn!(event = "clipboard_backend_unavailable", error = %error);
+        Err(_) => {
+            tracing::warn!(
+                event = "clipboard_backend_unavailable",
+                reason = ClipboardReason::ProtocolError.code()
+            );
             return;
         }
     };
     let listener = match TcpListener::bind(("0.0.0.0", port)).await {
         Ok(listener) => listener,
-        Err(error) => {
-            tracing::warn!(event = "clipboard_backend_unavailable", error = %error, port);
+        Err(_) => {
+            tracing::warn!(
+                event = "clipboard_backend_unavailable",
+                reason = ClipboardReason::ChannelUnavailable.code()
+            );
             return;
         }
     };
@@ -786,6 +806,19 @@ enum EstablishError {
     InvalidLimit,
 }
 
+impl EstablishError {
+    fn reason(&self) -> ClipboardReason {
+        match self {
+            Self::Io(_) => ClipboardReason::ChannelUnavailable,
+            Self::Frame(error) => error.reason(),
+            Self::Tls(_) | Self::MissingHello => ClipboardReason::ProtocolError,
+            Self::Timeout => ClipboardReason::TransferTimeout,
+            Self::Canceled => ClipboardReason::Canceled,
+            Self::InvalidLimit => ClipboardReason::Oversize,
+        }
+    }
+}
+
 pub(crate) fn text_v1_capability(backend_ready: bool) -> u64 {
     if backend_ready { CLIPBOARD_TEXT_V1 } else { 0 }
 }
@@ -847,5 +880,22 @@ mod tests {
     fn capability_is_absent_until_native_backend_is_ready() {
         assert_eq!(text_v1_capability(false), 0);
         assert_eq!(text_v1_capability(true), CLIPBOARD_TEXT_V1);
+    }
+
+    #[test]
+    fn establishment_failures_map_to_stable_public_reasons() {
+        assert_eq!(
+            EstablishError::Timeout.reason(),
+            ClipboardReason::TransferTimeout
+        );
+        assert_eq!(EstablishError::Canceled.reason(), ClipboardReason::Canceled);
+        assert_eq!(
+            EstablishError::MissingHello.reason(),
+            ClipboardReason::ProtocolError
+        );
+        assert_eq!(
+            EstablishError::InvalidLimit.reason(),
+            ClipboardReason::Oversize
+        );
     }
 }

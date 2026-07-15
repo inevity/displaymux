@@ -228,6 +228,28 @@ pub enum FrameError {
     UnavailableData,
 }
 
+impl FrameError {
+    pub const fn reason(&self) -> ClipboardReason {
+        match self {
+            Self::Io(_) => ClipboardReason::ChannelUnavailable,
+            Self::Canceled => ClipboardReason::Canceled,
+            Self::TransferTimeout => ClipboardReason::TransferTimeout,
+            Self::PayloadTooLarge | Self::PlatformLengthOverflow => ClipboardReason::Oversize,
+            Self::IntegrityFailed => ClipboardReason::IntegrityFailed,
+            Self::InvalidUtf8 => ClipboardReason::InvalidUtf8,
+            Self::UnavailableData => ClipboardReason::BackendUnavailable,
+            Self::InvalidMagic
+            | Self::UnsupportedVersion(_)
+            | Self::UnknownMessageType(_)
+            | Self::UnknownFlags(_)
+            | Self::InvalidHeaderLength
+            | Self::UnexpectedPayload
+            | Self::InvalidHostId
+            | Self::InvalidField => ClipboardReason::ProtocolError,
+        }
+    }
+}
+
 pub fn encode_message(
     message: &WireMessage,
     max_payload_bytes: usize,
@@ -1307,5 +1329,34 @@ mod tests {
         assert!(debug.contains("bytes: 10"));
         assert!(!debug.contains("alpha"));
         assert!(!debug.contains("beta"));
+    }
+
+    #[test]
+    fn frame_failures_map_to_stable_public_reasons() {
+        assert_eq!(FrameError::Canceled.reason(), ClipboardReason::Canceled);
+        assert_eq!(
+            FrameError::TransferTimeout.reason(),
+            ClipboardReason::TransferTimeout
+        );
+        assert_eq!(
+            FrameError::PayloadTooLarge.reason(),
+            ClipboardReason::Oversize
+        );
+        assert_eq!(
+            FrameError::IntegrityFailed.reason(),
+            ClipboardReason::IntegrityFailed
+        );
+        assert_eq!(
+            FrameError::InvalidUtf8.reason(),
+            ClipboardReason::InvalidUtf8
+        );
+        assert_eq!(
+            FrameError::InvalidMagic.reason(),
+            ClipboardReason::ProtocolError
+        );
+        assert_eq!(
+            FrameError::Io(io::Error::new(io::ErrorKind::BrokenPipe, "closed")).reason(),
+            ClipboardReason::ChannelUnavailable
+        );
     }
 }

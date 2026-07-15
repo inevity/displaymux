@@ -112,7 +112,7 @@ impl ClipboardHandle {
             Ok(()) => true,
             Err(mpsc::error::TrySendError::Full(_)) => {
                 tracing::debug!(
-                    event = "clipboard_handoff_skipped",
+                    event = "clipboard_snapshot_skipped",
                     reason = ClipboardReason::QueueFull.code(),
                     "clipboard service hook queue is full"
                 );
@@ -258,7 +258,7 @@ async fn run(
                         if let Some(previous_reason) = actor_unavailable_reason.take() {
                             tracing::info!(
                                 event = "clipboard_backend_ready",
-                                previous_reason = previous_reason.code(),
+                                reason = previous_reason.code(),
                                 "native clipboard actor recovered"
                             );
                         }
@@ -357,7 +357,6 @@ fn initialize_native_actor(
         .name("lan-mouse-clipboard-init".to_string())
         .spawn(move || {
             let actor = LinuxClipboardBackend::connect().and_then(|backend| {
-                let backend_name = backend.name();
                 let spawned = spawn_actor(
                     "lan-mouse-clipboard",
                     backend,
@@ -365,7 +364,7 @@ fn initialize_native_actor(
                     local_host,
                     initial_token,
                 )?;
-                tracing::info!(event = "clipboard_backend_ready", backend = backend_name);
+                tracing::info!(event = "clipboard_backend_ready");
                 Ok(spawned)
             });
             let _ = completion.send(actor);
@@ -391,10 +390,7 @@ fn initialize_native_actor(
                     local_host,
                     initial_token,
                 )?;
-                tracing::info!(
-                    event = "clipboard_backend_ready",
-                    backend = "windows_clipboard"
-                );
+                tracing::info!(event = "clipboard_backend_ready");
                 Ok(spawned)
             });
             let _ = completion.send(actor);
@@ -420,10 +416,7 @@ fn initialize_native_actor(
                     local_host,
                     initial_token,
                 )?;
-                tracing::info!(
-                    event = "clipboard_backend_ready",
-                    backend = "macos_pasteboard"
-                );
+                tracing::info!(event = "clipboard_backend_ready");
                 Ok(spawned)
             });
             let _ = completion.send(actor);
@@ -653,17 +646,7 @@ impl RuntimeCore {
             .as_ref()
             .ok_or(ClipboardReason::ChannelUnavailable)?
             .clone();
-        tokio::task::spawn_local(async move {
-            if let Ok(event) = completion.await {
-                if completion_tx.try_send((command, event)).is_err() {
-                    tracing::debug!(
-                        event = "clipboard_handoff_skipped",
-                        reason = ClipboardReason::QueueFull.code(),
-                        "clipboard actor completion queue is unavailable"
-                    );
-                }
-            }
-        });
+        tokio::task::spawn_local(forward_actor_completion(command, completion, completion_tx));
         Ok(())
     }
 
@@ -677,17 +660,9 @@ impl RuntimeCore {
                 let source_token = match &self.role {
                     RuntimeRole::Peer {
                         local_host,
-                        server_host,
                         authority_state: Some(state),
                         ..
                     } if state.current_token.owner_host_id == *local_host => {
-                        tracing::debug!(
-                            event = "clipboard_provisional_capture_requested",
-                            local_host = %local_host,
-                            server_host = %server_host,
-                            process_session = self.process_session_id.get(),
-                            "clipboard provisional capture notice accepted"
-                        );
                         Some(state.current_token.clone())
                     }
                     _ => None,
@@ -704,9 +679,9 @@ impl RuntimeCore {
                 } = &self.role
                 {
                     tracing::debug!(
-                        event = "clipboard_handoff_skipped",
-                        local_host = %local_host,
-                        server_host = %server_host,
+                        event = "clipboard_snapshot_skipped",
+                        source_host = %local_host,
+                        target_host = %server_host,
                         reason = ClipboardReason::StaleOwnerToken.code(),
                         "clipboard provisional capture has no current local owner token"
                     );
@@ -970,6 +945,14 @@ impl RuntimeCore {
         };
         match result {
             Ok(begin) => {
+                tracing::debug!(
+                    event = "clipboard_handoff_started",
+                    source_host = %begin.source_token.owner_host_id,
+                    target_host = %begin.target_token.owner_host_id,
+                    handoff_epoch = begin.handoff_id.handoff_epoch.get(),
+                    ownership_epoch = begin.target_token.ownership_epoch.get(),
+                    "clipboard handoff started"
+                );
                 let target_process_session_id = self
                     .coordinator()
                     .and_then(Coordinator::active)
@@ -986,7 +969,7 @@ impl RuntimeCore {
                 });
                 self.dispatch(commands);
             }
-            Err(error) => self.log_reducer_error("begin", error),
+            Err(error) => self.log_reducer_error(error),
         }
     }
 
@@ -1017,12 +1000,12 @@ impl RuntimeCore {
             Err(CoordinatorError::TargetNotPrepared) => {
                 self.pending = None;
                 tracing::debug!(
-                    event = "clipboard_handoff_skipped",
+                    event = "clipboard_snapshot_skipped",
                     reason = ClipboardReason::TargetNotPrepared.code(),
                     "clipboard target was not prepared before input activation"
                 );
             }
-            Err(error) => self.log_reducer_error("activate", error),
+            Err(error) => self.log_reducer_error(error),
         }
     }
 
@@ -1044,11 +1027,12 @@ impl RuntimeCore {
         if let RuntimeRole::Authority(coordinator) = &mut self.role {
             match coordinator.abort(pending.handoff_id) {
                 Ok(commands) => self.dispatch(commands),
-                Err(error) => self.log_reducer_error("cancel", error),
+                Err(error) => self.log_reducer_error(error),
             }
         }
         tracing::debug!(
             event = "clipboard_handoff_canceled",
+            handoff_epoch = pending.handoff_id.handoff_epoch.get(),
             reason = reason.code(),
             "clipboard handoff canceled"
         );
@@ -1182,7 +1166,7 @@ impl RuntimeCore {
                             })
                         {
                             tracing::debug!(
-                                event = "clipboard_handoff_skipped",
+                                event = "clipboard_snapshot_skipped",
                                 handoff_epoch = handoff_id.handoff_epoch.get(),
                                 reason = ClipboardReason::StalePeerSession.code(),
                                 "clipboard source peer session is unavailable"
@@ -1256,6 +1240,13 @@ impl RuntimeCore {
                 process_session_id,
                 baseline_generation,
             } => {
+                tracing::debug!(
+                    event = "clipboard_target_prepared",
+                    target_host = %target_token.owner_host_id,
+                    handoff_epoch = handoff_id.handoff_epoch.get(),
+                    ownership_epoch = target_token.ownership_epoch.get(),
+                    "clipboard target baseline prepared"
+                );
                 if matches!(self.role, RuntimeRole::Authority(_)) {
                     let _ = self.target_prepared(
                         handoff_id,
@@ -1284,6 +1275,14 @@ impl RuntimeCore {
                 kind,
                 bytes,
             } => {
+                tracing::debug!(
+                    event = "clipboard_snapshot_captured",
+                    source_host = %source_token.owner_host_id,
+                    handoff_epoch = handoff_id.handoff_epoch.get(),
+                    snapshot_sequence = snapshot_id.sequence.get(),
+                    bytes,
+                    "clipboard snapshot captured"
+                );
                 if matches!(self.role, RuntimeRole::Authority(_)) {
                     let _ = self.source_captured(
                         handoff_id,
@@ -1320,6 +1319,7 @@ impl RuntimeCore {
             }
             ActorEvent::Skipped { handoff_id, reason }
             | ActorEvent::BackendUnavailable { handoff_id, reason } => {
+                trace_actor_skip(&command, handoff_id, reason);
                 let Some(handoff_id) = handoff_id else {
                     return;
                 };
@@ -1526,18 +1526,76 @@ impl RuntimeCore {
             tracing::debug!(
                 event = "clipboard_transfer_rejected",
                 host = %host,
-                error = %error,
+                reason = error.reason().code(),
                 "clipboard control message could not be queued"
             );
         }
     }
 
-    fn log_reducer_error(&self, action: &'static str, error: CoordinatorError) {
+    fn log_reducer_error(&self, error: CoordinatorError) {
         tracing::debug!(
-            event = "clipboard_handoff_skipped",
-            action,
-            error = %error,
+            event = "clipboard_snapshot_skipped",
+            reason = error.reason().code(),
             "clipboard coordinator rejected stale or unavailable work"
+        );
+    }
+}
+
+fn trace_actor_skip(
+    command: &ActorCommand,
+    handoff_id: Option<HandoffId>,
+    reason: ClipboardReason,
+) {
+    match command {
+        ActorCommand::StageSnapshot(stage) => tracing::debug!(
+            event = "clipboard_apply_skipped",
+            handoff_epoch = stage.handoff_id.handoff_epoch.get(),
+            snapshot_sequence = stage.snapshot_id.sequence.get(),
+            reason = reason.code(),
+            "clipboard snapshot apply skipped"
+        ),
+        ActorCommand::PublishSnapshot {
+            handoff_id,
+            snapshot_id,
+        } => tracing::debug!(
+            event = "clipboard_snapshot_skipped",
+            handoff_epoch = handoff_id.handoff_epoch.get(),
+            snapshot_sequence = snapshot_id.sequence.get(),
+            reason = reason.code(),
+            "clipboard snapshot publication skipped"
+        ),
+        _ => {
+            if let Some(handoff_id) = handoff_id {
+                tracing::debug!(
+                    event = "clipboard_snapshot_skipped",
+                    handoff_epoch = handoff_id.handoff_epoch.get(),
+                    reason = reason.code(),
+                    "clipboard actor work skipped"
+                );
+            } else {
+                tracing::debug!(
+                    event = "clipboard_snapshot_skipped",
+                    reason = reason.code(),
+                    "clipboard actor work skipped"
+                );
+            }
+        }
+    }
+}
+
+async fn forward_actor_completion(
+    command: ActorCommand,
+    completion: oneshot::Receiver<ActorEvent>,
+    completion_tx: mpsc::Sender<(ActorCommand, ActorEvent)>,
+) {
+    let Ok(event) = completion.await else {
+        return;
+    };
+    if completion_tx.send((command, event)).await.is_err() {
+        tracing::debug!(
+            event = "clipboard_snapshot_skipped",
+            reason = ClipboardReason::ChannelUnavailable.code(),
+            "clipboard actor completion receiver is closed"
         );
     }
 }
@@ -1929,6 +1987,45 @@ mod tests {
         drop(hook_rx);
         let handle = ClipboardHandle { hook_tx };
         assert!(!handle.capture_provisional());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn full_actor_completion_queue_backpressures_without_dropping_result() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (completion_tx, mut completion_rx) = mpsc::channel(1);
+                completion_tx
+                    .send((ActorCommand::Shutdown, ActorEvent::Shutdown))
+                    .await
+                    .unwrap();
+                let handoff_id = HandoffId {
+                    authority_session_id: AuthoritySessionId::new(20),
+                    handoff_epoch: HandoffEpoch::new(3),
+                };
+                let (actor_tx, actor_rx) = oneshot::channel();
+                let task = tokio::task::spawn_local(forward_actor_completion(
+                    ActorCommand::CancelHandoff { handoff_id },
+                    actor_rx,
+                    completion_tx,
+                ));
+                actor_tx.send(ActorEvent::Canceled { handoff_id }).unwrap();
+                tokio::task::yield_now().await;
+                assert!(!task.is_finished());
+
+                assert!(matches!(
+                    completion_rx.recv().await,
+                    Some((ActorCommand::Shutdown, ActorEvent::Shutdown))
+                ));
+                assert!(matches!(
+                    completion_rx.recv().await,
+                    Some((
+                        ActorCommand::CancelHandoff { handoff_id: delivered_command },
+                        ActorEvent::Canceled { handoff_id: delivered_event },
+                    )) if delivered_command == handoff_id && delivered_event == handoff_id
+                ));
+                task.await.unwrap();
+            })
+            .await;
     }
 
     #[test]

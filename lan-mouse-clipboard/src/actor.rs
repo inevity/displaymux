@@ -581,18 +581,16 @@ impl<B: ClipboardBackend> Actor<B> {
 
         // The native write and applied-identity record are synchronous in this
         // serialized actor, with no await or cancellation point between them.
-        let post_write_generation = match self.backend.apply(stage.baseline_generation, &stage.data)
-        {
-            Ok(generation) => generation,
+        match self.backend.apply(stage.baseline_generation, &stage.data) {
+            Ok(_) => {}
             Err(reason) => return Self::native_failure(Some(stage.handoff_id), reason),
-        };
+        }
         self.applied = Some(identity);
         self.preparation = None;
         tracing::debug!(
             event = "clipboard_apply_completed",
             handoff_epoch = identity.handoff_id.handoff_epoch.get(),
             snapshot_sequence = identity.snapshot_id.sequence.get(),
-            native_generation = post_write_generation.get(),
             "clipboard actor applied snapshot"
         );
         ActorEvent::Applied(identity)
@@ -623,11 +621,6 @@ impl<B: ClipboardBackend> Actor<B> {
     }
 
     fn skipped(handoff_id: Option<HandoffId>, reason: ClipboardReason) -> ActorEvent {
-        tracing::debug!(
-            event = "clipboard_snapshot_skipped",
-            reason = reason.code(),
-            "clipboard actor skipped work"
-        );
         ActorEvent::Skipped { handoff_id, reason }
     }
 
