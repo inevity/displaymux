@@ -1181,12 +1181,12 @@ Proposed subject: `feat: harden clipboard handoff lifecycle`.
 
 ## P8: Native Build and Deployment
 
-Status: blocked pending explicit approval to restart the user-stopped Linux
-services and perform normal-use acceptance. Exact revision
-`852f51e47e6b074feac7a0ab2014eb7dbb4b9dcc` is installed on Linux, Windows,
-and macOS. Windows and macOS are running; the Linux Lan Mouse and
-`tv-multiview` services are intentionally inactive at the user's explicit
-request, so the all-host runtime gate is not yet complete. Depends on P7.
+Status: blocked on one macOS Accessibility reauthorization before normal-use
+acceptance. Exact revision `8a32992a08e0cb2c7fe207d4f0561d316caa2db8`
+is installed and running on Linux, Windows, and macOS. Both Linux services are
+active and Windows now reports `clipboard_backend_ready`; macOS reports its
+clipboard backend ready but rejects input capture/emulation because TCC does
+not recognize the newly rebuilt ad-hoc-signed binary. Depends on P7.
 
 P8 evidence recorded on 2026-07-15:
 
@@ -1210,10 +1210,11 @@ P8 evidence recorded on 2026-07-15:
 - `[clipboard]` is enabled with `max_bytes = 3145728` on all three hosts.
   Persistent runtime log samples contain only status/error metadata, while the
   code-level log-capture tests prove clipboard payload values are not logged;
-- Linux has the exact artifact and configuration installed, but
-  `lan-mouse.service` and `tv-multiview.service` are both inactive by explicit
-  user request. Minimal normal-use clipboard acceptance remains pending until
-  those services are restarted.
+- Linux `lan-mouse.service` and `tv-multiview.service` were restarted with
+  explicit approval and are active. Native rollout of `8a32992` passed with
+  zero failed or unreachable hosts. Windows accepted native generation zero
+  and reached `clipboard_backend_ready`; minimal normal-use clipboard
+  acceptance is blocked only by macOS Accessibility reauthorization.
 
 Deployment is one final phase, not a substitute for domain/native tests.
 
@@ -1408,9 +1409,11 @@ must not be collapsed before their individual gates pass.
 - P5 Windows native actor: completed 2026-07-15; positive live mutation remains
   part of P8 acceptance
 - P6 macOS native actor: completed in `8c5f40e`
-- P7 Cross-platform hardening and observability: completed in `852f51e`
-- P8 Native build and deployment: blocked; exact artifacts are installed, but
-  Linux services are intentionally inactive pending explicit restart approval
-  and normal-use acceptance
+- P7 Cross-platform hardening and observability: completed in `852f51e`, with
+  tracing-log integration in `1e6ec36` and Windows native failure detail in
+  `b5b17aa`
+- P8 Native build and deployment: blocked; `8a32992` is installed and running
+  on all hosts, Windows clipboard readiness is verified, and macOS input awaits
+  one Accessibility reauthorization for the rebuilt binary
 - P9 Final refinement and acceptance: verification completed; closure blocked
   on P8 runtime acceptance
