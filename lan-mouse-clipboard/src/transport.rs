@@ -1,7 +1,8 @@
+use crate::frame::read_next_frame_validated;
 use crate::{
     AuthenticatedPeer, AuthoritySessionId, ClipboardHello, ClipboardPayload, ClipboardReason,
     FrameError, FrameMetadata, HandoffEnvelope, HandoffId, HostId, ProcessSessionId, WireMessage,
-    authenticate_hello, encode_message, read_frame_validated, write_frame,
+    authenticate_hello, encode_message, write_frame,
 };
 use std::{
     collections::HashMap,
@@ -572,7 +573,7 @@ where
     let (sink, inbound) = inbound_queues();
     let task = tokio::spawn(async move {
         loop {
-            let message = read_frame_validated(
+            let message = read_next_frame_validated(
                 &mut reader,
                 max_payload_bytes,
                 transfer_budget,
@@ -779,6 +780,59 @@ mod tests {
             Err(TransportError::StalePeerSession)
         ));
         assert!(inbound.payload_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn established_reader_survives_idle_budget_and_accepts_next_frame() {
+        let cancellation = CancellationToken::new();
+        let (mut writer, reader) = tokio::io::duplex(4096);
+        let (mut inbound, task) = spawn_reader(
+            reader,
+            64,
+            Duration::from_millis(20),
+            cancellation.clone(),
+            |_| Ok(()),
+        );
+
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert!(!task.is_finished());
+
+        let message = WireMessage::ProtocolError(ClipboardReason::ProtocolError);
+        let frame = encode_message(&message, 64).unwrap();
+        write_frame(&mut writer, &frame, Duration::from_secs(1), &cancellation)
+            .await
+            .unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), inbound.control_rx.recv())
+                .await
+                .unwrap(),
+            Some(message)
+        );
+
+        cancellation.cancel();
+        assert!(matches!(
+            task.await.unwrap(),
+            Err(TransportError::Frame(FrameError::Canceled))
+        ));
+    }
+
+    #[tokio::test]
+    async fn established_reader_times_out_after_partial_frame_starts() {
+        let cancellation = CancellationToken::new();
+        let (mut writer, reader) = tokio::io::duplex(4096);
+        let (_inbound, task) =
+            spawn_reader(reader, 64, Duration::from_millis(20), cancellation, |_| {
+                Ok(())
+            });
+        writer.write_all(b"L").await.unwrap();
+
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), task)
+                .await
+                .unwrap()
+                .unwrap(),
+            Err(TransportError::Frame(FrameError::TransferTimeout))
+        ));
     }
 
     #[tokio::test]

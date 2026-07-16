@@ -374,11 +374,66 @@ where
     E: From<FrameError>,
     V: FnOnce(&FrameMetadata) -> Result<(), E>,
 {
-    let deadline = Instant::now() + transfer_budget;
     let mut prefix = [0_u8; PREFIX_BYTES];
+    let deadline = Instant::now() + transfer_budget;
     read_exact_before(reader, &mut prefix, deadline, cancellation)
         .await
         .map_err(E::from)?;
+    read_frame_after_prefix(
+        reader,
+        max_payload_bytes,
+        prefix,
+        deadline,
+        cancellation,
+        validator,
+    )
+    .await
+}
+
+pub(crate) async fn read_next_frame_validated<R, E, V>(
+    reader: &mut R,
+    max_payload_bytes: usize,
+    transfer_budget: Duration,
+    cancellation: &CancellationToken,
+    validator: V,
+) -> Result<WireMessage, E>
+where
+    R: AsyncRead + Unpin,
+    E: From<FrameError>,
+    V: FnOnce(&FrameMetadata) -> Result<(), E>,
+{
+    let mut prefix = [0_u8; PREFIX_BYTES];
+    read_exact_until_cancel(reader, &mut prefix[..1], cancellation)
+        .await
+        .map_err(E::from)?;
+    let deadline = Instant::now() + transfer_budget;
+    read_exact_before(reader, &mut prefix[1..], deadline, cancellation)
+        .await
+        .map_err(E::from)?;
+    read_frame_after_prefix(
+        reader,
+        max_payload_bytes,
+        prefix,
+        deadline,
+        cancellation,
+        validator,
+    )
+    .await
+}
+
+async fn read_frame_after_prefix<R, E, V>(
+    reader: &mut R,
+    max_payload_bytes: usize,
+    prefix: [u8; PREFIX_BYTES],
+    deadline: Instant,
+    cancellation: &CancellationToken,
+    validator: V,
+) -> Result<WireMessage, E>
+where
+    R: AsyncRead + Unpin,
+    E: From<FrameError>,
+    V: FnOnce(&FrameMetadata) -> Result<(), E>,
+{
     let decoded = decode_prefix(&prefix, max_payload_bytes).map_err(E::from)?;
 
     let mut header_storage = [0_u8; MAX_HEADER_BYTES];
@@ -668,6 +723,21 @@ fn require_empty_payload(payload: &[u8]) -> Result<(), FrameError> {
         Ok(())
     } else {
         Err(FrameError::UnexpectedPayload)
+    }
+}
+
+async fn read_exact_until_cancel<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    bytes: &mut [u8],
+    cancellation: &CancellationToken,
+) -> Result<(), FrameError> {
+    tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => Err(FrameError::Canceled),
+        result = reader.read_exact(bytes) => match result {
+            Ok(_) => Ok(()),
+            Err(error) => Err(FrameError::Io(error)),
+        },
     }
 }
 
