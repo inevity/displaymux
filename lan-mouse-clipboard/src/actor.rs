@@ -312,10 +312,19 @@ impl<B: ClipboardBackend> Actor<B> {
     }
 
     fn synchronize_authority(&mut self, current_token: OwnershipToken) -> ActorEvent {
-        if current_token.authority_session_id != self.current_token.authority_session_id
-            || current_token != self.current_token
-        {
-            self.source_snapshot = None;
+        let authority_changed =
+            current_token.authority_session_id != self.current_token.authority_session_id;
+        let token_changed = current_token != self.current_token;
+        if authority_changed || token_changed {
+            // Activation moves ownership to the target before an asynchronously completed source
+            // capture is published. Preserve only snapshots already fenced to that handoff.
+            let preserve_bound_source = !authority_changed
+                && self.source_snapshot.as_ref().is_some_and(|snapshot| {
+                    snapshot.handoff_id.is_some() && snapshot.source_token == self.current_token
+                });
+            if !preserve_bound_source {
+                self.source_snapshot = None;
+            }
             self.stage = None;
             self.preparation = None;
             self.applied = None;
@@ -1544,6 +1553,123 @@ mod tests {
             ),
             ActorEvent::Captured { .. }
         ));
+        recv(actor.handle.try_request(ActorCommand::Shutdown).unwrap());
+        actor.join().unwrap();
+    }
+
+    #[test]
+    fn bound_provisional_survives_same_authority_activation_until_publish() {
+        let data = ClipboardData::text(Arc::<[u8]>::from(&b"remote-value"[..])).unwrap();
+        let control = BackendControl::new(data.clone());
+        let process = ProcessSessionId::new(5);
+        let source = token("remote", 3);
+        let mut actor = spawn_actor(
+            "clipboard-test",
+            control.backend(),
+            process,
+            HostId::from("remote"),
+            source.clone(),
+        )
+        .unwrap();
+        assert!(matches!(
+            recv(
+                actor
+                    .handle
+                    .try_request(ActorCommand::CaptureProvisional {
+                        source_token: source.clone(),
+                        max_bytes: 32,
+                    })
+                    .unwrap()
+            ),
+            ActorEvent::ProvisionalCaptured { .. }
+        ));
+        let ActorEvent::Captured { snapshot_id, .. } = recv(
+            actor
+                .handle
+                .try_request(ActorCommand::BindProvisional {
+                    handoff_id: handoff(4),
+                    source_token: source,
+                })
+                .unwrap(),
+        ) else {
+            panic!("provisional capture did not bind")
+        };
+
+        assert!(matches!(
+            recv(
+                actor
+                    .handle
+                    .try_request(ActorCommand::SynchronizeAuthority {
+                        current_token: token("server", 4),
+                    })
+                    .unwrap()
+            ),
+            ActorEvent::AuthoritySynchronized { .. }
+        ));
+        assert_eq!(
+            recv(
+                actor
+                    .handle
+                    .try_request(ActorCommand::PublishSnapshot {
+                        handoff_id: handoff(4),
+                        snapshot_id,
+                    })
+                    .unwrap()
+            ),
+            ActorEvent::Published {
+                handoff_id: handoff(4),
+                snapshot_id,
+            }
+        );
+        assert_eq!(actor.payload_rx.blocking_recv().unwrap().data, data);
+        recv(actor.handle.try_request(ActorCommand::Shutdown).unwrap());
+        actor.join().unwrap();
+    }
+
+    #[test]
+    fn unbound_provisional_is_fenced_by_same_authority_owner_change() {
+        let control = BackendControl::new(ClipboardData::Empty);
+        let source = token("remote", 3);
+        let actor = spawn_actor(
+            "clipboard-test",
+            control.backend(),
+            ProcessSessionId::new(5),
+            HostId::from("remote"),
+            source.clone(),
+        )
+        .unwrap();
+        recv(
+            actor
+                .handle
+                .try_request(ActorCommand::CaptureProvisional {
+                    source_token: source.clone(),
+                    max_bytes: 16,
+                })
+                .unwrap(),
+        );
+        recv(
+            actor
+                .handle
+                .try_request(ActorCommand::SynchronizeAuthority {
+                    current_token: token("server", 4),
+                })
+                .unwrap(),
+        );
+        assert_eq!(
+            recv(
+                actor
+                    .handle
+                    .try_request(ActorCommand::BindProvisional {
+                        handoff_id: handoff(4),
+                        source_token: source,
+                    })
+                    .unwrap()
+            ),
+            ActorEvent::Skipped {
+                handoff_id: Some(handoff(4)),
+                reason: ClipboardReason::SourceChanged,
+            }
+        );
         recv(actor.handle.try_request(ActorCommand::Shutdown).unwrap());
         actor.join().unwrap();
     }
