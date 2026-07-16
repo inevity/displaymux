@@ -2,12 +2,12 @@
 
 ## Plan Control
 
-- Status: corrective P9 model, local Rust verification, native builds, and
-  deployment completed on 2026-07-15 for revision
-  `a688304f2ee3fada02e5c001d6669a4cde8c87a5` after normal-use runtime
-  acceptance exposed an OS-independent prepare-acknowledgement race. Final
-  normal-use acceptance is blocked until macOS Accessibility authorization is
-  restored for the rebuilt binary.
+- Status: completed on 2026-07-16 for revision
+  `60073d43b83c3ca340c94e388f408aae25c7e692`. Linux-to-macOS clipboard
+  handoff passed under the immediately preceding exact revision; runtime logs
+  then exposed and localized the remote-source publication race fixed by
+  `60073d4`. After one required Accessibility authorization for the rebuilt
+  macOS binary, the macOS-to-server clipboard handoff also passed end to end.
 - Plan type: scoped child implementation plan. The requested filename is
   `docs/clipboardplan.md`; this is not a replacement root objective and
   therefore does not supersede
@@ -58,6 +58,7 @@ GoalState ==
     /\ NoFailureClear
     /\ SessionFreshness
     /\ OneActiveHandoff
+    /\ BoundSourceUntilPublication
     /\ NativeLinuxBuildVerified
     /\ NativeWindowsBuildVerified
     /\ NativeMacosBuildVerified
@@ -182,6 +183,11 @@ These are implementation acceptance criteria, not comments.
 14. **PayloadPrivacy**: logs, notifications, status, crash context, and build
     artifacts never contain clipboard bytes, digest, source application, or
     content-derived metadata.
+15. **BoundSourceUntilPublication**: after an exact active handoff binds a
+    provisional source snapshot, same-authority ownership activation cannot
+    invalidate that snapshot before publication. Explicit cancellation,
+    supersession, or authority-session change still invalidates it; an unbound
+    provisional snapshot is invalidated by any owner-token change.
 
 ### Checker Correspondence
 
@@ -237,7 +243,7 @@ property enforceable in Rust.
 | `CaptureSuccess` | Source actor returns stable `Text` or explicit `Empty` | Payload remains in actor/transport ownership |
 | `RetrySourceChanged` | Source actor observes generation change while the source token is still current | Retry only within the fixed, justified actor budget |
 | `CaptureFailure` | Private, unsupported, oversized, unavailable, racing, or stale source | No wire payload; target unchanged |
-| `CommitSwitch` | Successful `BundleLeaseManager::commit`, or server return at `ClientReleased` | Publish activation notice after input mutation; never roll input back |
+| `CommitSwitch` | Successful `BundleLeaseManager::commit`, or server return at `ClientReleased` | Publish activation notice after input mutation; never roll input back; retain an already handoff-bound source snapshot until its queued publication or cancellation |
 | `AbortSwitch` | Every `fail_context`, invalidation, denial, reconfiguration, and shutdown path | Non-blocking cancellation and stale-result fencing |
 | `SetInputReady` | Existing peer readiness/session updates | Remains an input-only action; clipboard observes loss only to cancel stale work |
 | `SendSnapshot` | Transport accepts one active payload for an authenticated negotiated peer | Queue full or channel down skips clipboard only |
@@ -1188,13 +1194,11 @@ Proposed subject: `feat: harden clipboard handoff lifecycle`.
 
 ## P8: Native Build and Deployment
 
-Status: corrected revision native builds and deployment completed; blocked on
-one macOS Accessibility reauthorization before normal-use acceptance. Exact
-revision `a688304f2ee3fada02e5c001d6669a4cde8c87a5` is installed and running on
-Linux, Windows, and macOS. Both Linux services are active, and Windows and
-macOS report `clipboard_backend_ready`; macOS rejects input
-capture/emulation because TCC does not recognize the rebuilt ad-hoc-signed
-binary. Depends on P7.
+Status: exact revision `60073d43b83c3ca340c94e388f408aae25c7e692` was
+built natively and deployed on 2026-07-16 with zero failed or unreachable
+hosts. Both Linux services and the Windows daemon are active. The macOS
+LaunchAgent, native input capture/emulation backends, and clipboard backend are
+active after Accessibility reauthorization. Depends on P7.
 
 P8 evidence recorded on 2026-07-15:
 
@@ -1233,6 +1237,13 @@ P8 evidence recorded on 2026-07-15:
   its designated requirement is the build-specific CDHash. Consequently,
   rebuilding changes the TCC identity and requires Accessibility authorization
   again before input switching and normal-use clipboard acceptance can run.
+- corrective revision `60073d4` passed the locked no-GTK workspace check and
+  all 149 non-interactive tests locally, then passed native Linux, Windows, and
+  macOS test/build tasks. The all-inventory rollout completed with Linux
+  `ok=43 changed=11`, Windows `ok=45 changed=10`, macOS `ok=39 changed=12`,
+  controller `ok=14 changed=1`, and no failed or unreachable hosts. Linux saw
+  both clipboard peers reconnect with `capability_ready=true`; macOS startup
+  then reported the exact external TCC authorization blocker.
 
 Deployment is one final phase, not a substitute for domain/native tests.
 
@@ -1306,9 +1317,9 @@ restart Lan Mouse only. Native clipboards are not rewritten during rollback.
 
 ## P9: Final Refinement and Acceptance
 
-Status: model, Rust, native-build, and deployment verification completed on
-2026-07-15; phase closure remains blocked on macOS Accessibility
-reauthorization and the P8 normal-use acceptance gate. Depends on P8.
+Status: completed through corrective revision `60073d4` on 2026-07-16. Model,
+Rust, native-build, exact-revision deployment, and both-direction normal-use
+acceptance gates pass. Depends on P8.
 
 P9 evidence:
 
@@ -1326,6 +1337,28 @@ P9 evidence:
 - no-GTK all-target and Linux production-feature clippy runs passed with only
   the recorded non-fatal warnings; native Windows, macOS, and Linux build/test
   evidence is recorded under P8.
+- the Linux-to-macOS normal-use trace passed end to end: Linux captured and
+  transferred 78 bytes, macOS prepared its baseline, and macOS logged
+  `clipboard_apply_completed`;
+- the reverse trace proved a same-authority ordering violation: macOS logged
+  `clipboard_snapshot_captured`, then `source_changed`, then
+  `stale_handoff`. Code tracing showed `SynchronizeAuthority` erased the
+  already-bound source snapshot when ownership activated on the server before
+  the asynchronous `Captured` completion queued `PublishSnapshot`;
+- revision `60073d4` preserves only handoff-bound source snapshots across that
+  same-authority activation. Focused tests replay bind, activation, and
+  publication and separately prove that unbound provisional data remains
+  fenced. The full locked no-GTK workspace check passed; all 149
+  non-interactive tests passed and two interactive display-server probes were
+  intentionally ignored;
+- no TLA+ action changed: `CommitInputOwner` already preserves matching source
+  capture work. This correction restores the Rust refinement to that existing
+  model transition, so no checker rerun is required for this implementation
+  fix.
+- after Accessibility reauthorization, the exact macOS-to-server acceptance
+  trace completed at `08:44:27Z`: macOS captured 78 bytes for handoff 3, the
+  payload transfer completed, and Linux logged `clipboard_apply_completed` for
+  the same handoff and snapshot sequence. Clipboard paste on Linux succeeded.
 
 ### TLC Recheck
 
@@ -1431,10 +1464,8 @@ must not be collapsed before their individual gates pass.
 - P7 Cross-platform hardening and observability: completed in `852f51e`, with
   tracing-log integration in `1e6ec36` and Windows native failure detail in
   `b5b17aa`
-- P8 Native build and deployment: corrected revision `a688304` is installed on
-  all hosts with zero failed/unreachable hosts; Linux and Windows are ready,
-  while macOS input awaits one Accessibility reauthorization for the rebuilt
-  binary before normal-use acceptance
-- P9 Final refinement and acceptance: corrective model and local Rust
-  verification completed; corrected-revision native builds and deployment
-  completed; normal-use acceptance remains blocked on macOS Accessibility
+- P8 Native build and deployment: corrective revision `60073d4` is installed
+  on all hosts with zero failed/unreachable hosts; Linux, Windows, and macOS
+  native input and clipboard backends are ready
+- P9 Final refinement and acceptance: the reverse-handoff race is fixed,
+  locally verified, natively built, deployed, and accepted in both directions
