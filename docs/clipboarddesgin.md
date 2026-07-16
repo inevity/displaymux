@@ -337,6 +337,12 @@ is accepted because it reports the pre-switch cached generation, not a new
 post-commit sample. A missing, failed, stale-session, or out-of-order
 preparation still becomes `Skipped(target_not_prepared)`.
 
+The peer retains the exact authenticated `PrepareTarget` envelope before
+dispatching actor work. `Prepared` or `Skipped` returns a `PrepareResult` from
+that retained envelope; it must not reconstruct the response identity from a
+separately delivered `AuthorityState`. `PrepareTarget` and the authority-state
+snapshot may arrive or complete in either order without losing the result.
+
 The actor refreshes its cached generation after initialization, stable source
 capture, successful apply, and a detected destination change. A stale cached
 generation is conservative: the final compare detects any intervening target
@@ -365,6 +371,16 @@ Unavailable(reason)
 ```
 
 `Unavailable` is never serialized as clipboard content.
+
+For a remote-to-server return, capture may finish before the authority has
+allocated the return handoff. That snapshot is provisional and cannot be
+published until `BindProvisional` attaches the exact active handoff and source
+token. Once bound, a same-authority `OwnershipActivated(target_token)` update
+must retain the source snapshot until its queued `PublishSnapshot` completes or
+the handoff is explicitly canceled or superseded. A token change while the
+snapshot is still unbound invalidates it, and any authority-session change
+invalidates both bound and unbound snapshots. This lifetime rule is independent
+of actor-completion and authority-state message ordering.
 
 ### 7.5 CommitInputOwner
 
