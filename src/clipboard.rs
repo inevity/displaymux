@@ -486,13 +486,19 @@ struct PendingTransition {
 }
 
 #[derive(Debug)]
+struct PeerPreparation {
+    handoff: HandoffEnvelope,
+    baseline_generation: Option<NativeGeneration>,
+}
+
+#[derive(Debug)]
 enum RuntimeRole {
     Authority(Coordinator),
     Peer {
         local_host: HostId,
         server_host: HostId,
         authority_state: Option<AuthorityState>,
-        preparation: Option<(HandoffId, OwnershipToken, NativeGeneration)>,
+        preparation: Option<PeerPreparation>,
     },
     Unavailable,
 }
@@ -782,6 +788,12 @@ impl RuntimeCore {
             WireMessage::AuthorityState(state) => self.accept_authority_state(state),
             WireMessage::PrepareTarget(handoff) => {
                 if matches!(self.role, RuntimeRole::Peer { .. }) {
+                    if let RuntimeRole::Peer { preparation, .. } = &mut self.role {
+                        *preparation = Some(PeerPreparation {
+                            handoff: handoff.clone(),
+                            baseline_generation: None,
+                        });
+                    }
                     let command = ActorCommand::PrepareTarget {
                         handoff_id: handoff.handoff_id,
                         target_token: handoff.target_token.clone(),
@@ -908,12 +920,12 @@ impl RuntimeCore {
     fn stage_delivered_snapshot(&mut self, payload: ClipboardPayload) {
         let preparation = match &self.role {
             RuntimeRole::Peer {
-                preparation: Some((handoff_id, target_token, generation)),
+                preparation: Some(preparation),
                 ..
-            } if *handoff_id == payload.handoff.handoff_id
-                && *target_token == payload.handoff.target_token =>
+            } if preparation.handoff.handoff_id == payload.handoff.handoff_id
+                && preparation.handoff.target_token == payload.handoff.target_token =>
             {
-                Some(*generation)
+                preparation.baseline_generation
             }
             _ => None,
         };
@@ -1273,11 +1285,21 @@ impl RuntimeCore {
                         baseline_generation,
                     );
                 } else {
-                    if let RuntimeRole::Peer { preparation, .. } = &mut self.role {
-                        *preparation =
-                            Some((handoff_id, target_token.clone(), baseline_generation));
-                    }
-                    if let Some(handoff) = self.peer_handoff(handoff_id) {
+                    let handoff = match &mut self.role {
+                        RuntimeRole::Peer {
+                            preparation: Some(preparation),
+                            ..
+                        } if preparation.handoff.handoff_id == handoff_id
+                            && preparation.handoff.target_token == target_token
+                            && preparation.handoff.target_process_session_id
+                                == process_session_id =>
+                        {
+                            preparation.baseline_generation = Some(baseline_generation);
+                            Some(preparation.handoff.clone())
+                        }
+                        _ => None,
+                    };
+                    if let Some(handoff) = handoff {
                         self.send_prepare_result(
                             &handoff,
                             Some(baseline_generation),
@@ -1468,13 +1490,22 @@ impl RuntimeCore {
     fn peer_handoff(&self, handoff_id: HandoffId) -> Option<HandoffEnvelope> {
         match &self.role {
             RuntimeRole::Peer {
-                authority_state: Some(state),
+                authority_state,
+                preparation,
                 ..
-            } => state
-                .active_handoff
+            } => preparation
                 .as_ref()
+                .map(|preparation| &preparation.handoff)
                 .filter(|handoff| handoff.handoff_id == handoff_id)
-                .cloned(),
+                .cloned()
+                .or_else(|| {
+                    authority_state
+                        .as_ref()?
+                        .active_handoff
+                        .as_ref()
+                        .filter(|handoff| handoff.handoff_id == handoff_id)
+                        .cloned()
+                }),
             _ => None,
         }
     }
@@ -1944,6 +1975,92 @@ mod tests {
             ) => panic!("transport writer ended before snapshot: {result:?}"),
         };
         assert!(matches!(delivered, WireMessage::SnapshotDeliver(_)));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn peer_prepare_completion_does_not_wait_for_authority_state_snapshot() {
+        let local_process = ProcessSessionId::new(40);
+        let server_process = ProcessSessionId::new(10);
+        let server_host = HostId::from("linux");
+        let mut core = RuntimeCore::peer(
+            config(true),
+            HostId::from("mac"),
+            server_host.clone(),
+            local_process,
+            Arc::new(RwLock::new(None)),
+        );
+        let (outbound, mut receiver) = transport_queues();
+        core.network_peers.insert(
+            server_host,
+            (negotiated_peer("linux", server_process), outbound),
+        );
+        let handoff = HandoffEnvelope {
+            handoff_id: HandoffId {
+                authority_session_id: AuthoritySessionId::new(20),
+                handoff_epoch: HandoffEpoch::new(1),
+            },
+            source_token: OwnershipToken {
+                authority_session_id: AuthoritySessionId::new(20),
+                ownership_epoch: OwnershipEpoch::new(0),
+                owner_host_id: HostId::from("linux"),
+            },
+            source_process_session_id: server_process,
+            target_token: OwnershipToken {
+                authority_session_id: AuthoritySessionId::new(20),
+                ownership_epoch: OwnershipEpoch::new(1),
+                owner_host_id: HostId::from("mac"),
+            },
+            target_process_session_id: local_process,
+        };
+
+        core.handle_wire_message(
+            HostId::from("linux"),
+            WireMessage::PrepareTarget(handoff.clone()),
+        );
+        assert!(matches!(
+            &core.role,
+            RuntimeRole::Peer {
+                authority_state: None,
+                ..
+            }
+        ));
+        core.handle_actor_event(
+            ActorCommand::PrepareTarget {
+                handoff_id: handoff.handoff_id,
+                target_token: handoff.target_token.clone(),
+            },
+            ActorEvent::Prepared {
+                handoff_id: handoff.handoff_id,
+                target_token: handoff.target_token.clone(),
+                process_session_id: local_process,
+                baseline_generation: NativeGeneration::new(7),
+            },
+        );
+
+        let cancellation = CancellationToken::new();
+        let (mut reader, mut writer) = tokio::io::duplex(4096);
+        let response = tokio::select! {
+            result = read_frame(
+                &mut reader,
+                1024,
+                Duration::from_secs(1),
+                &cancellation,
+            ) => result.unwrap(),
+            result = run_writer(
+                &mut writer,
+                &mut receiver,
+                1024,
+                Duration::from_secs(1),
+            ) => panic!("transport writer ended before prepare result: {result:?}"),
+        };
+        let WireMessage::PrepareResult(result) = response else {
+            panic!("expected prepare result");
+        };
+        assert_eq!(result.handoff_id, handoff.handoff_id);
+        assert_eq!(result.target_token, handoff.target_token);
+        assert_eq!(result.target_process_session_id, local_process);
+        assert_eq!(result.baseline_generation, Some(NativeGeneration::new(7)));
+        assert_eq!(result.result, OperationResult::Completed);
     }
 
     #[test]
