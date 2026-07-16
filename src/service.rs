@@ -839,10 +839,17 @@ impl Service {
                 return;
             }
         };
-        let _ = self
+        let clipboard_queued = self
             .clipboard
             .handle()
             .begin_remote(context.lease.lease_epoch, context.target);
+        tracing::info!(
+            event = "clipboard_handoff_requested",
+            target_host = %context.target,
+            lease_epoch = context.lease.lease_epoch,
+            queued = clipboard_queued,
+            "clipboard handoff request emitted before switch preparation"
+        );
         self.reset_switch_deadline();
         if !self.start_prepare_task(context.clone(), readiness) {
             self.fail_context(context, "controller_busy");

@@ -600,7 +600,7 @@ impl<B: ClipboardBackend> Actor<B> {
         }
         self.applied = Some(identity);
         self.preparation = None;
-        tracing::debug!(
+        tracing::info!(
             event = "clipboard_apply_completed",
             handoff_epoch = identity.handoff_id.handoff_epoch.get(),
             snapshot_sequence = identity.snapshot_id.sequence.get(),

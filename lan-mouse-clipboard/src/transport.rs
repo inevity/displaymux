@@ -471,7 +471,7 @@ pub async fn run_writer<W: AsyncWrite + Unpin>(
             Ok(frame) => frame,
             Err(error) => {
                 if let Some((handoff_epoch, snapshot_sequence, bytes)) = payload_trace {
-                    tracing::debug!(
+                    tracing::info!(
                         event = "clipboard_transfer_rejected",
                         handoff_epoch,
                         snapshot_sequence,
@@ -488,7 +488,7 @@ pub async fn run_writer<W: AsyncWrite + Unpin>(
         };
         let started = Instant::now();
         if let Some((handoff_epoch, snapshot_sequence, bytes)) = payload_trace {
-            tracing::debug!(
+            tracing::info!(
                 event = "clipboard_transfer_started",
                 handoff_epoch,
                 snapshot_sequence,
@@ -504,7 +504,7 @@ pub async fn run_writer<W: AsyncWrite + Unpin>(
         let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
         if let Err(error) = write_result {
             if let Some((handoff_epoch, snapshot_sequence, bytes)) = payload_trace {
-                tracing::debug!(
+                tracing::info!(
                     event = "clipboard_transfer_rejected",
                     handoff_epoch,
                     snapshot_sequence,
@@ -517,7 +517,7 @@ pub async fn run_writer<W: AsyncWrite + Unpin>(
             return Err(error.into());
         }
         if let Some((handoff_epoch, snapshot_sequence, bytes)) = payload_trace {
-            tracing::debug!(
+            tracing::info!(
                 event = "clipboard_transfer_completed",
                 handoff_epoch,
                 snapshot_sequence,

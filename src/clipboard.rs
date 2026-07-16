@@ -701,7 +701,14 @@ impl RuntimeCore {
     fn handle_transport_event(&mut self, event: ClipboardTransportEvent) {
         match event {
             ClipboardTransportEvent::Connected { peer, outbound } => {
-                if peer.effective_max_bytes.is_some() {
+                let capability_ready = peer.effective_max_bytes.is_some();
+                tracing::info!(
+                    event = "clipboard_peer_connected",
+                    host = %peer.host_id,
+                    capability_ready,
+                    "clipboard peer transport connected"
+                );
+                if capability_ready {
                     self.peer_session_changed(peer.host_id.clone(), peer.process_session_id);
                 }
                 self.network_peers
@@ -720,6 +727,12 @@ impl RuntimeCore {
                 if !current {
                     return;
                 }
+                tracing::info!(
+                    event = "clipboard_peer_disconnected",
+                    host = %host_id,
+                    reason = ClipboardReason::ChannelUnavailable.code(),
+                    "clipboard peer transport disconnected"
+                );
                 self.network_peers.remove(&host_id);
                 let mut actor_cancel = None;
                 let commands = match &mut self.role {
@@ -952,12 +965,14 @@ impl RuntimeCore {
         };
         match result {
             Ok(begin) => {
-                tracing::debug!(
+                let transfer_ready = self.coordinator().and_then(Coordinator::active).is_some();
+                tracing::info!(
                     event = "clipboard_handoff_started",
                     source_host = %begin.source_token.owner_host_id,
                     target_host = %begin.target_token.owner_host_id,
                     handoff_epoch = begin.handoff_id.handoff_epoch.get(),
                     ownership_epoch = begin.target_token.ownership_epoch.get(),
+                    transfer_ready,
                     "clipboard handoff started"
                 );
                 let target_process_session_id = self
@@ -1243,7 +1258,7 @@ impl RuntimeCore {
                 process_session_id,
                 baseline_generation,
             } => {
-                tracing::debug!(
+                tracing::info!(
                     event = "clipboard_target_prepared",
                     target_host = %target_token.owner_host_id,
                     handoff_epoch = handoff_id.handoff_epoch.get(),
@@ -1278,7 +1293,7 @@ impl RuntimeCore {
                 kind,
                 bytes,
             } => {
-                tracing::debug!(
+                tracing::info!(
                     event = "clipboard_snapshot_captured",
                     source_host = %source_token.owner_host_id,
                     handoff_epoch = handoff_id.handoff_epoch.get(),
@@ -1570,7 +1585,7 @@ fn trace_actor_skip(
     reason: ClipboardReason,
 ) {
     match command {
-        ActorCommand::StageSnapshot(stage) => tracing::debug!(
+        ActorCommand::StageSnapshot(stage) => tracing::info!(
             event = "clipboard_apply_skipped",
             handoff_epoch = stage.handoff_id.handoff_epoch.get(),
             snapshot_sequence = stage.snapshot_id.sequence.get(),
@@ -1580,7 +1595,7 @@ fn trace_actor_skip(
         ActorCommand::PublishSnapshot {
             handoff_id,
             snapshot_id,
-        } => tracing::debug!(
+        } => tracing::info!(
             event = "clipboard_snapshot_skipped",
             handoff_epoch = handoff_id.handoff_epoch.get(),
             snapshot_sequence = snapshot_id.sequence.get(),
@@ -1589,14 +1604,14 @@ fn trace_actor_skip(
         ),
         _ => {
             if let Some(handoff_id) = handoff_id {
-                tracing::debug!(
+                tracing::info!(
                     event = "clipboard_snapshot_skipped",
                     handoff_epoch = handoff_id.handoff_epoch.get(),
                     reason = reason.code(),
                     "clipboard actor work skipped"
                 );
             } else {
-                tracing::debug!(
+                tracing::info!(
                     event = "clipboard_snapshot_skipped",
                     reason = reason.code(),
                     "clipboard actor work skipped"
