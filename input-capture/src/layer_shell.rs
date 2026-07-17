@@ -25,7 +25,7 @@ use wayland_protocols::{
             zwp_keyboard_shortcuts_inhibitor_v1::ZwpKeyboardShortcutsInhibitorV1,
         },
         pointer_constraints::zv1::client::{
-            zwp_locked_pointer_v1::ZwpLockedPointerV1,
+            zwp_locked_pointer_v1::{self, ZwpLockedPointerV1},
             zwp_pointer_constraints_v1::{Lifetime, ZwpPointerConstraintsV1},
         },
         relative_pointer::zv1::client::{
@@ -45,7 +45,7 @@ use wayland_protocols_wlr::layer_shell::v1::client::{
 };
 
 use wayland_client::{
-    Connection, Dispatch, DispatchError, EventQueue, QueueHandle, WEnum,
+    Connection, Dispatch, DispatchError, EventQueue, Proxy, QueueHandle, WEnum,
     backend::{ReadEventsGuard, WaylandError},
     delegate_noop,
     globals::{Global, GlobalList, GlobalListContents, registry_queue_init},
@@ -117,6 +117,8 @@ struct State {
     pointer: Option<WlPointer>,
     keyboard: Option<WlKeyboard>,
     pointer_lock: Option<ZwpLockedPointerV1>,
+    pointer_lock_state: PointerLockState,
+    pending_begin: Option<Position>,
     rel_pointer: Option<ZwpRelativePointerV1>,
     shortcut_inhibitor: Option<ZwpKeyboardShortcutsInhibitorV1>,
     active_windows: Vec<Arc<Window>>,
@@ -130,6 +132,22 @@ struct State {
     pending_events: VecDeque<(Position, CaptureEvent)>,
     outputs: Vec<Output>,
     scroll_discrete_pending: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum PointerLockState {
+    #[default]
+    Released,
+    Pending,
+    Locked,
+}
+
+fn confirm_pointer_lock(
+    state: &mut PointerLockState,
+    pending_begin: &mut Option<Position>,
+) -> Option<Position> {
+    *state = PointerLockState::Locked;
+    pending_begin.take()
 }
 
 struct Inner {
@@ -328,6 +346,8 @@ impl LayerShellInputCapture {
                 xdg_output_manager,
             },
             pointer_lock: None,
+            pointer_lock_state: PointerLockState::Released,
+            pending_begin: None,
             rel_pointer: None,
             shortcut_inhibitor: None,
             active_windows: Vec::new(),
@@ -446,6 +466,7 @@ impl State {
 
         // lock pointer
         if self.pointer_lock.is_none() {
+            self.pointer_lock_state = PointerLockState::Pending;
             self.pointer_lock = Some(self.globals.pointer_constraints.lock_pointer(
                 surface,
                 pointer,
@@ -478,6 +499,29 @@ impl State {
         }
     }
 
+    fn begin_when_pointer_locked(&mut self, pos: Position) {
+        if self.pointer_lock_state == PointerLockState::Locked {
+            self.pending_events.push_back((pos, CaptureEvent::Begin));
+        } else {
+            self.pending_begin = Some(pos);
+        }
+    }
+
+    fn pointer_locked(&mut self) {
+        if let Some(pos) = confirm_pointer_lock(
+            &mut self.pointer_lock_state,
+            &mut self.pending_begin,
+        ) {
+            self.pending_events.push_back((pos, CaptureEvent::Begin));
+        }
+    }
+
+    fn current_pointer_lock(&self, pointer_lock: &ZwpLockedPointerV1) -> bool {
+        self.pointer_lock
+            .as_ref()
+            .is_some_and(|current| current.id() == pointer_lock.id())
+    }
+
     fn ungrab(&mut self) {
         // get focused client
         let window = match self.focused.as_ref() {
@@ -492,10 +536,11 @@ impl State {
         window.surface.commit();
 
         // destroy pointer lock
-        if let Some(pointer_lock) = &self.pointer_lock {
+        if let Some(pointer_lock) = self.pointer_lock.take() {
             pointer_lock.destroy();
-            self.pointer_lock = None;
         }
+        self.pointer_lock_state = PointerLockState::Released;
+        self.pending_begin = None;
 
         // destroy relative input
         if let Some(rel_pointer) = &self.rel_pointer {
@@ -525,7 +570,7 @@ impl State {
         };
         let qh = self.qh.clone();
         self.grab(&window.surface, &pointer, serial, &qh);
-        self.pending_events.push_back((pos, CaptureEvent::Begin));
+        self.begin_when_pointer_locked(pos);
         true
     }
 
@@ -637,6 +682,14 @@ impl Inner {
         }
         Ok(())
     }
+
+    fn roundtrip(&mut self) -> io::Result<()> {
+        self.state.read_guard.take();
+        self.queue
+            .roundtrip(&mut self.state)
+            .map_err(|error| io::Error::other(format!("Wayland roundtrip failed: {error}")))?;
+        self.prepare_read()
+    }
 }
 
 #[async_trait]
@@ -662,8 +715,17 @@ impl Capture for LayerShellInputCapture {
 
     async fn resume_if_focused(&mut self, pos: Position) -> Result<bool, CaptureError> {
         let inner = self.0.get_mut();
-        let resumed = inner.state.resume_if_focused(pos);
+        if !inner.state.resume_if_focused(pos) {
+            return Ok(false);
+        }
         inner.flush_events()?;
+        inner.roundtrip()?;
+        let resumed = inner.state.pointer_lock_state == PointerLockState::Locked;
+        if !resumed {
+            log::warn!("Wayland pointer lock was not confirmed while resuming {pos} capture");
+            inner.state.ungrab();
+            inner.flush_events()?;
+        }
         Ok(resumed)
     }
 
@@ -786,7 +848,7 @@ impl Dispatch<WlPointer, ()> for State {
                     .find(|w| w.surface == surface)
                     .map(|w| w.pos)
                     .unwrap();
-                app.pending_events.push_back((pos, CaptureEvent::Begin));
+                app.begin_when_pointer_locked(pos);
             }
             wl_pointer::Event::Leave { .. } => {
                 let retreated_pos = app.focused.as_ref().map(|window| window.pos);
@@ -943,6 +1005,37 @@ impl Dispatch<ZwpRelativePointerV1, ()> for State {
     }
 }
 
+impl Dispatch<ZwpLockedPointerV1, ()> for State {
+    fn event(
+        app: &mut Self,
+        pointer_lock: &ZwpLockedPointerV1,
+        event: zwp_locked_pointer_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if !app.current_pointer_lock(pointer_lock) {
+            return;
+        }
+        match event {
+            zwp_locked_pointer_v1::Event::Locked => app.pointer_locked(),
+            zwp_locked_pointer_v1::Event::Unlocked => {
+                let lost_pos = app.focused.as_ref().map(|window| window.pos);
+                log::warn!("Wayland pointer lock was lost");
+                app.ungrab();
+                if let Some(pos) = lost_pos {
+                    app.pending_events.retain(|(queued_pos, event)| {
+                        *queued_pos != pos || *event != CaptureEvent::Begin
+                    });
+                    app.pending_events
+                        .push_back((pos, CaptureEvent::EdgeRetreated));
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 impl Dispatch<ZwlrLayerSurfaceV1, ()> for State {
     fn event(
         app: &mut Self,
@@ -1072,7 +1165,6 @@ delegate_noop!(State: ignore wl_shm::WlShm);
 delegate_noop!(State: ignore wl_buffer::WlBuffer);
 delegate_noop!(State: ignore WlSurface);
 delegate_noop!(State: ignore ZwpKeyboardShortcutsInhibitorV1);
-delegate_noop!(State: ignore ZwpLockedPointerV1);
 
 #[cfg(test)]
 mod tests {
@@ -1083,5 +1175,17 @@ mod tests {
         assert!(same_focused_edge(Some(Position::Left), Position::Left));
         assert!(!same_focused_edge(Some(Position::Left), Position::Right));
         assert!(!same_focused_edge(None, Position::Left));
+    }
+
+    #[test]
+    fn capture_begin_waits_for_pointer_lock_confirmation() {
+        let mut state = PointerLockState::Pending;
+        let mut pending_begin = Some(Position::Right);
+
+        let confirmed = confirm_pointer_lock(&mut state, &mut pending_begin);
+
+        assert_eq!(state, PointerLockState::Locked);
+        assert_eq!(confirmed, Some(Position::Right));
+        assert_eq!(pending_begin, None);
     }
 }

@@ -65,6 +65,7 @@ pub(crate) enum ICaptureEvent {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum CaptureReleaseReason {
+    LocalCaptureLost,
     PeerLeft,
     PeerReadinessLost,
     PeerReleaseRequested,
@@ -76,6 +77,7 @@ pub(crate) enum CaptureReleaseReason {
 impl CaptureReleaseReason {
     pub(crate) const fn failure_reason(self) -> Option<&'static str> {
         match self {
+            Self::LocalCaptureLost => Some("local_pointer_capture_lost"),
             Self::PeerReadinessLost => Some("peer_readiness_lost_during_capture"),
             Self::TransportFailed => Some("peer_transport_failed_during_capture"),
             Self::PeerLeft
@@ -484,6 +486,12 @@ impl CaptureTask {
         log::trace!("({handle}): {event:?}");
 
         if event == CaptureEvent::EdgeRetreated {
+            if self.active_client == Some(handle) {
+                log::warn!("releasing capture: local pointer capture was lost");
+                return self
+                    .release_capture(capture, CaptureReleaseReason::LocalCaptureLost)
+                    .await;
+            }
             self.event_tx
                 .send(ICaptureEvent::EdgeRetreated(handle))
                 .expect("channel closed");
@@ -798,6 +806,10 @@ mod tests {
     fn only_failed_capture_releases_request_a_notification() {
         assert_eq!(CaptureReleaseReason::PeerLeft.failure_reason(), None);
         assert_eq!(CaptureReleaseReason::ReleaseBind.failure_reason(), None);
+        assert_eq!(
+            CaptureReleaseReason::LocalCaptureLost.failure_reason(),
+            Some("local_pointer_capture_lost")
+        );
         assert_eq!(
             CaptureReleaseReason::PeerReadinessLost.failure_reason(),
             Some("peer_readiness_lost_during_capture")
