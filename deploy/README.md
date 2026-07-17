@@ -8,20 +8,20 @@ ansible-galaxy collection install ansible.windows community.general
 ```
 
 **On the Windows host, once, before this playbook can reach it at all:**
-Enable OpenSSH Server and install Git, rustup, PowerShell 7, and Visual Studio
-Build Tools with the MSVC x64 component. The playbook installs its selected
-Rust toolchain only when the native `rustc.exe` is absent, then builds the
-no-GTK executable on Windows itself.
+Enable OpenSSH Server and install PowerShell 7. Native-build mode additionally
+requires Git, rustup, and Visual Studio Build Tools with the MSVC x64
+component. The playbook installs its selected Rust toolchain only when the
+native `rustc.exe` is absent.
 
 **On macOS:**
-Install Xcode command-line tools and Homebrew rustup. The playbook installs its
-selected Rust toolchain only when the native `rustc` is absent, then builds the
-no-GTK executable natively.
+Install the Xcode command-line tools. Native-build mode additionally requires
+Homebrew rustup. The playbook installs its selected Rust toolchain only when
+the native `rustc` is absent.
 
 **Edit before running:**
 - `inventory.ini` — real hostnames, IPs, users.
 - `group_vars/all.yml` — TV address, HDMI mapping, server host, fingerprints,
-  controller timeouts, and native build features.
+  controller timeouts, install method, and native build features.
 - Windows SSH credentials — keep them in Ansible Vault or pass them as extra
   variables instead of committing new plaintext credentials.
 - The sibling `../../lan-mouse` checkout is the source deployed by the
@@ -32,13 +32,28 @@ Run:
 ansible-playbook -i inventory.ini playbook.yml
 ```
 
-The first play creates a git bundle from the local checkout, a locked Cargo
-vendor tree and ZIP under `/tmp`, and a persistent controller token under
-`~/.local/state/lan-mouse-deploy/`. `--limit localhost` runs only that artifact
-preparation play; it does not deploy or restart any host. The vendor tree needs
-roughly 640 MiB with the current lockfile, plus its archive and Cargo cache.
-After artifact preparation, Linux, macOS, and Windows run their native test,
-build, install, and service-restart sequences concurrently.
+The default `lan_mouse_install_method: native_build` preserves the existing
+local-checkout build. To deploy no-GTK binaries from a public GitHub Release
+instead, set the repository and select either `latest` or a release tag:
+
+```yaml
+lan_mouse_install_method: github_release
+lan_mouse_github_repository: owner/lan-mouse
+lan_mouse_github_release_tag: latest
+```
+
+Release mode downloads the matching Linux, macOS, or Windows asset directly on
+each host. It does not copy source, vendor Lan Mouse dependencies, or build Lan
+Mouse. The macOS host still re-signs the downloaded binary with its stable local
+identity so the existing Accessibility grant remains valid.
+
+The first play always prepares the persistent controller token under
+`~/.local/state/lan-mouse-deploy/`. In native-build mode it also creates a git
+bundle from the local checkout and a locked Cargo vendor archive under `/tmp`.
+`--limit localhost` runs only that preparation play; it does not deploy or
+restart any host. The native-build vendor tree needs roughly 640 MiB with the
+current lockfile, plus its archive and Cargo cache. Linux, macOS, and Windows
+then run their selected install and service-restart sequences concurrently.
 
 ## After running (one-time manual steps)
 
@@ -65,7 +80,8 @@ build, install, and service-restart sequences concurrently.
 - Windows runs the native daemon through `LanMouseDaemon`; bounded persistent
   logs are under `%LOCALAPPDATA%\lan-mouse\logs` with five 10 MiB backups.
 
-Every run replaces the build source and builds and installs it on all three
-hosts against the same locked vendor archive. The GTK workspace member is
-excluded, and no release archive, legacy `enter_hook`, or compatibility
+Native-build runs replace the build source and build all three hosts against
+the same locked vendor archive. GitHub-release runs install the selected
+release assets without a native Lan Mouse build. In both modes the GTK
+workspace member is excluded and no legacy `enter_hook` or compatibility
 protocol is used.

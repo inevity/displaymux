@@ -2,9 +2,9 @@
 # lan-mouse + tv-multiview daemon deployment
 # Run from the Arch box: ansible-playbook -i inventory.ini playbook.yml
 #
-# The control host packages the local checkout and one Cargo.lock vendor set.
-# Linux, macOS, and Windows replace their build source, then test, build, and
-# install it natively without GTK or live crates.io access.
+# In native_build mode, the control host packages the local checkout and one
+# Cargo.lock vendor set. In github_release mode, every host downloads its
+# native no-GTK GitHub Release asset and skips the Lan Mouse source build.
 #
 # Control-node prerequisites (not handled by this playbook):
 #   ansible-galaxy collection install ansible.windows community.general
@@ -16,7 +16,7 @@
 #   - macOS: disable lock screen password (Lock Screen > Require
 #     password: Never). Remote input can't unlock macOS.
 
-- name: Prepare lan-mouse source and dependency artifacts
+- name: Prepare deployment inputs
   hosts: localhost
   connection: local
   gather_facts: false
@@ -25,33 +25,53 @@
     vendor_dir: "/tmp/lan-mouse-vendor-{{ lan_mouse_cargo_lock_sha256[:12] }}"
     vendor_archive: "/tmp/lan-mouse-vendor-{{ lan_mouse_cargo_lock_sha256[:12] }}.zip"
   tasks:
+    - name: Validate Lan Mouse installation method
+      ansible.builtin.assert:
+        that: lan_mouse_install_method in ['native_build', 'github_release']
+        fail_msg: >-
+          lan_mouse_install_method must be native_build or github_release,
+          not {{ lan_mouse_install_method }}
+
+    - name: Require a GitHub repository for release deployment
+      ansible.builtin.assert:
+        that: lan_mouse_github_repository | trim | length > 0
+        fail_msg: >-
+          Set lan_mouse_github_repository to owner/repository when using
+          lan_mouse_install_method=github_release.
+      when: lan_mouse_install_method == 'github_release'
+
     - name: Read locked Cargo lock hash
       ansible.builtin.command:
         argv: [sha256sum, Cargo.lock]
         chdir: "{{ lan_mouse_source_path }}"
       register: local_cargo_lock_hash
       changed_when: false
+      when: lan_mouse_install_method == 'native_build'
 
     - name: Validate locked Cargo lock identity
       ansible.builtin.assert:
         that: local_cargo_lock_hash.stdout.split()[0] == lan_mouse_cargo_lock_sha256
         fail_msg: "Cargo.lock does not match {{ lan_mouse_cargo_lock_sha256 }}"
+      when: lan_mouse_install_method == 'native_build'
 
     - name: Remove the previous local source bundle
       ansible.builtin.file:
         path: "{{ source_bundle }}"
         state: absent
+      when: lan_mouse_install_method == 'native_build'
 
     - name: Create the current local source bundle
       ansible.builtin.command:
         argv: [git, bundle, create, "{{ source_bundle }}", HEAD]
         chdir: "{{ lan_mouse_source_path }}"
       changed_when: true
+      when: lan_mouse_install_method == 'native_build'
 
     - name: Check locked vendor archive
       ansible.builtin.stat:
         path: "{{ vendor_archive }}"
       register: vendor_archive_stat
+      when: lan_mouse_install_method == 'native_build'
 
     - name: Generate locked versioned Cargo vendor tree
       ansible.builtin.command:
@@ -64,7 +84,9 @@
           - "{{ lan_mouse_source_path }}/Cargo.toml"
           - "{{ vendor_dir }}"
       no_log: true
-      when: not vendor_archive_stat.stat.exists
+      when:
+        - lan_mouse_install_method == 'native_build'
+        - not vendor_archive_stat.stat.exists
 
     - name: Archive Cargo vendor tree for native hosts
       ansible.builtin.command:
@@ -77,12 +99,14 @@
           - /tmp
           - "lan-mouse-vendor-{{ lan_mouse_cargo_lock_sha256[:12] }}"
         creates: "{{ vendor_archive }}"
+      when: lan_mouse_install_method == 'native_build'
 
     - name: Verify Cargo vendor archive
       ansible.builtin.command:
         argv: [bsdtar, -tf, "{{ vendor_archive }}"]
       changed_when: false
       no_log: true
+      when: lan_mouse_install_method == 'native_build'
 
     - name: Ensure controller-token state directory exists
       ansible.builtin.file:

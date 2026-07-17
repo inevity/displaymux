@@ -21,18 +21,21 @@
     - "{{ lan_mouse_build_cache }}"
     - "{{ ansible_facts.env.HOME }}/.cache/lan-mouse-pkgbuild"
     - "{{ lan_mouse_linux_cargo_home }}"
+  when: lan_mouse_install_method == 'native_build'
 
 - name: Copy source bundle to Linux build cache
   ansible.builtin.copy:
     src: "{{ source_bundle }}"
     dest: "{{ lan_mouse_build_cache }}/source.bundle"
     mode: "0644"
+  when: lan_mouse_install_method == 'native_build'
 
 - name: Copy locked vendor archive to Linux build cache
   ansible.builtin.copy:
     src: "{{ vendor_archive }}"
     dest: "{{ lan_mouse_build_cache }}/vendor.zip"
     mode: "0644"
+  when: lan_mouse_install_method == 'native_build'
 
 - name: Extract locked Cargo vendor tree on Linux
   ansible.builtin.unarchive:
@@ -40,11 +43,13 @@
     dest: "{{ lan_mouse_build_cache }}"
     remote_src: true
     creates: "{{ lan_mouse_linux_vendor_dir }}"
+  when: lan_mouse_install_method == 'native_build'
 
 - name: Remove previous lan-mouse source on Linux
   ansible.builtin.file:
     path: "{{ lan_mouse_linux_source_dir }}"
     state: absent
+  when: lan_mouse_install_method == 'native_build'
 
 - name: Deploy lan-mouse source on Linux
   ansible.builtin.command:
@@ -53,11 +58,13 @@
       - clone
       - "{{ lan_mouse_build_cache }}/source.bundle"
       - "{{ lan_mouse_linux_source_dir }}"
+  when: lan_mouse_install_method == 'native_build'
 
 - name: Record source repository origin on Linux
   ansible.builtin.command:
     argv: [git, -C, "{{ lan_mouse_linux_source_dir }}", remote, set-url, origin, "{{ lan_mouse_repo_url }}"]
   changed_when: false
+  when: lan_mouse_install_method == 'native_build'
 
 - name: Configure locked offline Cargo source on Linux
   ansible.builtin.template:
@@ -66,12 +73,14 @@
     mode: "0644"
   vars:
     cargo_vendor_path: "{{ lan_mouse_linux_vendor_dir }}"
+  when: lan_mouse_install_method == 'native_build'
 
 - name: Template PKGBUILD for no-GTK source
   ansible.builtin.template:
     src: templates/lan-mouse-git-PKGBUILD.j2
     dest: "{{ ansible_facts.env.HOME }}/.cache/lan-mouse-pkgbuild/PKGBUILD"
     mode: "0644"
+  when: lan_mouse_install_method == 'native_build'
 
 - name: Build, test, and install lan-mouse on Linux
   block:
@@ -106,12 +115,64 @@
           - --noconfirm
           - "{{ (linux_packages.files | sort(attribute='mtime') | last).path }}"
       changed_when: true
+  when: lan_mouse_install_method == 'native_build'
 
 - name: Ensure ~/.local/bin exists
   ansible.builtin.file:
     path: "{{ ansible_facts.env.HOME }}/.local/bin"
     state: directory
     mode: "0755"
+
+- name: Install no-GTK Linux GitHub Release asset
+  when: lan_mouse_install_method == 'github_release'
+  vars:
+    linux_release_arch: >-
+      {{ {'x86_64': 'x86_64', 'aarch64': 'aarch64'}.get(ansible_facts.architecture, '') }}
+    linux_release_asset: "lan-mouse-no-gtk-linux-{{ linux_release_arch }}"
+    linux_release_archive: "{{ linux_release_asset }}.tar.gz"
+    github_release_path: >-
+      {{ 'latest/download' if lan_mouse_github_release_tag == 'latest'
+         else 'download/' ~ lan_mouse_github_release_tag }}
+  block:
+    - name: Require a supported Linux release architecture
+      ansible.builtin.assert:
+        that: linux_release_arch | length > 0
+        fail_msg: >-
+          No no-GTK Linux release asset is defined for
+          {{ ansible_facts.architecture }}.
+
+    - name: Ensure Linux release cache exists
+      ansible.builtin.file:
+        path: "{{ lan_mouse_build_cache }}"
+        state: directory
+        mode: "0755"
+
+    - name: Download no-GTK Linux release archive
+      ansible.builtin.get_url:
+        url: >-
+          https://github.com/{{ lan_mouse_github_repository }}/releases/{{
+          github_release_path }}/{{ linux_release_archive }}
+        dest: "{{ lan_mouse_build_cache }}/{{ linux_release_archive }}"
+        mode: "0644"
+        force: true
+
+    - name: Remove previous extracted Linux release
+      ansible.builtin.file:
+        path: "{{ lan_mouse_build_cache }}/{{ linux_release_asset }}"
+        state: absent
+
+    - name: Extract no-GTK Linux release archive
+      ansible.builtin.unarchive:
+        src: "{{ lan_mouse_build_cache }}/{{ linux_release_archive }}"
+        dest: "{{ lan_mouse_build_cache }}"
+        remote_src: true
+
+    - name: Install no-GTK Linux release binary
+      ansible.builtin.copy:
+        src: "{{ lan_mouse_build_cache }}/{{ linux_release_asset }}/lan-mouse"
+        dest: "{{ ansible_facts.env.HOME }}/.local/bin/lan-mouse"
+        remote_src: true
+        mode: "0755"
 
 - name: Test tv-multiview daemon
   ansible.builtin.command:
@@ -205,7 +266,10 @@
     dest: "{{ ansible_facts.env.HOME }}/.config/systemd/user/lan-mouse.service"
     mode: "0644"
   vars:
-    lan_mouse_binary: "/usr/bin/lan-mouse"
+    lan_mouse_binary: >-
+      {{ '/usr/bin/lan-mouse'
+         if lan_mouse_install_method == 'native_build'
+         else ansible_facts.env.HOME ~ '/.local/bin/lan-mouse' }}
   register: lm_service_template
 
 - name: Deploy tv-multiview systemd user unit

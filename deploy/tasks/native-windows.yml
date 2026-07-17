@@ -16,6 +16,7 @@
     creates: >-
       {{ ansible_facts.env.USERPROFILE }}\.rustup\toolchains\{{ lan_mouse_rust_toolchain
       }}-x86_64-pc-windows-msvc\bin\rustc.exe
+  when: lan_mouse_install_method == 'native_build'
 
 - name: Locate Windows MSVC x64 Build Tools
   ansible.windows.win_shell: |
@@ -26,6 +27,7 @@
     Write-Output $installation
   register: win_vs_installation
   changed_when: false
+  when: lan_mouse_install_method == 'native_build'
 
 - name: Locate PowerShell 7 for bounded log wrapper
   ansible.windows.win_shell: |
@@ -38,38 +40,45 @@
   ansible.windows.win_copy:
     src: "{{ source_bundle }}"
     dest: "{{ win_build_cache }}\\source.bundle"
+  when: lan_mouse_install_method == 'native_build'
 
 - name: Copy locked vendor archive to Windows
   ansible.windows.win_copy:
     src: "{{ vendor_archive }}"
     dest: "{{ win_build_cache }}\\vendor.zip"
+  when: lan_mouse_install_method == 'native_build'
 
 - name: Extract locked Cargo vendor tree on Windows
   ansible.windows.win_shell: |
     Expand-Archive -Path "{{ win_build_cache }}\vendor.zip" -DestinationPath "{{ win_build_cache }}" -Force
   args:
     creates: "{{ win_vendor_dir }}"
+  when: lan_mouse_install_method == 'native_build'
 
 - name: Remove previous lan-mouse source on Windows
   ansible.windows.win_file:
     path: "{{ win_source_dir }}"
     state: absent
+  when: lan_mouse_install_method == 'native_build'
 
 - name: Deploy lan-mouse source on Windows
   ansible.windows.win_shell: |
     git clone "{{ win_build_cache }}\source.bundle" "{{ win_source_dir }}"
     exit $LASTEXITCODE
+  when: lan_mouse_install_method == 'native_build'
 
 - name: Record source repository origin on Windows
   ansible.windows.win_shell: |
     git -C "{{ win_source_dir }}" remote set-url origin "{{ lan_mouse_repo_url }}"
     exit $LASTEXITCODE
   changed_when: false
+  when: lan_mouse_install_method == 'native_build'
 
 - name: Ensure checkout-local Cargo config directory exists on Windows
   ansible.windows.win_file:
     path: "{{ win_source_dir }}\\.cargo"
     state: directory
+  when: lan_mouse_install_method == 'native_build'
 
 - name: Configure locked offline Cargo source on Windows
   ansible.windows.win_template:
@@ -77,6 +86,7 @@
     dest: "{{ win_source_dir }}\\.cargo\\config.toml"
   vars:
     cargo_vendor_path: "{{ win_vendor_dir }}"
+  when: lan_mouse_install_method == 'native_build'
 
 - name: Verify Windows offline dependency resolution
   ansible.windows.win_shell: |
@@ -86,6 +96,7 @@
   args:
     chdir: "{{ win_source_dir }}"
   changed_when: false
+  when: lan_mouse_install_method == 'native_build'
 
 - name: Build and test lan-mouse natively on Windows
   block:
@@ -120,70 +131,107 @@
       changed_when: true
       async: 3600
       poll: 5
+  when: lan_mouse_install_method == 'native_build'
 
-    - name: Require built Windows release artifact before stopping the daemon
-      ansible.windows.win_stat:
-        path: '{{ win_target_dir }}\release\lan-mouse.exe'
-      register: win_release_artifact
+- name: Select native Windows release candidate
+  ansible.builtin.set_fact:
+    win_release_candidate: "{{ win_target_dir }}\\release\\lan-mouse.exe"
+  when: lan_mouse_install_method == 'native_build'
 
-    - name: Validate built Windows release artifact
-      ansible.builtin.assert:
-        that:
-          - win_release_artifact.stat.exists
-          - win_release_artifact.stat.size | int > 0
+- name: Download no-GTK Windows GitHub Release asset
+  when: lan_mouse_install_method == 'github_release'
+  vars:
+    win_release_asset: lan-mouse-no-gtk-windows-x86_64
+    win_release_archive: "{{ win_release_asset }}.zip"
+    win_release_extract_dir: "{{ win_build_cache }}\\release-artifact"
+    github_release_path: >-
+      {{ 'latest/download' if lan_mouse_github_release_tag == 'latest'
+         else 'download/' ~ lan_mouse_github_release_tag }}
+  block:
+    - name: Download no-GTK Windows release archive
+      ansible.windows.win_get_url:
+        url: >-
+          https://github.com/{{ lan_mouse_github_repository }}/releases/{{
+          github_release_path }}/{{ win_release_archive }}
+        dest: "{{ win_build_cache }}\\{{ win_release_archive }}"
+        force: true
 
-    - name: Check Windows interactive desktop before binary replacement
+    - name: Remove previous extracted Windows release
+      ansible.windows.win_file:
+        path: "{{ win_release_extract_dir }}"
+        state: absent
+
+    - name: Extract no-GTK Windows release archive
       ansible.windows.win_shell: |
-        $targetUser = "{{ ansible_user }}"
-        $active = Get-CimInstance Win32_Process -Filter "Name = 'explorer.exe'" |
-          ForEach-Object {
-            $owner = Invoke-CimMethod -InputObject $_ -MethodName GetOwner
-            if ($owner.User -ieq $targetUser) { $true }
-          }
-        if ($active -contains $true) { Write-Output "active" }
-      register: win_interactive_before_replace
-      changed_when: false
+        Expand-Archive -Path "{{ win_build_cache }}\{{ win_release_archive }}" -DestinationPath "{{ win_release_extract_dir }}" -Force
 
-    - name: Check existing Windows lan-mouse process before binary replacement
-      ansible.windows.win_shell: |
-        $expected = [System.IO.Path]::GetFullPath("{{ win_installed_binary }}")
-        $process = Get-CimInstance Win32_Process -Filter "Name = 'lan-mouse.exe'" |
-          Where-Object { $_.ExecutablePath -and [System.IO.Path]::GetFullPath($_.ExecutablePath) -eq $expected }
-        if ($process) { Write-Output "running" }
-      register: win_process_before_replace
-      changed_when: false
+    - name: Select downloaded Windows release candidate
+      ansible.builtin.set_fact:
+        win_release_candidate: "{{ win_release_extract_dir }}\\lan-mouse.exe"
 
-    - name: Require a replacement desktop before stopping a running Windows daemon
-      ansible.builtin.assert:
-        that:
-          - "'running' not in win_process_before_replace.stdout or 'active' in win_interactive_before_replace.stdout"
-        fail_msg: >-
-          Refusing to stop the running Windows lan-mouse daemon because the deployment user
-          has no interactive desktop in which the replacement process can start.
+- name: Require Windows release candidate before stopping the daemon
+  ansible.windows.win_stat:
+    path: "{{ win_release_candidate }}"
+  register: win_release_artifact
 
-    - name: Stop existing lan-mouse scheduled task before binary replacement
-      ansible.windows.win_shell: |
-        schtasks /end /tn LanMouseDaemon 2>$null | Out-Null
-        $expected = [System.IO.Path]::GetFullPath("{{ win_installed_binary }}")
-        $processes = Get-CimInstance Win32_Process -Filter "Name = 'lan-mouse.exe'" |
-          Where-Object { $_.ExecutablePath -and [System.IO.Path]::GetFullPath($_.ExecutablePath) -eq $expected }
-        $processes | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction Stop }
+- name: Validate Windows release candidate
+  ansible.builtin.assert:
+    that:
+      - win_release_artifact.stat.exists
+      - win_release_artifact.stat.size | int > 0
 
-        $deadline = (Get-Date).AddSeconds(10)
-        do {
-          $remaining = Get-CimInstance Win32_Process -Filter "Name = 'lan-mouse.exe'" |
-            Where-Object { $_.ExecutablePath -and [System.IO.Path]::GetFullPath($_.ExecutablePath) -eq $expected }
-          if (-not $remaining) { break }
-          Start-Sleep -Milliseconds 100
-        } while ((Get-Date) -lt $deadline)
-        if ($remaining) { throw "lan-mouse.exe did not stop before replacement" }
-      changed_when: false
+- name: Check Windows interactive desktop before binary replacement
+  ansible.windows.win_shell: |
+    $targetUser = "{{ ansible_user }}"
+    $active = Get-CimInstance Win32_Process -Filter "Name = 'explorer.exe'" |
+      ForEach-Object {
+        $owner = Invoke-CimMethod -InputObject $_ -MethodName GetOwner
+        if ($owner.User -ieq $targetUser) { $true }
+      }
+    if ($active -contains $true) { Write-Output "active" }
+  register: win_interactive_before_replace
+  changed_when: false
 
-    - name: Install only the Windows daemon executable
-      ansible.windows.win_copy:
-        src: "{{ win_target_dir }}\\release\\lan-mouse.exe"
-        dest: "{{ win_installed_binary }}"
-        remote_src: true
+- name: Check existing Windows lan-mouse process before binary replacement
+  ansible.windows.win_shell: |
+    $expected = [System.IO.Path]::GetFullPath("{{ win_installed_binary }}")
+    $process = Get-CimInstance Win32_Process -Filter "Name = 'lan-mouse.exe'" |
+      Where-Object { $_.ExecutablePath -and [System.IO.Path]::GetFullPath($_.ExecutablePath) -eq $expected }
+    if ($process) { Write-Output "running" }
+  register: win_process_before_replace
+  changed_when: false
+
+- name: Require a replacement desktop before stopping a running Windows daemon
+  ansible.builtin.assert:
+    that:
+      - "'running' not in win_process_before_replace.stdout or 'active' in win_interactive_before_replace.stdout"
+    fail_msg: >-
+      Refusing to stop the running Windows lan-mouse daemon because the deployment user
+      has no interactive desktop in which the replacement process can start.
+
+- name: Stop existing lan-mouse scheduled task before binary replacement
+  ansible.windows.win_shell: |
+    schtasks /end /tn LanMouseDaemon 2>$null | Out-Null
+    $expected = [System.IO.Path]::GetFullPath("{{ win_installed_binary }}")
+    $processes = Get-CimInstance Win32_Process -Filter "Name = 'lan-mouse.exe'" |
+      Where-Object { $_.ExecutablePath -and [System.IO.Path]::GetFullPath($_.ExecutablePath) -eq $expected }
+    $processes | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction Stop }
+
+    $deadline = (Get-Date).AddSeconds(10)
+    do {
+      $remaining = Get-CimInstance Win32_Process -Filter "Name = 'lan-mouse.exe'" |
+        Where-Object { $_.ExecutablePath -and [System.IO.Path]::GetFullPath($_.ExecutablePath) -eq $expected }
+      if (-not $remaining) { break }
+      Start-Sleep -Milliseconds 100
+    } while ((Get-Date) -lt $deadline)
+    if ($remaining) { throw "lan-mouse.exe did not stop before replacement" }
+  changed_when: false
+
+- name: Install only the Windows daemon executable
+  ansible.windows.win_copy:
+    src: "{{ win_release_candidate }}"
+    dest: "{{ win_installed_binary }}"
+    remote_src: true
 
 - name: Add Linux host to Windows hosts file
   ansible.windows.win_shell: |

@@ -18,6 +18,7 @@
       {{ ansible_facts.env.HOME }}/.rustup/toolchains/{{ lan_mouse_rust_toolchain }}-{{
       'aarch64' if ansible_facts.architecture == 'arm64' else ansible_facts.architecture
       }}-apple-darwin/bin/rustc
+  when: lan_mouse_install_method == 'native_build'
 
 - name: Check persistent macOS code-signing identity
   ansible.builtin.command:
@@ -99,24 +100,28 @@
   ansible.builtin.set_fact:
     mac_cargo_profile: "{{ 'dev' if lan_mouse_macos_build_profile == 'debug' else 'release' }}"
     mac_target_profile_dir: "{{ 'debug' if lan_mouse_macos_build_profile == 'debug' else 'release' }}"
+  when: lan_mouse_install_method == 'native_build'
 
 - name: Resolve selected macOS Cargo path
   ansible.builtin.command:
     argv: [/usr/local/bin/rustup, which, --toolchain, "{{ lan_mouse_rust_toolchain }}", cargo]
   register: mac_cargo
   changed_when: false
+  when: lan_mouse_install_method == 'native_build'
 
 - name: Copy source bundle to macOS
   ansible.builtin.copy:
     src: "{{ source_bundle }}"
     dest: "{{ mac_build_cache }}/source.bundle"
     mode: "0644"
+  when: lan_mouse_install_method == 'native_build'
 
 - name: Copy locked vendor archive to macOS
   ansible.builtin.copy:
     src: "{{ vendor_archive }}"
     dest: "{{ mac_build_cache }}/vendor.zip"
     mode: "0644"
+  when: lan_mouse_install_method == 'native_build'
 
 - name: Extract locked Cargo vendor tree on macOS
   ansible.builtin.unarchive:
@@ -124,11 +129,13 @@
     dest: "{{ mac_build_cache }}"
     remote_src: true
     creates: "{{ mac_vendor_dir }}"
+  when: lan_mouse_install_method == 'native_build'
 
 - name: Remove previous lan-mouse source on macOS
   ansible.builtin.file:
     path: "{{ mac_source_dir }}"
     state: absent
+  when: lan_mouse_install_method == 'native_build'
 
 - name: Deploy lan-mouse source on macOS
   ansible.builtin.command:
@@ -137,17 +144,20 @@
       - clone
       - "{{ mac_build_cache }}/source.bundle"
       - "{{ mac_source_dir }}"
+  when: lan_mouse_install_method == 'native_build'
 
 - name: Record source repository origin on macOS
   ansible.builtin.command:
     argv: [git, -C, "{{ mac_source_dir }}", remote, set-url, origin, "{{ lan_mouse_repo_url }}"]
   changed_when: false
+  when: lan_mouse_install_method == 'native_build'
 
 - name: Ensure checkout-local Cargo config directory exists on macOS
   ansible.builtin.file:
     path: "{{ mac_source_dir }}/.cargo"
     state: directory
     mode: "0755"
+  when: lan_mouse_install_method == 'native_build'
 
 - name: Configure locked offline Cargo source on macOS
   ansible.builtin.template:
@@ -156,6 +166,7 @@
     mode: "0644"
   vars:
     cargo_vendor_path: "{{ mac_vendor_dir }}"
+  when: lan_mouse_install_method == 'native_build'
 
 - name: Test and build lan-mouse natively on macOS
   environment:
@@ -193,43 +204,93 @@
       changed_when: true
       async: 3600
       poll: 5
+  when: lan_mouse_install_method == 'native_build'
 
-    - name: Sign macOS daemon with persistent identity
-      ansible.builtin.command:
-        argv:
-          - codesign
-          - --force
-          - --sign
-          - "{{ lan_mouse_macos_codesign_identity }}"
-          - --identifier
-          - "{{ lan_mouse_macos_codesign_identifier }}"
-          - "{{ mac_target_dir }}/{{ mac_target_profile_dir }}/lan-mouse"
-      changed_when: true
+- name: Select native macOS release candidate
+  ansible.builtin.set_fact:
+    mac_release_candidate: "{{ mac_target_dir }}/{{ mac_target_profile_dir }}/lan-mouse"
+  when: lan_mouse_install_method == 'native_build'
 
-    - name: Inspect persistent macOS designated requirement
-      ansible.builtin.command:
-        argv:
-          - codesign
-          - -d
-          - --requirements
-          - '-'
-          - "{{ mac_target_dir }}/{{ mac_target_profile_dir }}/lan-mouse"
-      register: mac_designated_requirement
-      changed_when: false
-      failed_when: >-
-        mac_designated_requirement.rc != 0
-        or 'cdhash' in ((mac_designated_requirement.stdout | default(''))
-                        ~ (mac_designated_requirement.stderr | default('')))
-        or lan_mouse_macos_codesign_identifier
-           not in ((mac_designated_requirement.stdout | default(''))
-                   ~ (mac_designated_requirement.stderr | default('')))
+- name: Download no-GTK macOS GitHub Release asset
+  when: lan_mouse_install_method == 'github_release'
+  vars:
+    mac_release_arch: >-
+      {{ {'arm64': 'aarch64', 'aarch64': 'aarch64', 'x86_64': 'x86_64'}.get(
+         ansible_facts.architecture, '') }}
+    mac_release_asset: "lan-mouse-no-gtk-macos-{{ mac_release_arch }}"
+    mac_release_archive: "{{ mac_release_asset }}.zip"
+    github_release_path: >-
+      {{ 'latest/download' if lan_mouse_github_release_tag == 'latest'
+         else 'download/' ~ lan_mouse_github_release_tag }}
+  block:
+    - name: Require a supported macOS release architecture
+      ansible.builtin.assert:
+        that: mac_release_arch | length > 0
+        fail_msg: >-
+          No no-GTK macOS release asset is defined for
+          {{ ansible_facts.architecture }}.
 
-    - name: Install stable macOS daemon binary
-      ansible.builtin.copy:
-        src: "{{ mac_target_dir }}/{{ mac_target_profile_dir }}/lan-mouse"
-        dest: "{{ mac_installed_binary }}"
+    - name: Download no-GTK macOS release archive
+      ansible.builtin.get_url:
+        url: >-
+          https://github.com/{{ lan_mouse_github_repository }}/releases/{{
+          github_release_path }}/{{ mac_release_archive }}
+        dest: "{{ mac_build_cache }}/{{ mac_release_archive }}"
+        mode: "0644"
+        force: true
+
+    - name: Remove previous extracted macOS release
+      ansible.builtin.file:
+        path: "{{ mac_build_cache }}/{{ mac_release_asset }}"
+        state: absent
+
+    - name: Extract no-GTK macOS release archive
+      ansible.builtin.unarchive:
+        src: "{{ mac_build_cache }}/{{ mac_release_archive }}"
+        dest: "{{ mac_build_cache }}"
         remote_src: true
-        mode: "0755"
+
+    - name: Select downloaded macOS release candidate
+      ansible.builtin.set_fact:
+        mac_release_candidate: >-
+          {{ mac_build_cache }}/{{ mac_release_asset }}/lan-mouse
+
+- name: Sign macOS daemon with persistent identity
+  ansible.builtin.command:
+    argv:
+      - codesign
+      - --force
+      - --sign
+      - "{{ lan_mouse_macos_codesign_identity }}"
+      - --identifier
+      - "{{ lan_mouse_macos_codesign_identifier }}"
+      - "{{ mac_release_candidate }}"
+  changed_when: true
+
+- name: Inspect persistent macOS designated requirement
+  ansible.builtin.command:
+    argv:
+      - codesign
+      - -d
+      - --requirements
+      - '-'
+      - "{{ mac_release_candidate }}"
+  register: mac_designated_requirement
+  changed_when: false
+  failed_when: >-
+    mac_designated_requirement.rc != 0
+    or 'cdhash' in ((mac_designated_requirement.stdout | default(''))
+                    ~ (mac_designated_requirement.stderr | default('')))
+    or lan_mouse_macos_codesign_identifier
+       not in ((mac_designated_requirement.stdout | default(''))
+               ~ (mac_designated_requirement.stderr | default('')))
+
+- name: Install stable macOS daemon binary
+  ansible.builtin.copy:
+    src: "{{ mac_release_candidate }}"
+    dest: "{{ mac_installed_binary }}"
+    remote_src: true
+    mode: "0755"
 
 - name: Add Linux host to /etc/hosts
   become: true
