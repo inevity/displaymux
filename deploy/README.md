@@ -40,14 +40,17 @@ roughly 640 MiB with the current lockfile, plus its archive and Cargo cache.
 After artifact preparation, Linux, macOS, and Windows run their native test,
 build, install, and service-restart sequences concurrently.
 
-## After running (can't be automated, has to happen once by hand)
+## After running (one-time manual steps)
 
 1. **LG client key**: the Linux host must already have
    `~/.config/lg-buddy/.aiopylgtv.sqlite`. The playbook deliberately fails
    instead of opening an unattended TV pairing flow.
 2. **macOS Accessibility**: System Settings → Privacy & Security →
-   Accessibility → enable it for lan-mouse. Until this is granted the
-   LaunchAgent runs but captures/emulates nothing.
+   Accessibility → enable it for lan-mouse once. The playbook creates and
+   reuses a persistent local code-signing identity, so later rebuilt binaries
+   retain the same designated requirement and do not require another grant.
+   Replacing the Keychain identity or reinstalling the Mac requires a new
+   one-time grant.
 3. **Linux firewall**: admit UDP `4243` for lan-mouse and authenticated TCP
    `8765` for the controller. macOS and Windows application rules are managed
    by the playbook; Linux firewall policy remains externally owned.

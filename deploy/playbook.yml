@@ -9,11 +9,10 @@
 # Control-node prerequisites (not handled by this playbook):
 #   ansible-galaxy collection install ansible.windows community.general
 #
-# Manual steps after the first run (also not automatable):
-#   - macOS: after installing a rebuilt binary, grant lan-mouse Accessibility
-#     permission in System Settings > Privacy & Security > Accessibility.
-#     This native build is ad-hoc signed because no trusted signing identity is
-#     available, so a new binary has a new privacy code requirement.
+# Manual steps after the first stable-identity install (not automatable):
+#   - macOS: grant lan-mouse Accessibility permission once in System Settings
+#     > Privacy & Security > Accessibility. The playbook reuses a persistent
+#     local signing identity, so routine rebuilds retain that authorization.
 #   - macOS: disable lock screen password (Lock Screen > Require
 #     password: Never). Remote input can't unlock macOS.
 

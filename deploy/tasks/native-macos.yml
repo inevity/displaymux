@@ -19,6 +19,82 @@
       'aarch64' if ansible_facts.architecture == 'arm64' else ansible_facts.architecture
       }}-apple-darwin/bin/rustc
 
+- name: Check persistent macOS code-signing identity
+  ansible.builtin.command:
+    argv:
+      - security
+      - find-identity
+      - -v
+      - -p
+      - codesigning
+      - /Library/Keychains/System.keychain
+  register: mac_codesign_identities
+  changed_when: false
+
+- name: Bootstrap persistent macOS code-signing identity once
+  ansible.builtin.shell: |
+    set -euo pipefail
+    umask 077
+    identity_dir="$(mktemp -d "${TMPDIR:-/tmp}/lan-mouse-codesign.XXXXXX")"
+    trap 'rm -rf "$identity_dir"' EXIT
+    identity_password="$(openssl rand -hex 32)"
+
+    cat > "$identity_dir/openssl.cnf" <<'EOF'
+    [req]
+    distinguished_name = subject
+    x509_extensions = extensions
+    prompt = no
+
+    [subject]
+    CN = {{ lan_mouse_macos_codesign_identity }}
+    O = Lan Mouse Local
+
+    [extensions]
+    basicConstraints = critical,CA:TRUE
+    keyUsage = critical,digitalSignature,keyCertSign
+    extendedKeyUsage = codeSigning
+    subjectKeyIdentifier = hash
+    authorityKeyIdentifier = keyid:always
+    EOF
+
+    openssl req -new -x509 -newkey rsa:3072 -sha256 -days 3650 -nodes \
+      -config "$identity_dir/openssl.cnf" \
+      -keyout "$identity_dir/identity.key" \
+      -out "$identity_dir/identity.crt"
+    openssl pkcs12 -export -legacy \
+      -inkey "$identity_dir/identity.key" \
+      -in "$identity_dir/identity.crt" \
+      -name "{{ lan_mouse_macos_codesign_identity }}" \
+      -passout "pass:$identity_password" \
+      -out "$identity_dir/identity.p12"
+    security import "$identity_dir/identity.p12" \
+      -k /Library/Keychains/System.keychain \
+      -P "$identity_password" \
+      -T /usr/bin/codesign
+    security add-trusted-cert -d -r trustRoot -p codeSign \
+      -k /Library/Keychains/System.keychain \
+      "$identity_dir/identity.crt"
+  args:
+    executable: /bin/bash
+  when: >-
+    ('"' ~ lan_mouse_macos_codesign_identity ~ '"') not in mac_codesign_identities.stdout
+  become: true
+  no_log: true
+
+- name: Require persistent macOS code-signing identity
+  ansible.builtin.command:
+    argv:
+      - security
+      - find-identity
+      - -v
+      - -p
+      - codesigning
+      - /Library/Keychains/System.keychain
+  register: mac_codesign_identity_check
+  changed_when: false
+  failed_when: >-
+    ('"' ~ lan_mouse_macos_codesign_identity ~ '"') not in mac_codesign_identity_check.stdout
+
 - name: Select macOS Cargo build profile
   ansible.builtin.set_fact:
     mac_cargo_profile: "{{ 'dev' if lan_mouse_macos_build_profile == 'debug' else 'release' }}"
@@ -118,17 +194,32 @@
       async: 3600
       poll: 5
 
-    - name: Sign macOS daemon with a stable launch identifier
+    - name: Sign macOS daemon with persistent identity
       ansible.builtin.command:
         argv:
           - codesign
           - --force
           - --sign
-          - '-'
+          - "{{ lan_mouse_macos_codesign_identity }}"
           - --identifier
-          - com.feschber.lan-mouse
+          - "{{ lan_mouse_macos_codesign_identifier }}"
           - "{{ mac_target_dir }}/{{ mac_target_profile_dir }}/lan-mouse"
       changed_when: true
+
+    - name: Inspect persistent macOS designated requirement
+      ansible.builtin.command:
+        argv:
+          - codesign
+          - -d
+          - --requirements
+          - '-'
+          - "{{ mac_target_dir }}/{{ mac_target_profile_dir }}/lan-mouse"
+      register: mac_designated_requirement
+      changed_when: false
+      failed_when: >-
+        mac_designated_requirement.rc != 0
+        or 'cdhash' in mac_designated_requirement.stderr
+        or lan_mouse_macos_codesign_identifier not in mac_designated_requirement.stderr
 
     - name: Install stable macOS daemon binary
       ansible.builtin.copy:
