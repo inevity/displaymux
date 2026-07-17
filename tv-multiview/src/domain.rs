@@ -188,6 +188,7 @@ pub struct ProtocolState {
     pub next_signal_poll_ms: Option<u64>,
     pub fallback_required: bool,
     pub fallback_reason: Option<String>,
+    pub manual_recovery_target: Option<Host>,
     pub reconnect_total: u64,
     pub switch_count: BTreeMap<Host, u64>,
     pub last_error: Option<String>,
@@ -236,6 +237,7 @@ impl ProtocolState {
             next_signal_poll_ms: None,
             fallback_required: true,
             fallback_reason: Some("startup_unsynchronized".to_string()),
+            manual_recovery_target: None,
             reconnect_total: 0,
             switch_count,
             last_error: None,
@@ -309,6 +311,16 @@ impl ProtocolState {
         if self.fallback_required && self.keyboard_owner != self.server_host {
             return Err(InvariantViolation::FallbackOwnsRemoteInput);
         }
+        if self.manual_recovery_target == Some(self.server_host) {
+            return Err(InvariantViolation::ManualRecoveryTargetsServer);
+        }
+        if self.manual_recovery_target.is_some()
+            && (self.active_request.is_some()
+                || self.active_session.is_some()
+                || self.keyboard_owner != self.server_host)
+        {
+            return Err(InvariantViolation::ManualRecoveryWhileInputActive);
+        }
         if self.keyboard_owner != self.server_host {
             let session = self
                 .active_session
@@ -363,6 +375,10 @@ pub enum InvariantViolation {
     SplitInputOwnership,
     #[error("fallback required while remote input remains owned")]
     FallbackOwnsRemoteInput,
+    #[error("manual recovery target must be a remote host")]
+    ManualRecoveryTargetsServer,
+    #[error("manual recovery cannot be armed while an input transaction is active")]
+    ManualRecoveryWhileInputActive,
     #[error("remote owner has no active bundle session")]
     RemoteOwnerWithoutSession,
     #[error("remote owner does not match active bundle session")]

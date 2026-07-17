@@ -403,6 +403,10 @@ fn log_transition(
         deadline_remaining_ms = deadline_remaining_ms.unwrap_or(0),
         fallback_required = state.fallback_required,
         fallback_reason = state.fallback_reason.as_deref().unwrap_or(""),
+        manual_recovery_target = state
+            .manual_recovery_target
+            .map(|host| host.as_str())
+            .unwrap_or(""),
     );
 }
 

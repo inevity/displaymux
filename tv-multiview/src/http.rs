@@ -191,6 +191,7 @@ async fn status(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Respo
             pending_switch,
             switch_timer: deadline_remaining_ms.unwrap_or(0),
             fallback_required: protocol.fallback_required,
+            manual_recovery_target: protocol.manual_recovery_target,
             keyboard_owner: protocol.keyboard_owner,
             pointer_owner: protocol.pointer_owner,
             reservation_target: pending_switch,
@@ -549,8 +550,7 @@ fn coordinator_error(error: CoordinatorError) -> Response {
             error.to_string(),
         ),
         CoordinatorError::Protocol(
-            ProtocolError::TargetNotReady
-            | ProtocolError::InvalidLease
+            ProtocolError::InvalidLease
             | ProtocolError::StaleIdentity
             | ProtocolError::RequestIdentityConflict
             | ProtocolError::InputNotLocal,
@@ -699,6 +699,7 @@ struct StatusResponse {
     pending_switch: Option<Host>,
     switch_timer: u64,
     fallback_required: bool,
+    manual_recovery_target: Option<Host>,
     keyboard_owner: Host,
     pointer_owner: Host,
     reservation_target: Option<Host>,

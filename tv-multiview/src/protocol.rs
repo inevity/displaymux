@@ -143,8 +143,6 @@ pub enum ProtocolError {
     Busy { active_request_id: String },
     #[error("request id already exists with different identity")]
     RequestIdentityConflict,
-    #[error("target is online but keyboard and pointer are not both ready")]
-    TargetNotReady,
     #[error("bundle lease is invalid or expired")]
     InvalidLease,
     #[error("request not found")]
@@ -194,6 +192,8 @@ pub fn apply(
             store_observation(&mut next, switch_epoch, now_ms, mode, input, signals);
             if server_display_verified(&next, switch_epoch) {
                 finish_fallback(&mut next);
+            } else if manual_recovery_display_observed(&next) {
+                finish_manual_recovery(&mut next);
             } else {
                 begin_fallback(
                     &mut next,
@@ -287,6 +287,7 @@ pub fn apply(
                 return Err(ProtocolError::InvalidLease);
             }
 
+            next.manual_recovery_target = None;
             next.request_epoch = next.request_epoch.saturating_add(1);
             let request_epoch = next.request_epoch;
             let mut request = EnterRequest {
@@ -319,7 +320,11 @@ pub fn apply(
                     return validated(next, effects, now_ms);
                 }
                 if !readiness.bundle_ready(request.lease.peer_session_epoch) {
-                    return Err(ProtocolError::TargetNotReady);
+                    request.status = RequestStatus::Denied;
+                    request.reason = Some("target_input_not_ready".to_string());
+                    next.manual_recovery_target = Some(target);
+                    next.archive_request(request);
+                    return validated(next, effects, now_ms);
                 }
             }
 
@@ -492,6 +497,7 @@ pub fn apply(
                 next.pointer_owner = target;
                 next.fallback_required = false;
                 next.fallback_reason = None;
+                next.manual_recovery_target = None;
                 next.phase_deadline_ms = None;
                 next.observation_in_flight = None;
                 if target == next.server_host {
@@ -544,6 +550,9 @@ pub fn apply(
                 }
                 let tv_may_have_changed = request.switch_epoch.is_some();
                 let mut request = next.active_request.take().expect("checked request");
+                if request.target != next.server_host {
+                    next.manual_recovery_target = Some(request.target);
+                }
                 request.status = RequestStatus::Cancelled;
                 request.reason = Some(reason.clone());
                 next.archive_request(request);
@@ -677,6 +686,15 @@ pub fn apply(
                     "unexpected_tv_subscription",
                 );
             } else if next.phase == ProtocolPhase::Idle
+                && manual_recovery_display_observed(&next)
+            {
+                finish_manual_recovery(&mut next);
+            } else if next.phase == ProtocolPhase::Idle
+                && mode == TvMode::Fullscreen
+                && input == Some(next.server_host)
+            {
+                next.manual_recovery_target = None;
+            } else if next.phase == ProtocolPhase::Idle
                 && (mode != TvMode::Fullscreen
                     || input.is_some_and(|observed| observed != next.server_host))
             {
@@ -694,6 +712,9 @@ pub fn apply(
                 if request.deadline_ms <= now_ms {
                     let waking = request.status == RequestStatus::Waking;
                     let mut request = next.active_request.take().expect("active request");
+                    if request.target != next.server_host {
+                        next.manual_recovery_target = Some(request.target);
+                    }
                     request.status = RequestStatus::Expired;
                     request.reason = Some("request_deadline".to_string());
                     next.archive_request(request);
@@ -852,6 +873,14 @@ fn begin_fallback(
     timing: ProtocolTiming,
     reason: &str,
 ) {
+    if let Some(target) = state
+        .active_request
+        .as_ref()
+        .map(|request| request.target)
+        .filter(|target| *target != state.server_host)
+    {
+        state.manual_recovery_target = Some(target);
+    }
     let committed_request_id = state
         .active_session
         .as_ref()
@@ -911,6 +940,27 @@ fn finish_fallback(state: &mut ProtocolState) {
     state.next_signal_poll_ms = None;
     state.verified_epoch = Some(state.switch_epoch);
     record_verified_switch(state, state.server_host);
+}
+
+fn manual_recovery_display_observed(state: &ProtocolState) -> bool {
+    state.manual_recovery_target.is_some_and(|target| {
+        state.tv_mode == TvMode::Fullscreen
+            && state.observed_input == Some(target)
+            && state.keyboard_owner == state.server_host
+            && state.pointer_owner == state.server_host
+            && state.active_request.is_none()
+            && state.active_session.is_none()
+    })
+}
+
+fn finish_manual_recovery(state: &mut ProtocolState) {
+    release_to_server(state);
+    state.fallback_required = false;
+    state.fallback_reason = None;
+    state.phase = ProtocolPhase::Idle;
+    state.phase_deadline_ms = None;
+    state.observation_in_flight = None;
+    state.next_signal_poll_ms = None;
 }
 
 fn record_verified_switch(state: &mut ProtocolState, target: Host) {
@@ -1302,9 +1352,100 @@ mod tests {
                 observed_at_ms: 2,
             },
         );
-        let error = create_mac(&state).unwrap_err();
-        assert_eq!(error, ProtocolError::TargetNotReady);
-        assert_eq!(state.commanded_input, None);
+        let denied = create_mac(&state).unwrap();
+        let request = denied.next.request("request-1").unwrap();
+        assert_eq!(request.status, RequestStatus::Denied);
+        assert_eq!(request.reason.as_deref(), Some("target_input_not_ready"));
+        assert_eq!(denied.next.manual_recovery_target, Some(Host::Mac));
+        assert_eq!(denied.next.commanded_input, None);
+        assert!(denied.effects.is_empty());
+    }
+
+    #[test]
+    fn failed_enter_arms_exact_manual_recovery_target_after_server_fallback() {
+        let state = ready_peer(&synchronized(), Host::Mac, 11);
+        let switching = create_mac(&state).unwrap().next;
+        let failed = apply(
+            &switching,
+            Event::CommandFailed {
+                switch_epoch: switching.switch_epoch,
+                reason: "switch failed".to_string(),
+            },
+            11,
+            TIMING,
+        )
+        .unwrap()
+        .next;
+        assert_eq!(failed.manual_recovery_target, Some(Host::Mac));
+        assert!(failed.fallback_required);
+
+        let verifying = acknowledge_switch(&failed, 12);
+        let recovered = apply(
+            &verifying,
+            Event::Observation {
+                switch_epoch: verifying.switch_epoch,
+                mode: TvMode::Fullscreen,
+                input: Some(Host::Linux),
+                signals: signals(Host::Linux),
+            },
+            13,
+            TIMING,
+        )
+        .unwrap()
+        .next;
+        assert_eq!(recovered.phase, ProtocolPhase::Idle);
+        assert!(!recovered.fallback_required);
+        assert_eq!(recovered.manual_recovery_target, Some(Host::Mac));
+
+        let manual = apply(
+            &recovered,
+            Event::SubscriptionObserved {
+                mode: TvMode::Fullscreen,
+                input: Some(Host::Mac),
+            },
+            14,
+            TIMING,
+        )
+        .unwrap();
+        assert!(manual.effects.is_empty());
+        assert_eq!(manual.next.phase, ProtocolPhase::Idle);
+        assert!(!manual.next.fallback_required);
+        assert_eq!(manual.next.observed_input, Some(Host::Mac));
+        assert_eq!(manual.next.keyboard_owner, Host::Linux);
+        assert_eq!(manual.next.pointer_owner, Host::Linux);
+    }
+
+    #[test]
+    fn manual_recovery_is_target_scoped_and_server_observation_clears_it() {
+        let mut state = synchronized();
+        state.manual_recovery_target = Some(Host::Mac);
+
+        let wrong_target = apply(
+            &state,
+            Event::SubscriptionObserved {
+                mode: TvMode::Fullscreen,
+                input: Some(Host::Windows),
+            },
+            10,
+            TIMING,
+        )
+        .unwrap();
+        assert_eq!(
+            wrong_target.next.fallback_reason.as_deref(),
+            Some("manual_tv_override")
+        );
+
+        let returned = apply(
+            &state,
+            Event::SubscriptionObserved {
+                mode: TvMode::Fullscreen,
+                input: Some(Host::Linux),
+            },
+            10,
+            TIMING,
+        )
+        .unwrap();
+        assert_eq!(returned.next.manual_recovery_target, None);
     }
 
     #[test]
@@ -1958,6 +2099,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(changed.next.keyboard_owner, Host::Linux);
+        assert_eq!(changed.next.manual_recovery_target, None);
         assert_eq!(
             changed.next.fallback_reason.as_deref(),
             Some("unexpected_tv_subscription")
