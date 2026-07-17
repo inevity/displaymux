@@ -29,6 +29,10 @@ const DEFAULT_REPEAT_DELAY: Duration = Duration::from_millis(500);
 const DEFAULT_REPEAT_INTERVAL: Duration = Duration::from_millis(32);
 const DOUBLE_CLICK_INTERVAL: Duration = Duration::from_millis(500);
 
+fn request_repeat_stop(notify: &Notify) {
+    notify.notify_one();
+}
+
 pub(crate) struct MacOSEmulation {
     /// global event source for all events
     event_source: CGEventSource,
@@ -173,9 +177,22 @@ impl MacOSEmulation {
 
     async fn cancel_repeat_task(&mut self) {
         if let Some(task) = self.repeat_task.take() {
-            self.notify_repeat_task.notify_waiters();
+            // There is exactly one repeat task. `notify_one` stores a permit
+            // when key-up wins the race before that task first polls, whereas
+            // `notify_waiters` would lose the cancellation and wait forever.
+            request_repeat_stop(&self.notify_repeat_task);
             let _ = task.await;
         }
+    }
+
+    async fn release_session_state(&mut self) {
+        self.cancel_repeat_task().await;
+        self.modifier_state.set(XMods::empty());
+        modifier_event(self.event_source.clone(), XMods::empty());
+        self.pressed_buttons.clear();
+        self.previous_button = None;
+        self.previous_button_click = None;
+        self.button_click_state = 0;
     }
 }
 
@@ -614,9 +631,13 @@ impl Emulation for MacOSEmulation {
 
     async fn create(&mut self, _handle: EmulationHandle) {}
 
-    async fn destroy(&mut self, _handle: EmulationHandle) {}
+    async fn destroy(&mut self, _handle: EmulationHandle) {
+        self.release_session_state().await;
+    }
 
-    async fn terminate(&mut self) {}
+    async fn terminate(&mut self) {
+        self.release_session_state().await;
+    }
 }
 
 fn update_modifiers(modifiers: &Cell<XMods>, key: u32, state: u8) -> bool {
@@ -724,5 +745,21 @@ mod tests {
     #[test]
     fn rejects_incomplete_display_selector() {
         assert!(MacDisplaySelector::parse("7789:33485").is_err());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn repeat_cancellation_is_durable_before_waiter_first_polls() {
+        let notify = Arc::new(Notify::new());
+        let waiter = notify.clone();
+        let task = tokio::spawn(async move {
+            waiter.notified().await;
+        });
+
+        request_repeat_stop(&notify);
+
+        tokio::time::timeout(Duration::from_millis(100), task)
+            .await
+            .expect("repeat cancellation was lost")
+            .expect("repeat waiter panicked");
     }
 }

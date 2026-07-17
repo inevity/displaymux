@@ -7,8 +7,10 @@ use lan_mouse_proto::{Position, ProtoEvent};
 use local_channel::mpsc::{Receiver, Sender, channel};
 use std::{
     cell::Cell,
-    collections::HashMap,
+    collections::{HashMap, HashSet},
+    future,
     net::SocketAddr,
+    pin::Pin,
     rc::Rc,
     time::{Duration, Instant},
 };
@@ -16,6 +18,7 @@ use tokio::{
     select,
     sync::oneshot,
     task::{JoinHandle, spawn_local},
+    time::Sleep,
 };
 
 /// emulation handling events received from a listener
@@ -161,6 +164,95 @@ struct PendingReleases {
     epochs: HashMap<SocketAddr, u64>,
 }
 
+const ENTER_HANDOFF_TIMEOUT: Duration = Duration::from_secs(2);
+
+enum PendingEnterStep {
+    Releasing(oneshot::Receiver<bool>),
+    Centering(oneshot::Receiver<bool>),
+}
+
+struct PendingEnter {
+    addr: SocketAddr,
+    pos: Position,
+    fingerprint: String,
+    step: PendingEnterStep,
+    deadline: Pin<Box<Sleep>>,
+}
+
+impl PendingEnter {
+    fn new(
+        addr: SocketAddr,
+        pos: Position,
+        fingerprint: String,
+        release: oneshot::Receiver<bool>,
+    ) -> Self {
+        Self {
+            addr,
+            pos,
+            fingerprint,
+            step: PendingEnterStep::Releasing(release),
+            deadline: Box::pin(tokio::time::sleep(ENTER_HANDOFF_TIMEOUT)),
+        }
+    }
+
+    fn step_name(&self) -> &'static str {
+        match self.step {
+            PendingEnterStep::Releasing(_) => "capture_release",
+            PendingEnterStep::Centering(_) => "pointer_centering",
+        }
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum PendingEnterProgress {
+    Released(bool),
+    Centered(bool),
+    TimedOut,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum EnterDisposition {
+    Start,
+    WaitForPending,
+    Acknowledge,
+    RejectBusy,
+}
+
+fn enter_disposition(
+    entered: &HashSet<SocketAddr>,
+    pending: Option<&PendingEnter>,
+    addr: SocketAddr,
+) -> EnterDisposition {
+    if entered.contains(&addr) {
+        EnterDisposition::Acknowledge
+    } else if pending.is_some_and(|pending| pending.addr == addr) {
+        EnterDisposition::WaitForPending
+    } else if pending.is_some() {
+        EnterDisposition::RejectBusy
+    } else {
+        EnterDisposition::Start
+    }
+}
+
+async fn wait_for_pending_enter(
+    pending: &mut Option<PendingEnter>,
+) -> PendingEnterProgress {
+    let Some(pending) = pending.as_mut() else {
+        return future::pending().await;
+    };
+    let PendingEnter { step, deadline, .. } = pending;
+    match step {
+        PendingEnterStep::Releasing(completion) => select! {
+            result = completion => PendingEnterProgress::Released(result.unwrap_or(false)),
+            _ = deadline.as_mut() => PendingEnterProgress::TimedOut,
+        },
+        PendingEnterStep::Centering(completion) => select! {
+            result = completion => PendingEnterProgress::Centered(result.unwrap_or(false)),
+            _ = deadline.as_mut() => PendingEnterProgress::TimedOut,
+        },
+    }
+}
+
 impl PendingReleases {
     fn request(&mut self, addr: SocketAddr, release_epoch: u64) {
         self.epochs.insert(addr, release_epoch);
@@ -189,6 +281,8 @@ impl ListenTask {
         let mut last_response = HashMap::new();
         let mut rejected_connections = HashMap::new();
         let mut pending_releases = PendingReleases::default();
+        let mut pending_enter = None;
+        let mut entered_connections = HashSet::new();
         loop {
             select! {
                 e = self.listener.next() => {match e {
@@ -198,34 +292,53 @@ impl ListenTask {
                         match event {
                             ProtoEvent::Enter(pos) => {
                                 if let Some(fingerprint) = self.listener.get_certificate_fingerprint(addr).await {
+                                    match enter_disposition(
+                                        &entered_connections,
+                                        pending_enter.as_ref(),
+                                        addr,
+                                    ) {
+                                        EnterDisposition::Acknowledge => {
+                                            self.listener.reply(addr, ProtoEvent::Ack(0)).await;
+                                            continue;
+                                        }
+                                        EnterDisposition::WaitForPending => {
+                                            log::debug!("ignoring duplicate enter from {addr} while handoff is pending");
+                                            continue;
+                                        }
+                                        EnterDisposition::RejectBusy => {
+                                            log::warn!("not acknowledging enter from {addr}: another handoff is pending");
+                                            continue;
+                                        }
+                                        EnterDisposition::Start => {}
+                                    }
                                     log::info!("releasing capture: {addr} entered this device");
                                     let (completion_tx, completion_rx) = oneshot::channel();
                                     self.event_tx.send(EmulationEvent::ReleaseCapture {
                                         completion: completion_tx,
                                     }).expect("channel closed");
-                                    if !completion_rx.await.unwrap_or(false) {
-                                        log::warn!("not acknowledging enter from {addr}: local capture release failed");
-                                        continue;
-                                    }
-                                    if !self.emulation_proxy.center_pointer(addr).await {
-                                        log::warn!("not acknowledging enter from {addr}: pointer centering failed");
-                                        continue;
-                                    }
-                                    self.listener.reply(addr, ProtoEvent::Ack(0)).await;
-                                    self.event_tx.send(EmulationEvent::Entered{addr, pos: to_ipc_pos(pos), fingerprint}).expect("channel closed");
+                                    pending_enter = Some(PendingEnter::new(
+                                        addr,
+                                        pos,
+                                        fingerprint,
+                                        completion_rx,
+                                    ));
                                 }
                             }
                             ProtoEvent::Leave(_) => {
+                                if pending_enter.as_ref().is_some_and(|pending| pending.addr == addr) {
+                                    pending_enter = None;
+                                }
+                                entered_connections.remove(&addr);
                                 self.emulation_proxy.remove(addr);
                                 self.listener.reply(addr, ProtoEvent::Ack(0)).await;
                             }
                             ProtoEvent::Input(event) => self.emulation_proxy.consume(event, addr),
                             ProtoEvent::Ping => {
+                                self.listener.reply(addr, ProtoEvent::Pong(self.emulation_proxy.control_ready())).await;
+                                self.listener.reply(addr, self.emulation_proxy.readiness()).await;
                                 if let Some(release_epoch) = pending_releases.retry_epoch(addr) {
                                     self.listener.reply(addr, ProtoEvent::ReleaseRequest { release_epoch }).await;
                                 }
-                                self.listener.reply(addr, ProtoEvent::Pong(self.emulation_proxy.control_ready())).await;
-                                self.listener.reply(addr, self.emulation_proxy.readiness()).await;
                             }
                             // Peer's version handshake. Echo our own
                             // commit back so the peer's connect-side
@@ -269,11 +382,59 @@ impl ListenTask {
                     Some(ListenEvent::Disconnected { addr }) => {
                         last_response.remove(&addr);
                         pending_releases.disconnected(addr);
+                        if pending_enter.as_ref().is_some_and(|pending| pending.addr == addr) {
+                            pending_enter = None;
+                        }
+                        entered_connections.remove(&addr);
                         self.emulation_proxy.remove(addr);
                         self.event_tx.send(EmulationEvent::Disconnected { addr }).expect("channel closed");
                     }
                     None => break
                 }}
+                progress = wait_for_pending_enter(&mut pending_enter) => {
+                    match progress {
+                        PendingEnterProgress::Released(true) => {
+                            let pending = pending_enter.as_mut().expect("pending enter");
+                            pending.step = PendingEnterStep::Centering(
+                                self.emulation_proxy.request_center_pointer(pending.addr),
+                            );
+                        }
+                        PendingEnterProgress::Centered(true) => {
+                            let completed = pending_enter.take().expect("pending enter");
+                            if self.listener.reply(completed.addr, ProtoEvent::Ack(0)).await {
+                                entered_connections.insert(completed.addr);
+                                self.event_tx.send(EmulationEvent::Entered {
+                                    addr: completed.addr,
+                                    pos: to_ipc_pos(completed.pos),
+                                    fingerprint: completed.fingerprint,
+                                }).expect("channel closed");
+                            } else {
+                                self.emulation_proxy.remove(completed.addr);
+                                self.listener.disconnect(completed.addr).await;
+                            }
+                        }
+                        PendingEnterProgress::Released(false) | PendingEnterProgress::Centered(false) => {
+                            let failed = pending_enter.take().expect("pending enter");
+                            log::warn!(
+                                "not acknowledging enter from {}: {} failed",
+                                failed.addr,
+                                failed.step_name(),
+                            );
+                            self.emulation_proxy.remove(failed.addr);
+                            self.listener.disconnect(failed.addr).await;
+                        }
+                        PendingEnterProgress::TimedOut => {
+                            let failed = pending_enter.take().expect("pending enter");
+                            log::warn!(
+                                "not acknowledging enter from {}: {} timed out",
+                                failed.addr,
+                                failed.step_name(),
+                            );
+                            self.emulation_proxy.remove(failed.addr);
+                            self.listener.disconnect(failed.addr).await;
+                        }
+                    }
+                }
                 event = self.emulation_proxy.event() => {
                     if matches!(&event, EmulationEvent::EmulationEnabled { .. } | EmulationEvent::EmulationDisabled { .. }) {
                         self.listener.broadcast(self.emulation_proxy.readiness()).await;
@@ -408,15 +569,16 @@ impl EmulationProxy {
         }
     }
 
-    async fn center_pointer(&self, addr: SocketAddr) -> bool {
-        if !self.control_ready() {
-            return false;
-        }
+    fn request_center_pointer(&self, addr: SocketAddr) -> oneshot::Receiver<bool> {
         let (result_tx, result_rx) = oneshot::channel();
+        if !self.control_ready() {
+            let _ = result_tx.send(false);
+            return result_rx;
+        }
         self.request_tx
             .send(ProxyRequest::CenterPointer(addr, result_tx))
             .expect("channel closed");
-        result_rx.await.unwrap_or(false)
+        result_rx
     }
 
     fn remove(&self, addr: SocketAddr) {
@@ -678,6 +840,53 @@ mod tests {
         assert_eq!(
             backend_readiness(input_emulation::Backend::Dummy),
             (false, false)
+        );
+    }
+
+    #[tokio::test]
+    async fn repeated_enter_waits_during_handoff_and_acknowledges_after_completion() {
+        let addr = peer();
+        let mut entered = HashSet::new();
+        let (_release_tx, release_rx) = oneshot::channel();
+        let pending = PendingEnter::new(
+            addr,
+            Position::Left,
+            "fingerprint".to_string(),
+            release_rx,
+        );
+
+        assert_eq!(
+            enter_disposition(&entered, Some(&pending), addr),
+            EnterDisposition::WaitForPending
+        );
+        entered.insert(addr);
+        assert_eq!(
+            enter_disposition(&entered, None, addr),
+            EnterDisposition::Acknowledge
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_enter_advances_release_and_centering_independently() {
+        let (release_tx, release_rx) = oneshot::channel();
+        let mut pending = Some(PendingEnter::new(
+            peer(),
+            Position::Left,
+            "fingerprint".to_string(),
+            release_rx,
+        ));
+        release_tx.send(true).unwrap();
+        assert_eq!(
+            wait_for_pending_enter(&mut pending).await,
+            PendingEnterProgress::Released(true)
+        );
+
+        let (center_tx, center_rx) = oneshot::channel();
+        pending.as_mut().unwrap().step = PendingEnterStep::Centering(center_rx);
+        center_tx.send(true).unwrap();
+        assert_eq!(
+            wait_for_pending_enter(&mut pending).await,
+            PendingEnterProgress::Centered(true)
         );
     }
 }

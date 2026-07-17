@@ -228,6 +228,20 @@ impl LanMouseListener {
         false
     }
 
+    pub(crate) async fn disconnect(&self, addr: SocketAddr) {
+        let conns = self
+            .conns
+            .lock()
+            .await
+            .iter()
+            .filter(|(candidate, _)| *candidate == addr)
+            .map(|(_, conn)| conn.clone())
+            .collect::<Vec<_>>();
+        for conn in conns {
+            let _ = conn.close().await;
+        }
+    }
+
     pub(crate) async fn broadcast(&self, event: ProtoEvent) {
         let (buf, len): ([u8; MAX_EVENT_SIZE], usize) = event.into();
         let conns = self
