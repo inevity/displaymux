@@ -8,36 +8,14 @@
     - "{{ ansible_facts.env.LOCALAPPDATA }}\\lan-mouse"
     - "{{ ansible_facts.env.LOCALAPPDATA }}\\lan-mouse\\logs"
 
-- name: Validate Windows native build prerequisites
-  ansible.windows.win_shell: |
-    foreach ($command in @("git", "rustup", "pwsh")) {
-      if (-not (Get-Command $command -ErrorAction SilentlyContinue)) {
-        throw "Required command is missing: $command"
-      }
-    }
-    if ($env:PROCESSOR_ARCHITECTURE -ne "AMD64") {
-      throw "Windows native build requires AMD64"
-    }
-  changed_when: false
-
-- name: Install selected Windows Rust toolchain
+- name: Bootstrap selected Windows Rust toolchain once
   ansible.windows.win_shell: |
     rustup toolchain install {{ lan_mouse_rust_toolchain }} --profile minimal
     exit $LASTEXITCODE
-  changed_when: false
-
-- name: Read Windows Rust compiler identity
-  ansible.windows.win_shell: |
-    rustup run {{ lan_mouse_rust_toolchain }} rustc --version
-    exit $LASTEXITCODE
-  register: win_rust_version
-  changed_when: false
-
-- name: Define Windows native build identity
-  ansible.builtin.set_fact:
-    win_build_id: >-
-      {{ lan_mouse_revision }} lock={{ lan_mouse_cargo_lock_sha256 }}
-      rust={{ win_rust_version.stdout | trim }} no-default-features
+  args:
+    creates: >-
+      {{ ansible_facts.env.USERPROFILE }}\.rustup\toolchains\{{ lan_mouse_rust_toolchain
+      }}-x86_64-pc-windows-msvc\bin\rustc.exe
 
 - name: Locate Windows MSVC x64 Build Tools
   ansible.windows.win_shell: |
@@ -56,44 +34,37 @@
   register: win_pwsh
   changed_when: false
 
-- name: Copy pinned source bundle to Windows
+- name: Copy source bundle to Windows
   ansible.windows.win_copy:
     src: "{{ source_bundle }}"
-    dest: "{{ win_build_cache }}\\source-{{ lan_mouse_revision[:12] }}.bundle"
+    dest: "{{ win_build_cache }}\\source.bundle"
 
 - name: Copy locked vendor archive to Windows
   ansible.windows.win_copy:
     src: "{{ vendor_archive }}"
-    dest: "{{ win_build_cache }}\\vendor-{{ lan_mouse_revision[:12] }}.zip"
+    dest: "{{ win_build_cache }}\\vendor.zip"
 
 - name: Extract locked Cargo vendor tree on Windows
   ansible.windows.win_shell: |
-    Expand-Archive -Path "{{ win_build_cache }}\vendor-{{ lan_mouse_revision[:12] }}.zip" -DestinationPath "{{ win_build_cache }}" -Force
+    Expand-Archive -Path "{{ win_build_cache }}\vendor.zip" -DestinationPath "{{ win_build_cache }}" -Force
   args:
     creates: "{{ win_vendor_dir }}"
 
-- name: Clone pinned lan-mouse source on Windows
+- name: Remove previous lan-mouse source on Windows
+  ansible.windows.win_file:
+    path: "{{ win_source_dir }}"
+    state: absent
+
+- name: Deploy lan-mouse source on Windows
   ansible.windows.win_shell: |
-    git clone "{{ win_build_cache }}\source-{{ lan_mouse_revision[:12] }}.bundle" "{{ win_source_dir }}"
+    git clone "{{ win_build_cache }}\source.bundle" "{{ win_source_dir }}"
     exit $LASTEXITCODE
-  args:
-    creates: "{{ win_source_dir }}\\.git"
 
 - name: Record source repository origin on Windows
   ansible.windows.win_shell: |
     git -C "{{ win_source_dir }}" remote set-url origin "{{ lan_mouse_repo_url }}"
     exit $LASTEXITCODE
   changed_when: false
-
-- name: Verify Windows source revision
-  ansible.windows.win_shell: |
-    git -C "{{ win_source_dir }}" rev-parse HEAD
-  register: win_source_revision
-  changed_when: false
-
-- name: Require exact Windows source revision
-  ansible.builtin.assert:
-    that: win_source_revision.stdout | trim == lan_mouse_revision
 
 - name: Ensure checkout-local Cargo config directory exists on Windows
   ansible.windows.win_file:
@@ -116,31 +87,7 @@
     chdir: "{{ win_source_dir }}"
   changed_when: false
 
-- name: Check installed Windows build identity
-  ansible.windows.win_stat:
-    path: "{{ win_installed_build_id }}"
-  register: win_build_id_stat
-
-- name: Read installed Windows build identity
-  ansible.windows.slurp:
-    path: "{{ win_installed_build_id }}"
-  register: win_build_id_content
-  when: win_build_id_stat.stat.exists
-
-- name: Check installed Windows binary
-  ansible.windows.win_stat:
-    path: "{{ win_installed_binary }}"
-  register: win_binary_stat
-
-- name: Decide whether Windows native build is required
-  ansible.builtin.set_fact:
-    win_build_required: >-
-      {{ not win_build_id_stat.stat.exists
-         or not win_binary_stat.stat.exists
-         or (win_build_id_content.content | default('') | b64decode | trim != win_build_id) }}
-
-- name: Build and test pinned lan-mouse natively on Windows
-  when: win_build_required
+- name: Build and test lan-mouse natively on Windows
   block:
     - name: Run no-GTK Windows workspace tests
       ansible.windows.win_shell: |
@@ -237,7 +184,6 @@
         src: "{{ win_target_dir }}\\release\\lan-mouse.exe"
         dest: "{{ win_installed_binary }}"
         remote_src: true
-      register: win_binary_install
 
 - name: Add Linux host to Windows hosts file
   ansible.windows.win_shell: |
@@ -258,7 +204,6 @@
   vars:
     spoke_position: "{{ win_spoke_position }}"
     spoke_host: windows
-  register: win_config
   no_log: true
 
 - name: Deploy bounded Windows log wrapper
@@ -267,7 +212,6 @@
     dest: "{{ win_wrapper }}"
   vars:
     lan_mouse_windows_binary: "{{ win_installed_binary }}"
-  register: win_wrapper_template
 
 - name: Create scheduled task for bounded-log lan-mouse daemon
   community.windows.win_scheduled_task:
@@ -291,7 +235,6 @@
     multiple_instances: 2
     restart_count: 999
     restart_interval: PT1M
-  register: win_scheduled_task
 
 - name: Detect Windows interactive desktop for the deployment user
   ansible.windows.win_shell: |
@@ -311,11 +254,7 @@
 
 - name: Decide whether Windows daemon restart is required
   ansible.builtin.set_fact:
-    win_runtime_changed: >-
-      {{ win_build_required
-         or win_config.changed
-         or win_wrapper_template.changed
-         or win_scheduled_task.changed }}
+    win_runtime_changed: true
 
 - name: Restart Windows lan-mouse when runtime inputs changed
   ansible.windows.win_shell: |
@@ -414,11 +353,6 @@
 - name: Require persistent Windows log sources
   ansible.builtin.assert:
     that: win_logs.results | selectattr('stat.exists', 'equalto', true) | list | length == 2
-
-- name: Record installed Windows build identity
-  ansible.windows.win_copy:
-    content: "{{ win_build_id }}\r\n"
-    dest: "{{ win_installed_build_id }}"
 
 - name: Open Windows Firewall for lan-mouse (UDP {{ lan_mouse_port }})
   ansible.windows.win_shell: |

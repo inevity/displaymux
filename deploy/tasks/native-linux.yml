@@ -1,0 +1,322 @@
+- name: Install build dependencies
+  become: true
+  community.general.pacman:
+    name:
+      - cmake
+      - pkgconf
+      - git
+      - libx11
+      - libxtst
+      - libarchive
+      - openssl
+      - rust
+    state: present
+
+- name: Ensure native build directories exist
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    mode: "0755"
+  loop:
+    - "{{ lan_mouse_build_cache }}"
+    - "{{ ansible_facts.env.HOME }}/.cache/lan-mouse-pkgbuild"
+    - "{{ lan_mouse_linux_cargo_home }}"
+
+- name: Copy source bundle to Linux build cache
+  ansible.builtin.copy:
+    src: "{{ source_bundle }}"
+    dest: "{{ lan_mouse_build_cache }}/source.bundle"
+    mode: "0644"
+
+- name: Copy locked vendor archive to Linux build cache
+  ansible.builtin.copy:
+    src: "{{ vendor_archive }}"
+    dest: "{{ lan_mouse_build_cache }}/vendor.zip"
+    mode: "0644"
+
+- name: Extract locked Cargo vendor tree on Linux
+  ansible.builtin.unarchive:
+    src: "{{ lan_mouse_build_cache }}/vendor.zip"
+    dest: "{{ lan_mouse_build_cache }}"
+    remote_src: true
+    creates: "{{ lan_mouse_linux_vendor_dir }}"
+
+- name: Remove previous lan-mouse source on Linux
+  ansible.builtin.file:
+    path: "{{ lan_mouse_linux_source_dir }}"
+    state: absent
+
+- name: Deploy lan-mouse source on Linux
+  ansible.builtin.command:
+    argv:
+      - git
+      - clone
+      - "{{ lan_mouse_build_cache }}/source.bundle"
+      - "{{ lan_mouse_linux_source_dir }}"
+
+- name: Record source repository origin on Linux
+  ansible.builtin.command:
+    argv: [git, -C, "{{ lan_mouse_linux_source_dir }}", remote, set-url, origin, "{{ lan_mouse_repo_url }}"]
+  changed_when: false
+
+- name: Configure locked offline Cargo source on Linux
+  ansible.builtin.template:
+    src: templates/cargo-vendor-config.toml.j2
+    dest: "{{ lan_mouse_linux_cargo_home }}/config.toml"
+    mode: "0644"
+  vars:
+    cargo_vendor_path: "{{ lan_mouse_linux_vendor_dir }}"
+
+- name: Template PKGBUILD for no-GTK source
+  ansible.builtin.template:
+    src: templates/lan-mouse-git-PKGBUILD.j2
+    dest: "{{ ansible_facts.env.HOME }}/.cache/lan-mouse-pkgbuild/PKGBUILD"
+    mode: "0644"
+
+- name: Build, test, and install lan-mouse on Linux
+  block:
+    - name: Remove stale makepkg VCS source clone
+      ansible.builtin.file:
+        path: "{{ ansible_facts.env.HOME }}/.cache/lan-mouse-pkgbuild/lan-mouse"
+        state: absent
+
+    - name: Build and test package as the desktop user
+      ansible.builtin.command:
+        argv: [makepkg, --force, --noconfirm, --check, --cleanbuild]
+        chdir: "{{ ansible_facts.env.HOME }}/.cache/lan-mouse-pkgbuild"
+      changed_when: true
+
+    - name: Locate built Linux package
+      ansible.builtin.find:
+        paths: "{{ ansible_facts.env.HOME }}/.cache/lan-mouse-pkgbuild"
+        patterns: "lan-mouse-git-*.pkg.tar.zst"
+        file_type: file
+      register: linux_packages
+
+    - name: Require a built Linux package
+      ansible.builtin.assert:
+        that: linux_packages.matched | int > 0
+
+    - name: Install built Linux package
+      become: true
+      ansible.builtin.command:
+        argv:
+          - pacman
+          - -U
+          - --noconfirm
+          - "{{ (linux_packages.files | sort(attribute='mtime') | last).path }}"
+      changed_when: true
+
+- name: Ensure ~/.local/bin exists
+  ansible.builtin.file:
+    path: "{{ ansible_facts.env.HOME }}/.local/bin"
+    state: directory
+    mode: "0755"
+
+- name: Test tv-multiview daemon
+  ansible.builtin.command:
+    argv: [cargo, test, --frozen]
+    chdir: "{{ playbook_dir }}/../tv-multiview"
+  changed_when: false
+  tags: [tv_multiview_mutation]
+
+- name: Build tv-multiview daemon
+  ansible.builtin.command:
+    argv: [cargo, build, --frozen, --release]
+    chdir: "{{ playbook_dir }}/../tv-multiview"
+  changed_when: false
+  tags: [tv_multiview_mutation]
+
+- name: Install tv-multiview binary
+  ansible.builtin.copy:
+    src: "{{ playbook_dir }}/../tv-multiview/target/release/tv-multiview"
+    dest: "{{ ansible_facts.env.HOME }}/.local/bin/tv-multiview"
+    mode: "0755"
+    remote_src: false
+  register: tv_multiview_binary_install
+  tags: [tv_multiview_mutation]
+
+- name: Ensure lingering is enabled (so user services survive without an active login)
+  become: true
+  ansible.builtin.command: "loginctl enable-linger {{ ansible_facts.user_id }}"
+  changed_when: false
+
+- name: Add spoke hostnames to /etc/hosts
+  become: true
+  ansible.builtin.lineinfile:
+    path: /etc/hosts
+    line: "{{ hostvars[item].ansible_host }} {{ item }}"
+    state: present
+  loop:
+    - "{{ groups['mac_desktop'][0] }}"
+    - "{{ groups['windows_desktop'][0] }}"
+
+- name: Ensure lan-mouse config dir exists
+  ansible.builtin.file:
+    path: "{{ ansible_facts.env.HOME }}/.config/lan-mouse"
+    state: directory
+    mode: "0755"
+
+- name: Ensure tv-multiview config dir exists
+  ansible.builtin.file:
+    path: "{{ ansible_facts.env.HOME }}/.config/tv-multiview"
+    state: directory
+    mode: "0700"
+  tags: [tv_multiview_mutation]
+
+- name: Verify shared LG client-key database exists
+  ansible.builtin.stat:
+    path: "{{ tv_multiview_client_key_path }}"
+  register: tv_client_key
+  tags: [tv_multiview_mutation]
+
+- name: Require existing LG client-key database
+  ansible.builtin.assert:
+    that: tv_client_key.stat.exists
+    fail_msg: "Missing LG client-key database at {{ tv_multiview_client_key_path }}"
+  tags: [tv_multiview_mutation]
+
+- name: Deploy authenticated tv-multiview configuration
+  ansible.builtin.template:
+    src: templates/tv-multiview-config.toml.j2
+    dest: "{{ tv_multiview_config_path }}"
+    mode: "0600"
+  register: daemon_config_template
+  no_log: true
+  tags: [tv_multiview_mutation]
+
+- name: Deploy lan-mouse hub configuration
+  ansible.builtin.template:
+    src: templates/hub-config.toml.j2
+    dest: "{{ ansible_facts.env.HOME }}/.config/lan-mouse/config.toml"
+    mode: "0600"
+  register: hub_config_template
+  no_log: true
+
+- name: Ensure systemd user dir exists
+  ansible.builtin.file:
+    path: "{{ ansible_facts.env.HOME }}/.config/systemd/user"
+    state: directory
+    mode: "0755"
+
+- name: Deploy lan-mouse systemd user unit
+  ansible.builtin.template:
+    src: templates/lan-mouse.service.j2
+    dest: "{{ ansible_facts.env.HOME }}/.config/systemd/user/lan-mouse.service"
+    mode: "0644"
+  vars:
+    lan_mouse_binary: "/usr/bin/lan-mouse"
+  register: lm_service_template
+
+- name: Deploy tv-multiview systemd user unit
+  ansible.builtin.template:
+    src: templates/tv-multiview.service.j2
+    dest: "{{ ansible_facts.env.HOME }}/.config/systemd/user/tv-multiview.service"
+    mode: "0644"
+  vars:
+    tv_multiview_binary: "{{ ansible_facts.env.HOME }}/.local/bin/tv-multiview"
+  register: daemon_service_template
+  tags: [tv_multiview_mutation]
+
+- name: Define Linux runtime change boundaries
+  ansible.builtin.set_fact:
+    lan_mouse_linux_runtime_changed: true
+    tv_multiview_runtime_changed: >-
+      {{ (tv_multiview_binary_install.changed | default(false))
+         or (daemon_config_template.changed | default(false))
+         or (daemon_service_template.changed | default(false)) }}
+
+- name: Reload systemd user daemon for changed units
+  ansible.builtin.systemd:
+    scope: user
+    daemon_reload: true
+  environment:
+    XDG_RUNTIME_DIR: "/run/user/{{ ansible_facts.user_uid }}"
+  when: >-
+    lm_service_template.changed
+    or (daemon_service_template.changed | default(false))
+
+- name: Stop lan-mouse before replacing the TV control plane
+  ansible.builtin.systemd:
+    name: lan-mouse.service
+    scope: user
+    state: stopped
+  environment:
+    XDG_RUNTIME_DIR: "/run/user/{{ ansible_facts.user_uid }}"
+  when: tv_multiview_runtime_changed
+
+- name: Restart changed tv-multiview with input local
+  ansible.builtin.systemd:
+    name: tv-multiview.service
+    scope: user
+    enabled: true
+    state: restarted
+  environment:
+    XDG_RUNTIME_DIR: "/run/user/{{ ansible_facts.user_uid }}"
+  when: tv_multiview_runtime_changed
+
+- name: Restart lan-mouse for changed Lan Mouse or TV runtime inputs
+  ansible.builtin.systemd:
+    name: lan-mouse.service
+    scope: user
+    enabled: true
+    state: restarted
+  environment:
+    XDG_RUNTIME_DIR: "/run/user/{{ ansible_facts.user_uid }}"
+  when: lan_mouse_linux_runtime_changed or tv_multiview_runtime_changed
+
+- name: Ensure both Linux services are enabled and started
+  ansible.builtin.systemd:
+    name: "{{ item }}"
+    scope: user
+    enabled: true
+    state: started
+  environment:
+    XDG_RUNTIME_DIR: "/run/user/{{ ansible_facts.user_uid }}"
+  loop:
+    - tv-multiview.service
+    - lan-mouse.service
+
+- name: Verify services are running
+  ansible.builtin.command:
+    argv: [systemctl, --user, is-active, "{{ item }}"]
+  environment:
+    XDG_RUNTIME_DIR: "/run/user/{{ ansible_facts.user_uid }}"
+  register: service_status
+  failed_when: service_status.rc != 0 or service_status.stdout | trim != 'active'
+  loop:
+    - tv-multiview.service
+    - lan-mouse.service
+  changed_when: false
+
+- name: Verify daemon health endpoint
+  ansible.builtin.uri:
+    url: "http://{{ hostvars[groups['linux_desktop'][0]].ansible_host }}:{{ daemon_port }}/health"
+    status_code: 200
+  register: daemon_health
+  retries: 10
+  delay: 1
+  until: daemon_health.status == 200
+  changed_when: false
+
+- name: Require synchronized daemon readiness after Linux deployment
+  ansible.builtin.uri:
+    url: "http://{{ hostvars[groups['linux_desktop'][0]].ansible_host }}:{{ daemon_port }}/ready"
+    headers:
+      Authorization: "Bearer {{ lookup('ansible.builtin.file', lan_mouse_controller_token_file) | trim }}"
+    status_code: 200
+    return_content: true
+  register: daemon_ready
+  retries: "{{ tv_multiview_deploy_ready_retries }}"
+  delay: "{{ tv_multiview_deploy_ready_delay_seconds }}"
+  until: >-
+    (daemon_ready.status | default(0) == 200)
+    and (daemon_ready.json is defined)
+    and (daemon_ready.json.data.ready | default(false) | bool)
+    and not (daemon_ready.json.data.fallback_required | default(true) | bool)
+  changed_when: false
+  no_log: true
+
+# Firewall policy remains externally owned. The Linux host must admit UDP
+# and TCP {{ lan_mouse_port }}, plus authenticated controller TCP
+# {{ daemon_port }}, from this LAN.

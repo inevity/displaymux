@@ -9,32 +9,36 @@ ansible-galaxy collection install ansible.windows community.general
 
 **On the Windows host, once, before this playbook can reach it at all:**
 Enable OpenSSH Server and install Git, rustup, PowerShell 7, and Visual Studio
-Build Tools with the MSVC x64 component. Ansible connects through SSH and
-builds the no-GTK executable on Windows itself.
+Build Tools with the MSVC x64 component. The playbook installs its selected
+Rust toolchain only when the native `rustc.exe` is absent, then builds the
+no-GTK executable on Windows itself.
 
 **On macOS:**
-Install Xcode command-line tools and Homebrew rustup. The playbook builds the
-no-GTK executable natively with the selected rustup toolchain.
+Install Xcode command-line tools and Homebrew rustup. The playbook installs its
+selected Rust toolchain only when the native `rustc` is absent, then builds the
+no-GTK executable natively.
 
 **Edit before running:**
 - `inventory.ini` — real hostnames, IPs, users.
-- `group_vars/all.yml` — pinned lan-mouse revision, TV address, HDMI mapping,
-  server host, fingerprints, controller timeouts, and native build features.
+- `group_vars/all.yml` — TV address, HDMI mapping, server host, fingerprints,
+  controller timeouts, and native build features.
 - Windows SSH credentials — keep them in Ansible Vault or pass them as extra
   variables instead of committing new plaintext credentials.
-- The sibling `../../lan-mouse` checkout must be clean and exactly at
-  `lan_mouse_revision`; artifact preparation fails closed otherwise.
+- The sibling `../../lan-mouse` checkout is the source deployed by the
+  playbook. There is no configured revision pin or installed build-ID cache.
 
 Run:
 ```bash
 ansible-playbook -i inventory.ini playbook.yml
 ```
 
-The first play creates a pinned git bundle, a locked Cargo vendor tree and ZIP
-under `/tmp`, and a persistent controller token under
+The first play creates a git bundle from the local checkout, a locked Cargo
+vendor tree and ZIP under `/tmp`, and a persistent controller token under
 `~/.local/state/lan-mouse-deploy/`. `--limit localhost` runs only that artifact
 preparation play; it does not deploy or restart any host. The vendor tree needs
 roughly 640 MiB with the current lockfile, plus its archive and Cargo cache.
+After artifact preparation, Linux, macOS, and Windows run their native test,
+build, install, and service-restart sequences concurrently.
 
 ## After running (can't be automated, has to happen once by hand)
 
@@ -58,6 +62,7 @@ roughly 640 MiB with the current lockfile, plus its archive and Cargo cache.
 - Windows runs the native daemon through `LanMouseDaemon`; bounded persistent
   logs are under `%LOCALAPPDATA%\lan-mouse\logs` with five 10 MiB backups.
 
-All three hosts build the same pinned source bundle against the same locked
-vendor archive. The GTK workspace member is excluded, and no release archive,
-legacy `enter_hook`, or compatibility protocol is used.
+Every run replaces the build source and builds and installs it on all three
+hosts against the same locked vendor archive. The GTK workspace member is
+excluded, and no release archive, legacy `enter_hook`, or compatibility
+protocol is used.

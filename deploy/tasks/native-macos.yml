@@ -10,92 +10,62 @@
     - "{{ ansible_facts.env.HOME }}/Library/LaunchAgents"
     - "{{ ansible_facts.env.HOME }}/Library/Logs"
 
-- name: Require Homebrew rustup on macOS
-  ansible.builtin.stat:
-    path: /usr/local/bin/rustup
-  register: mac_rustup
-
-- name: Validate macOS native build prerequisites
-  ansible.builtin.assert:
-    that:
-      - ansible_facts.architecture == 'x86_64'
-      - mac_rustup.stat.exists
-      - lan_mouse_macos_build_profile in ['debug', 'release']
-    fail_msg: >-
-      macOS requires Intel Xcode tools, /usr/local/bin/rustup, and a
-      lan_mouse_macos_build_profile of debug or release
-
-- name: Install selected macOS Rust toolchain
+- name: Bootstrap selected macOS Rust toolchain once
   ansible.builtin.command:
     argv: [/usr/local/bin/rustup, toolchain, install, "{{ lan_mouse_rust_toolchain }}", --profile, minimal]
-  changed_when: false
-
-- name: Read macOS Rust compiler identity
-  ansible.builtin.command:
-    argv: [/usr/local/bin/rustup, run, "{{ lan_mouse_rust_toolchain }}", rustc, --version]
-  register: mac_rust_version
-  changed_when: false
+  args:
+    creates: >-
+      {{ ansible_facts.env.HOME }}/.rustup/toolchains/{{ lan_mouse_rust_toolchain }}-{{
+      'aarch64' if ansible_facts.architecture == 'arm64' else ansible_facts.architecture
+      }}-apple-darwin/bin/rustc
 
 - name: Select macOS Cargo build profile
   ansible.builtin.set_fact:
     mac_cargo_profile: "{{ 'dev' if lan_mouse_macos_build_profile == 'debug' else 'release' }}"
     mac_target_profile_dir: "{{ 'debug' if lan_mouse_macos_build_profile == 'debug' else 'release' }}"
 
-- name: Define macOS native build identity
-  ansible.builtin.set_fact:
-    mac_build_id: >-
-      {{ lan_mouse_revision }} lock={{ lan_mouse_cargo_lock_sha256 }}
-      rust={{ mac_rust_version.stdout | trim }} no-default-features
-      profile={{ lan_mouse_macos_build_profile }}
-
-- name: Locate selected macOS Cargo binary
+- name: Resolve selected macOS Cargo path
   ansible.builtin.command:
     argv: [/usr/local/bin/rustup, which, --toolchain, "{{ lan_mouse_rust_toolchain }}", cargo]
   register: mac_cargo
   changed_when: false
 
-- name: Copy pinned source bundle to macOS
+- name: Copy source bundle to macOS
   ansible.builtin.copy:
     src: "{{ source_bundle }}"
-    dest: "{{ mac_build_cache }}/source-{{ lan_mouse_revision[:12] }}.bundle"
+    dest: "{{ mac_build_cache }}/source.bundle"
     mode: "0644"
 
 - name: Copy locked vendor archive to macOS
   ansible.builtin.copy:
     src: "{{ vendor_archive }}"
-    dest: "{{ mac_build_cache }}/vendor-{{ lan_mouse_revision[:12] }}.zip"
+    dest: "{{ mac_build_cache }}/vendor.zip"
     mode: "0644"
 
 - name: Extract locked Cargo vendor tree on macOS
   ansible.builtin.unarchive:
-    src: "{{ mac_build_cache }}/vendor-{{ lan_mouse_revision[:12] }}.zip"
+    src: "{{ mac_build_cache }}/vendor.zip"
     dest: "{{ mac_build_cache }}"
     remote_src: true
     creates: "{{ mac_vendor_dir }}"
 
-- name: Clone pinned lan-mouse source on macOS
+- name: Remove previous lan-mouse source on macOS
+  ansible.builtin.file:
+    path: "{{ mac_source_dir }}"
+    state: absent
+
+- name: Deploy lan-mouse source on macOS
   ansible.builtin.command:
     argv:
       - git
       - clone
-      - "{{ mac_build_cache }}/source-{{ lan_mouse_revision[:12] }}.bundle"
+      - "{{ mac_build_cache }}/source.bundle"
       - "{{ mac_source_dir }}"
-    creates: "{{ mac_source_dir }}/.git"
 
 - name: Record source repository origin on macOS
   ansible.builtin.command:
     argv: [git, -C, "{{ mac_source_dir }}", remote, set-url, origin, "{{ lan_mouse_repo_url }}"]
   changed_when: false
-
-- name: Verify macOS source revision
-  ansible.builtin.command:
-    argv: [git, -C, "{{ mac_source_dir }}", rev-parse, HEAD]
-  register: mac_source_revision
-  changed_when: false
-
-- name: Require exact macOS source revision
-  ansible.builtin.assert:
-    that: mac_source_revision.stdout | trim == lan_mouse_revision
 
 - name: Ensure checkout-local Cargo config directory exists on macOS
   ansible.builtin.file:
@@ -111,31 +81,7 @@
   vars:
     cargo_vendor_path: "{{ mac_vendor_dir }}"
 
-- name: Check installed macOS build identity
-  ansible.builtin.stat:
-    path: "{{ mac_installed_build_id }}"
-  register: mac_build_id_stat
-
-- name: Read installed macOS build identity
-  ansible.builtin.slurp:
-    path: "{{ mac_installed_build_id }}"
-  register: mac_build_id_content
-  when: mac_build_id_stat.stat.exists
-
-- name: Check installed macOS binary
-  ansible.builtin.stat:
-    path: "{{ mac_installed_binary }}"
-  register: mac_binary_stat
-
-- name: Decide whether macOS native build is required
-  ansible.builtin.set_fact:
-    mac_build_required: >-
-      {{ not mac_build_id_stat.stat.exists
-         or not mac_binary_stat.stat.exists
-         or (mac_build_id_content.content | default('') | b64decode | trim != mac_build_id) }}
-
-- name: Test and build pinned lan-mouse natively on macOS
-  when: mac_build_required
+- name: Test and build lan-mouse natively on macOS
   environment:
     CARGO_TARGET_DIR: "{{ mac_target_dir }}"
     CARGO_INCREMENTAL: "0"
@@ -190,7 +136,6 @@
         dest: "{{ mac_installed_binary }}"
         remote_src: true
         mode: "0755"
-      register: mac_binary_install
 
 - name: Add Linux host to /etc/hosts
   become: true
@@ -207,7 +152,6 @@
   vars:
     spoke_position: "{{ mac_spoke_position }}"
     spoke_host: mac
-  register: mac_config
   no_log: true
 
 - name: Deploy bounded macOS log wrapper
@@ -217,7 +161,6 @@
     mode: "0755"
   vars:
     lan_mouse_macos_binary: "{{ mac_installed_binary }}"
-  register: mac_wrapper_template
 
 - name: Deploy LaunchAgent
   ansible.builtin.template:
@@ -226,7 +169,6 @@
     mode: "0644"
   vars:
     lm_launcher_path: "{{ mac_wrapper }}"
-  register: plist_deploy
 
 - name: Check if LaunchAgent is already loaded
   ansible.builtin.command: launchctl list com.feschber.lan-mouse
@@ -237,14 +179,13 @@
 - name: Unload changed LaunchAgent
   ansible.builtin.command:
     argv: [launchctl, unload, "{{ ansible_facts.env.HOME }}/Library/LaunchAgents/com.feschber.lan-mouse.plist"]
-  when: la_loaded.rc == 0 and (mac_build_required or mac_config.changed or mac_wrapper_template.changed or plist_deploy.changed)
+  when: la_loaded.rc == 0
   failed_when: false
   changed_when: true
 
 - name: Load current LaunchAgent
   ansible.builtin.command:
     argv: [launchctl, load, -w, "{{ ansible_facts.env.HOME }}/Library/LaunchAgents/com.feschber.lan-mouse.plist"]
-  when: la_loaded.rc != 0 or mac_build_required or mac_config.changed or mac_wrapper_template.changed or plist_deploy.changed
   changed_when: true
 
 - name: Allow lan-mouse through macOS Application Firewall
@@ -277,9 +218,3 @@
 - name: Require persistent macOS log sources
   ansible.builtin.assert:
     that: mac_logs.results | selectattr('stat.exists', 'equalto', true) | list | length == 2
-
-- name: Record installed macOS build identity
-  ansible.builtin.copy:
-    content: "{{ mac_build_id }}\n"
-    dest: "{{ mac_installed_build_id }}"
-    mode: "0644"

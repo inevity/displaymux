@@ -1,10 +1,10 @@
 # Maintainer: CupricReki
 # Maintainer: feschber
-# Managed by Ansible - GTK stripped, pinned to {{ lan_mouse_revision }}.
+# Managed by Ansible - GTK stripped local source build.
 
 pkgname=lan-mouse-git
 _pkgname=lan-mouse
-pkgver=0.11.0.r{{ lan_mouse_revision[:12] }}
+pkgver=0.11.0.rlocal
 pkgrel=1
 pkgdesc="Software KVM Switch / mouse & keyboard sharing software for Local Area Networks"
 url="{{ lan_mouse_repo_url }}"
@@ -12,7 +12,7 @@ license=("GPL-3.0-only")
 arch=(x86_64)
 provides=("$_pkgname=${pkgver/\.r*/}")
 conflicts=("$_pkgname")
-source=("$_pkgname"::"git+file://{{ lan_mouse_linux_source_dir }}#commit={{ lan_mouse_revision }}")
+source=("$_pkgname"::"git+file://{{ lan_mouse_linux_source_dir }}")
 sha256sums=('SKIP')
 depends=(libx11 libxtst glibc gcc-libs)
 makedepends=(git cargo rust cmake pkgconf)
