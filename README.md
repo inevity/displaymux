@@ -119,6 +119,11 @@ First make sure to [install the necessary dependencies](#installing-dependencies
 Precompiled release binaries for Windows, MacOS and Linux are available in the [releases section](https://github.com/feschber/lan-mouse/releases).
 For Windows, the depenedencies are included in the .zip file, for other operating systems see [Installing Dependencies](#installing-dependencies-for-development--compiling-from-source).
 
+Releases also provide `lan-mouse-no-gtk-*` archives for CLI and daemon
+deployments. These contain the no-GTK `lan-mouse` executable and its license;
+the existing packages and application bundles continue to include the GTK
+frontend.
+
 Alternatively, the `lan-mouse` binary can be compiled from source (see below).
 
 ### Installing desktop file, app icon and firewall rules (optional)
