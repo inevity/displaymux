@@ -204,6 +204,10 @@ fn post_event(event: &CGEvent) {
     event.post(CGEventTapLocation::HID);
 }
 
+fn pointer_delta(from: CGPoint, to: CGPoint) -> (i64, i64) {
+    ((to.x - from.x) as i64, (to.y - from.y) as i64)
+}
+
 fn resolve_display(selector: Option<MacDisplaySelector>) -> Result<CGDirectDisplayID, io::Error> {
     let active = CGDisplay::active_displays()
         .map_err(|error| io::Error::other(format!("could not list active displays: {error}")))?;
@@ -618,6 +622,9 @@ impl Emulation for MacOSEmulation {
     fn center_pointer(&mut self, _handle: EmulationHandle) -> Result<(), EmulationError> {
         let display = resolve_display(self.display_selector)?;
         let center = display_center(get_display_bounds(display));
+        let current = self
+            .get_mouse_location()
+            .ok_or_else(|| io::Error::other("could not read mouse location"))?;
         let event = CGEvent::new_mouse_event(
             self.event_source.clone(),
             CGEventType::MouseMoved,
@@ -625,6 +632,9 @@ impl Emulation for MacOSEmulation {
             CGMouseButton::Left,
         )
         .map_err(|_| io::Error::other("could not create pointer-centering event"))?;
+        let (delta_x, delta_y) = pointer_delta(current, center);
+        event.set_integer_value_field(EventField::MOUSE_EVENT_DELTA_X, delta_x);
+        event.set_integer_value_field(EventField::MOUSE_EVENT_DELTA_Y, delta_y);
         post_event(&event);
         Ok(())
     }
@@ -745,6 +755,20 @@ mod tests {
     #[test]
     fn rejects_incomplete_display_selector() {
         assert!(MacDisplaySelector::parse("7789:33485").is_err());
+    }
+
+    #[test]
+    fn pointer_centering_preserves_inward_motion_delta() {
+        let center = CGPoint::new(-289.0, -1080.0);
+
+        assert_eq!(
+            pointer_delta(CGPoint::new(-2208.0, -1080.0), center),
+            (1919, 0)
+        );
+        assert_eq!(
+            pointer_delta(CGPoint::new(1630.0, -1080.0), center),
+            (-1919, 0)
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
