@@ -218,8 +218,11 @@
       changed_when: false
       failed_when: >-
         mac_designated_requirement.rc != 0
-        or 'cdhash' in mac_designated_requirement.stderr
-        or lan_mouse_macos_codesign_identifier not in mac_designated_requirement.stderr
+        or 'cdhash' in ((mac_designated_requirement.stdout | default(''))
+                        ~ (mac_designated_requirement.stderr | default('')))
+        or lan_mouse_macos_codesign_identifier
+           not in ((mac_designated_requirement.stdout | default(''))
+                   ~ (mac_designated_requirement.stderr | default('')))
 
     - name: Install stable macOS daemon binary
       ansible.builtin.copy:
