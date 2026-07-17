@@ -150,6 +150,19 @@ fn confirm_pointer_lock(
     pending_begin.take()
 }
 
+fn queue_confirmed_begin(
+    pending_events: &mut VecDeque<(Position, CaptureEvent)>,
+    pos: Position,
+) {
+    let insert_at = pending_events
+        .iter()
+        .position(|(queued_pos, event)| {
+            *queued_pos == pos && matches!(event, CaptureEvent::Input(_))
+        })
+        .unwrap_or(pending_events.len());
+    pending_events.insert(insert_at, (pos, CaptureEvent::Begin));
+}
+
 struct Inner {
     state: State,
     queue: EventQueue<State>,
@@ -501,7 +514,7 @@ impl State {
 
     fn begin_when_pointer_locked(&mut self, pos: Position) {
         if self.pointer_lock_state == PointerLockState::Locked {
-            self.pending_events.push_back((pos, CaptureEvent::Begin));
+            queue_confirmed_begin(&mut self.pending_events, pos);
         } else {
             self.pending_begin = Some(pos);
         }
@@ -512,7 +525,7 @@ impl State {
             &mut self.pointer_lock_state,
             &mut self.pending_begin,
         ) {
-            self.pending_events.push_back((pos, CaptureEvent::Begin));
+            queue_confirmed_begin(&mut self.pending_events, pos);
         }
     }
 
@@ -1187,5 +1200,24 @@ mod tests {
         assert_eq!(state, PointerLockState::Locked);
         assert_eq!(confirmed, Some(Position::Right));
         assert_eq!(pending_begin, None);
+    }
+
+    #[test]
+    fn confirmed_begin_precedes_input_queued_during_lock_setup() {
+        let modifiers = CaptureEvent::Input(Event::Keyboard(KeyboardEvent::Modifiers {
+            depressed: 0,
+            latched: 0,
+            locked: 16,
+            group: 0,
+        }));
+        let mut pending_events = VecDeque::from([(Position::Left, modifiers)]);
+
+        queue_confirmed_begin(&mut pending_events, Position::Left);
+
+        assert_eq!(
+            pending_events.pop_front(),
+            Some((Position::Left, CaptureEvent::Begin))
+        );
+        assert_eq!(pending_events.pop_front(), Some((Position::Left, modifiers)));
     }
 }
