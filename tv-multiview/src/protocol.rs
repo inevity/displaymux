@@ -515,7 +515,11 @@ pub fn apply(
         }
         Event::Cancel { request_id, reason } => {
             if next.request_history.iter().rev().any(|request| {
-                request.request_id == request_id && request.status == RequestStatus::Cancelled
+                request.request_id == request_id
+                    && matches!(
+                        request.status,
+                        RequestStatus::Cancelled | RequestStatus::Fallback
+                    )
             }) {
                 return validated(next, effects, now_ms);
             }
@@ -848,6 +852,18 @@ fn begin_fallback(
     timing: ProtocolTiming,
     reason: &str,
 ) {
+    let committed_request_id = state
+        .active_session
+        .as_ref()
+        .map(|session| session.request_id.clone());
+    if let Some(request_id) = committed_request_id {
+        if let Some(request) = state.archived_request_mut(&request_id) {
+            if request.status == RequestStatus::Committed {
+                request.status = RequestStatus::Fallback;
+                request.reason = Some(reason.to_string());
+            }
+        }
+    }
     release_to_server(state);
     state.fallback_required = true;
     state.fallback_reason = Some(reason.to_string());
@@ -1655,6 +1671,40 @@ mod tests {
         .unwrap();
         assert!(repeated.effects.is_empty());
         assert_eq!(repeated.next, cancelled.next);
+    }
+
+    #[test]
+    fn cancelling_after_readiness_fallback_is_idempotent() {
+        let remote = remote_owned();
+        let request_id = remote.active_session.as_ref().unwrap().request_id.clone();
+        let fallback = apply(
+            &remote,
+            Event::PeerReadinessUpdated {
+                host: Host::Mac,
+                readiness: PeerReadiness::default(),
+            },
+            40,
+            TIMING,
+        )
+        .unwrap();
+        assert_eq!(
+            fallback.next.request(&request_id).unwrap().status,
+            RequestStatus::Fallback
+        );
+
+        let repeated = apply(
+            &fallback.next,
+            Event::Cancel {
+                request_id,
+                reason: "peer_readiness_lost".to_string(),
+            },
+            41,
+            TIMING,
+        )
+        .unwrap();
+
+        assert!(repeated.effects.is_empty());
+        assert_eq!(repeated.next, fallback.next);
     }
 
     #[test]
