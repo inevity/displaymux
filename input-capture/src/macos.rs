@@ -32,6 +32,7 @@ use std::{
     sync::{Arc, OnceLock},
     task::{Context, Poll, ready},
     thread::{self},
+    time::Duration,
 };
 use tokio::sync::{
     Mutex,
@@ -48,6 +49,7 @@ struct Bounds {
 }
 
 const EDGE_REARM_DISTANCE: f64 = 3.0;
+const ACTIVE_DISPLAY_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 
 fn covering_bounds(rectangles: impl IntoIterator<Item = (f64, f64, f64, f64)>) -> Option<Bounds> {
     let mut rectangles = rectangles.into_iter();
@@ -801,7 +803,28 @@ impl MacOSInputCapture {
     pub async fn new() -> Result<Self, MacosCaptureCreationError> {
         request_macos_capture_permissions()?;
 
-        let state = Arc::new(Mutex::new(InputCaptureState::new()?));
+        let mut waiting_for_display = false;
+        let state = loop {
+            match InputCaptureState::new() {
+                Ok(state) => {
+                    if waiting_for_display {
+                        log::info!("active display became available; enabling macOS input capture");
+                    }
+                    break state;
+                }
+                Err(MacosCaptureCreationError::NoActiveDisplay) => {
+                    if !waiting_for_display {
+                        log::warn!(
+                            "no active display is available; waiting for display activation"
+                        );
+                        waiting_for_display = true;
+                    }
+                    tokio::time::sleep(ACTIVE_DISPLAY_RETRY_INTERVAL).await;
+                }
+                Err(error) => return Err(error),
+            }
+        };
+        let state = Arc::new(Mutex::new(state));
         let (event_tx, event_rx) = mpsc::channel(32);
         let producer_event_tx = event_tx.clone();
         let (notify_tx, mut notify_rx) = mpsc::unbounded_channel();
