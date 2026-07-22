@@ -1,5 +1,34 @@
 $ErrorActionPreference = "Stop"
 
+$binary = "{{ lan_mouse_windows_binary }}"
+
+function Request-ExistingEmulationRecovery {
+    $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
+    $startInfo.FileName = $binary
+    $startInfo.ArgumentList.Add("cli")
+    $startInfo.ArgumentList.Add("enable-emulation")
+    $startInfo.UseShellExecute = $false
+    $startInfo.CreateNoWindow = $true
+
+    $process = [System.Diagnostics.Process]::new()
+    $process.StartInfo = $startInfo
+    $started = $false
+    try {
+        $started = $process.Start()
+        $process.WaitForExit()
+        return $process.ExitCode -eq 0
+    } finally {
+        if ($started -and -not $process.HasExited) {
+            $process.Kill($true)
+        }
+        $process.Dispose()
+    }
+}
+
+if (Request-ExistingEmulationRecovery) {
+    exit 0
+}
+
 $logDirectory = Join-Path $env:LOCALAPPDATA "lan-mouse\logs"
 $stdoutLog = Join-Path $logDirectory "lan-mouse.log"
 $stderrLog = Join-Path $logDirectory "lan-mouse.err.log"
@@ -58,10 +87,11 @@ function Write-BoundedLog([hashtable]$State, [string]$Line) {
 
 $stdoutState = Open-LogState $stdoutLog
 $stderrState = Open-LogState $stderrLog
+$emulationFailed = $false
 
 $env:RUST_LOG = "{{ lan_mouse_log_filter }}"
 $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
-$startInfo.FileName = "{{ lan_mouse_windows_binary }}"
+$startInfo.FileName = $binary
 $startInfo.ArgumentList.Add("daemon")
 $startInfo.UseShellExecute = $false
 $startInfo.RedirectStandardOutput = $true
@@ -97,8 +127,15 @@ try {
                 $stderrTask = $null
             } else {
                 Write-BoundedLog $stderrState $line
+                if ($line -match '\blan_mouse::emulation\] input emulation exited:') {
+                    $emulationFailed = $true
+                }
                 $stderrTask = $process.StandardError.ReadLineAsync()
             }
+        }
+
+        if ($emulationFailed) {
+            throw "lan-mouse input emulation stopped; requesting a supervised restart"
         }
     }
     $process.WaitForExit()
