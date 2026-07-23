@@ -72,6 +72,10 @@ pub fn router(
             post(renew_enter),
         )
         .route("/internal/readiness/{host}", post(update_readiness))
+        .route(
+            "/internal/manual-recovery/{target}",
+            post(arm_manual_recovery),
+        )
         .route("/multiview/on", post(multiview_on))
         .route("/multiview/off", post(multiview_off))
         .route_layer(middleware::from_fn_with_state(state.clone(), authenticate));
@@ -465,6 +469,35 @@ async fn update_readiness(
     }
 }
 
+async fn arm_manual_recovery(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(target): Path<String>,
+) -> Response {
+    if let Err(error) = authorize(&headers, &state.controller_token) {
+        return error.into_response();
+    }
+    let target = match Host::from_str(&target) {
+        Ok(target) => target,
+        Err(error) => return api_error(StatusCode::BAD_REQUEST, "invalid_host", error.to_string()),
+    };
+    match state
+        .coordinator
+        .apply_safety(Event::ArmManualRecovery { target })
+        .await
+    {
+        Ok(snapshot) => Json(ApiEnvelope::new(
+            state.coordinator.now_ms(),
+            ManualRecoveryResponse {
+                target,
+                armed: snapshot.manual_recovery_target == Some(target),
+            },
+        ))
+        .into_response(),
+        Err(error) => coordinator_error(error),
+    }
+}
+
 async fn multiview_on(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
     multiview(state, headers, true).await
 }
@@ -555,6 +588,9 @@ fn coordinator_error(error: CoordinatorError) -> Response {
             | ProtocolError::RequestIdentityConflict
             | ProtocolError::InputNotLocal,
         ) => api_error(StatusCode::CONFLICT, "request_conflict", error.to_string()),
+        CoordinatorError::Protocol(ProtocolError::InvalidManualRecoveryTarget) => {
+            api_error(StatusCode::BAD_REQUEST, "invalid_target", error.to_string())
+        }
         CoordinatorError::Protocol(ProtocolError::Invariant(_)) => api_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             "invariant_violation",
@@ -736,6 +772,12 @@ struct ReadinessResponse {
 }
 
 #[derive(Debug, Serialize)]
+struct ManualRecoveryResponse {
+    target: Host,
+    armed: bool,
+}
+
+#[derive(Debug, Serialize)]
 struct MultiViewResponse {
     enabled: bool,
     phase: crate::domain::ProtocolPhase,
@@ -747,7 +789,7 @@ mod tests {
     use super::*;
     use crate::{
         coordinator,
-        domain::{ProtocolState, TvMode},
+        domain::{ProtocolPhase, ProtocolState, TvMode},
         protocol::ProtocolTiming,
     };
     use axum::{
@@ -1276,5 +1318,49 @@ mod tests {
             effects.ordinary.recv().await,
             Some(crate::protocol::Effect::SetMultiView { enabled: true, .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn manual_recovery_route_arms_target_without_commanding_tv() {
+        let (app, handle, mut effects) = ready_app().await;
+        let response = app
+            .oneshot(
+                authenticated(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/internal/manual-recovery/windows"),
+                )
+                .body(Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response).await;
+        assert_eq!(body["data"]["target"], "windows");
+        assert_eq!(body["data"]["armed"], true);
+        assert_eq!(
+            handle.snapshot().manual_recovery_target,
+            Some(Host::Windows)
+        );
+        assert!(tokio::time::timeout(
+            std::time::Duration::from_millis(10),
+            effects.ordinary.recv(),
+        )
+        .await
+        .is_err());
+
+        let manual = handle
+            .apply_safety(Event::SubscriptionObserved {
+                mode: TvMode::Fullscreen,
+                input: Some(Host::Windows),
+            })
+            .await
+            .unwrap();
+        assert_eq!(manual.phase, ProtocolPhase::Idle);
+        assert!(!manual.fallback_required);
+        assert_eq!(manual.keyboard_owner, Host::Linux);
+        assert_eq!(manual.pointer_owner, Host::Linux);
     }
 }

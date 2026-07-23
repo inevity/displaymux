@@ -32,6 +32,9 @@ pub enum Event {
         host: Host,
         readiness: PeerReadiness,
     },
+    ArmManualRecovery {
+        target: Host,
+    },
     CreateEnter {
         request_id: String,
         client_id: String,
@@ -93,6 +96,7 @@ impl Event {
             Self::TransportSynchronized { .. } => "transport_synchronized",
             Self::TransportDisconnected { .. } => "transport_disconnected",
             Self::PeerReadinessUpdated { .. } => "peer_readiness_updated",
+            Self::ArmManualRecovery { .. } => "arm_manual_recovery",
             Self::CreateEnter { .. } => "create_enter",
             Self::CommandAcknowledged { .. } => "command_acknowledged",
             Self::CommandFailed { .. } => "command_failed",
@@ -151,6 +155,8 @@ pub enum ProtocolError {
     StaleIdentity,
     #[error("multiview change requires local server ownership")]
     InputNotLocal,
+    #[error("manual recovery target must be a remote host")]
+    InvalidManualRecoveryTarget,
     #[error("protocol invariant failed: {0}")]
     Invariant(String),
 }
@@ -255,6 +261,22 @@ pub fn apply(
                     );
                 }
             }
+        }
+        Event::ArmManualRecovery { target } => {
+            if target == next.server_host {
+                return Err(ProtocolError::InvalidManualRecoveryTarget);
+            }
+            if !state.ready()
+                || state.phase != ProtocolPhase::Idle
+                || state.keyboard_owner != state.server_host
+                || state.pointer_owner != state.server_host
+                || state.active_request.is_some()
+                || state.active_session.is_some()
+                || !server_display_verified(state, state.switch_epoch)
+            {
+                return Err(ProtocolError::Unavailable);
+            }
+            next.manual_recovery_target = Some(target);
         }
         Event::CreateEnter {
             request_id,
@@ -1474,6 +1496,66 @@ mod tests {
         )
         .unwrap();
         assert_eq!(returned.next.manual_recovery_target, None);
+    }
+
+    #[test]
+    fn explicit_manual_recovery_requires_settled_server_fallback() {
+        let state = synchronized();
+        let armed = apply(
+            &state,
+            Event::ArmManualRecovery {
+                target: Host::Windows,
+            },
+            10,
+            TIMING,
+        )
+        .unwrap();
+
+        assert!(armed.effects.is_empty());
+        assert_eq!(armed.next.phase, ProtocolPhase::Idle);
+        assert_eq!(armed.next.keyboard_owner, Host::Linux);
+        assert_eq!(armed.next.pointer_owner, Host::Linux);
+        assert_eq!(armed.next.manual_recovery_target, Some(Host::Windows));
+
+        let manual = apply(
+            &armed.next,
+            Event::SubscriptionObserved {
+                mode: TvMode::Fullscreen,
+                input: Some(Host::Windows),
+            },
+            11,
+            TIMING,
+        )
+        .unwrap();
+        assert!(manual.effects.is_empty());
+        assert_eq!(manual.next.phase, ProtocolPhase::Idle);
+        assert!(!manual.next.fallback_required);
+
+        let remote = remote_owned();
+        assert_eq!(
+            apply(
+                &remote,
+                Event::ArmManualRecovery {
+                    target: Host::Windows,
+                },
+                40,
+                TIMING,
+            )
+            .unwrap_err(),
+            ProtocolError::Unavailable
+        );
+        assert_eq!(
+            apply(
+                &state,
+                Event::ArmManualRecovery {
+                    target: Host::Linux,
+                },
+                10,
+                TIMING,
+            )
+            .unwrap_err(),
+            ProtocolError::InvalidManualRecoveryTarget
+        );
     }
 
     #[test]
