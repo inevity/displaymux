@@ -246,7 +246,7 @@ pub fn apply(
                     .map(|session| session.lease.peer_session_epoch)
                     .unwrap_or_default();
                 if !readiness.bundle_ready(active_session_epoch) {
-                    begin_fallback(
+                    begin_active_session_failure_fallback(
                         &mut next,
                         &mut effects,
                         now_ms,
@@ -421,7 +421,7 @@ pub fn apply(
                     if session.switch_epoch == switch_epoch
                         && !target_display_verified(&next, session.target, switch_epoch)
                     {
-                        begin_fallback(
+                        begin_active_session_failure_fallback(
                             &mut next,
                             &mut effects,
                             now_ms,
@@ -581,7 +581,7 @@ pub fn apply(
                         .is_some_and(|peer| peer.bundle_ready(peer_session_epoch))
             });
             if !valid {
-                begin_fallback(
+                begin_active_session_failure_fallback(
                     &mut next,
                     &mut effects,
                     now_ms,
@@ -729,7 +729,7 @@ pub fn apply(
             if next.active_session.as_ref().is_some_and(|session| {
                 session.renewed_until_ms <= now_ms || session.lease.expires_at_ms <= now_ms
             }) {
-                begin_fallback(
+                begin_active_session_failure_fallback(
                     &mut next,
                     &mut effects,
                     now_ms,
@@ -754,7 +754,17 @@ pub fn apply(
                     .is_some_and(|deadline| deadline <= now_ms)
             {
                 let reason = verification_timeout_reason(&next);
-                begin_fallback(&mut next, &mut effects, now_ms, timing, reason);
+                if next.active_session.is_some() {
+                    begin_active_session_failure_fallback(
+                        &mut next,
+                        &mut effects,
+                        now_ms,
+                        timing,
+                        reason,
+                    );
+                } else {
+                    begin_fallback(&mut next, &mut effects, now_ms, timing, reason);
+                }
             } else if next.phase == ProtocolPhase::Verifying
                 && next
                     .phase_deadline_ms
@@ -911,6 +921,24 @@ fn begin_fallback(
         state.phase = ProtocolPhase::FallbackDeferred;
         state.phase_deadline_ms = None;
     }
+}
+
+fn begin_active_session_failure_fallback(
+    state: &mut ProtocolState,
+    effects: &mut Vec<Effect>,
+    now_ms: u64,
+    timing: ProtocolTiming,
+    reason: &str,
+) {
+    if let Some(target) = state
+        .active_session
+        .as_ref()
+        .map(|session| session.target)
+        .filter(|target| *target != state.server_host)
+    {
+        state.manual_recovery_target = Some(target);
+    }
+    begin_fallback(state, effects, now_ms, timing, reason);
 }
 
 fn issue_fallback_command(
@@ -2082,6 +2110,65 @@ mod tests {
             readiness_lost.next.fallback_reason.as_deref(),
             Some("active_peer_readiness_lost")
         );
+    }
+
+    #[test]
+    fn active_readiness_loss_allows_manual_recovery_after_server_fallback() {
+        let remote = remote_owned();
+        let failed = apply(
+            &remote,
+            Event::PeerReadinessUpdated {
+                host: Host::Mac,
+                readiness: PeerReadiness::default(),
+            },
+            40,
+            TIMING,
+        )
+        .unwrap()
+        .next;
+
+        assert_eq!(failed.keyboard_owner, Host::Linux);
+        assert_eq!(failed.pointer_owner, Host::Linux);
+        assert_eq!(failed.manual_recovery_target, Some(Host::Mac));
+        assert_eq!(
+            failed.fallback_reason.as_deref(),
+            Some("active_peer_readiness_lost")
+        );
+
+        let verifying = acknowledge_switch(&failed, 41);
+        let recovered = apply(
+            &verifying,
+            Event::Observation {
+                switch_epoch: verifying.switch_epoch,
+                mode: TvMode::Fullscreen,
+                input: Some(Host::Linux),
+                signals: signals(Host::Linux),
+            },
+            42,
+            TIMING,
+        )
+        .unwrap()
+        .next;
+        assert_eq!(recovered.phase, ProtocolPhase::Idle);
+        assert!(!recovered.fallback_required);
+        assert_eq!(recovered.manual_recovery_target, Some(Host::Mac));
+
+        let manual = apply(
+            &recovered,
+            Event::SubscriptionObserved {
+                mode: TvMode::Fullscreen,
+                input: Some(Host::Mac),
+            },
+            43,
+            TIMING,
+        )
+        .unwrap();
+        assert!(manual.effects.is_empty());
+        assert_eq!(manual.next.phase, ProtocolPhase::Idle);
+        assert!(!manual.next.fallback_required);
+        assert_eq!(manual.next.observed_input, Some(Host::Mac));
+        assert_eq!(manual.next.keyboard_owner, Host::Linux);
+        assert_eq!(manual.next.pointer_owner, Host::Linux);
     }
 
     #[test]
