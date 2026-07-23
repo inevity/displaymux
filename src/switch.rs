@@ -782,6 +782,26 @@ impl SwitchController {
         Ok(())
     }
 
+    pub(crate) async fn arm_manual_recovery(
+        &self,
+        target: SwitchHost,
+        cancellation: &CancellationToken,
+    ) -> Result<(), SwitchClientError> {
+        let response = self
+            .send(
+                self.http
+                    .post(self.endpoint(["internal", "manual-recovery", &target.to_string()])?)
+                    .bearer_auth(&self.config.token),
+                cancellation,
+            )
+            .await?;
+        let envelope: ApiEnvelope<ManualRecoveryResponse> = self.decode(response).await?;
+        if envelope.data.target != target || !envelope.data.armed {
+            return Err(SwitchClientError::StaleIdentity);
+        }
+        Ok(())
+    }
+
     fn endpoint<const N: usize>(&self, segments: [&str; N]) -> Result<Url, SwitchClientError> {
         let mut url = self.config.url.clone();
         let mut path = url
@@ -1027,6 +1047,12 @@ struct RenewResponse {
 struct ReadinessResponse {
     host: SwitchHost,
     readiness: RemoteReadiness,
+}
+
+#[derive(Deserialize)]
+struct ManualRecoveryResponse {
+    target: SwitchHost,
+    armed: bool,
 }
 
 #[derive(Deserialize)]
@@ -1488,6 +1514,48 @@ mod tests {
                 .to_ascii_lowercase()
                 .contains("authorization: bearer test-token")
         }));
+    }
+
+    #[tokio::test]
+    async fn manual_recovery_uses_target_scoped_internal_endpoint() {
+        let responses = vec![json!({
+            "protocol_version": 1,
+            "server_now_ms": 1_000,
+            "data": {
+                "target": "windows",
+                "armed": true
+            }
+        })];
+        let (base_url, server) = spawn_http_responses(responses).await;
+        let controller = SwitchController::new(SwitchControllerConfig {
+            url: base_url,
+            token: "test-token".to_string(),
+            local_host: SwitchHost::Linux,
+            server_host: SwitchHost::Linux,
+            http_timeout_ms: 1_000,
+            request_timeout_ms: 2_000,
+            poll_interval_ms: 10,
+            edge_double_tap_ms: 500,
+            lease_ttl_ms: 5_000,
+            renew_interval_ms: 1_000,
+        })
+        .unwrap();
+
+        controller
+            .arm_manual_recovery(SwitchHost::Windows, &CancellationToken::new())
+            .await
+            .unwrap();
+
+        let requests = server.await.unwrap();
+        assert_eq!(
+            requests[0].lines().next().unwrap(),
+            "POST /internal/manual-recovery/windows HTTP/1.1"
+        );
+        assert!(
+            requests[0]
+                .to_ascii_lowercase()
+                .contains("authorization: bearer test-token")
+        );
     }
 
     fn enter_envelope(status: &str, lease_expires_at_ms: u64, grant: Option<u64>) -> Value {

@@ -19,7 +19,7 @@ use futures::StreamExt;
 use lan_mouse_clipboard::{ClipboardReason, TlsIdentity};
 use lan_mouse_ipc::{
     AsyncFrontendListener, ClientHandle, FrontendEvent, FrontendRequest, IpcError,
-    IpcListenerCreationError, Position, Status,
+    IpcListenerCreationError, Position, Status, SwitchHost,
 };
 use log;
 use std::{
@@ -148,6 +148,13 @@ enum SwitchTaskEvent {
     CleanupFinished {
         task_epoch: u64,
         request_id: String,
+        result: Result<(), SwitchClientError>,
+    },
+    ManualRecoveryArmed {
+        task_epoch: u64,
+        target: SwitchHost,
+        reason: &'static str,
+        detail: String,
         result: Result<(), SwitchClientError>,
     },
 }
@@ -792,8 +799,11 @@ impl Service {
         }
         let Some(readiness) = readiness else {
             log::warn!("capture candidate {handle} rejected: client does not exist");
-            self.system_notifier
-                .switch_failed(Some(target), "peer_missing");
+            self.arm_manual_recovery_then_notify(
+                target,
+                "peer_missing",
+                "The target lan-mouse peer is unavailable".to_string(),
+            );
             return;
         };
         let bundle_ready = readiness.online
@@ -834,8 +844,12 @@ impl Service {
                         ),
                     ),
                 };
-                self.system_notifier
-                    .switch_failed_with_detail(Some(target), reason, detail);
+                if error == GateError::PeerNotReady {
+                    self.arm_manual_recovery_then_notify(target, reason, detail);
+                } else {
+                    self.system_notifier
+                        .switch_failed_with_detail(Some(target), reason, detail);
+                }
                 return;
             }
         };
@@ -1017,6 +1031,51 @@ impl Service {
         });
     }
 
+    fn arm_manual_recovery_then_notify(
+        &mut self,
+        target: SwitchHost,
+        reason: &'static str,
+        detail: String,
+    ) {
+        let Some(controller) = self.switch_controller.clone() else {
+            self.system_notifier
+                .switch_failed_with_detail(Some(target), reason, detail);
+            return;
+        };
+        let Some((task_epoch, cancellation)) = self.begin_switch_task() else {
+            tracing::warn!(
+                event = "manual_recovery_arm_skipped",
+                target_host = %target,
+                reason,
+                "controller operation became active before manual recovery could be armed"
+            );
+            self.system_notifier
+                .switch_failed_with_detail(Some(target), reason, detail);
+            return;
+        };
+        let task_cancellation = cancellation.clone();
+        let event_tx = self.switch_event_tx.clone();
+        let task = spawn_local(async move {
+            let result = controller
+                .arm_manual_recovery(target, &task_cancellation)
+                .await;
+            let _ = event_tx
+                .send(SwitchTaskEvent::ManualRecoveryArmed {
+                    task_epoch,
+                    target,
+                    reason,
+                    detail,
+                    result,
+                })
+                .await;
+        });
+        self.switch_task = Some(SwitchTask {
+            epoch: task_epoch,
+            cancellation,
+            task,
+        });
+    }
+
     fn handle_switch_task_event(&mut self, event: SwitchTaskEvent) {
         match event {
             SwitchTaskEvent::Prepared {
@@ -1064,6 +1123,40 @@ impl Service {
                         log::warn!("controller cleanup failed for {request_id}: {error}")
                     }
                 }
+            }
+            SwitchTaskEvent::ManualRecoveryArmed {
+                task_epoch,
+                target,
+                reason,
+                detail,
+                result,
+            } => {
+                if !self.finish_switch_task(task_epoch) {
+                    return;
+                }
+                let detail = match result {
+                    Ok(()) => {
+                        tracing::info!(
+                            event = "manual_recovery_armed",
+                            target_host = %target,
+                            reason,
+                            "manual OLED recovery authorized after local switch denial"
+                        );
+                        detail
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            event = "manual_recovery_arm_failed",
+                            target_host = %target,
+                            reason,
+                            error = %error,
+                            "manual OLED recovery could not be authorized"
+                        );
+                        format!("{detail}. Manual OLED recovery could not be authorized: {error}")
+                    }
+                };
+                self.system_notifier
+                    .switch_failed_with_detail(Some(target), reason, detail);
             }
         }
     }
