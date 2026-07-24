@@ -85,66 +85,99 @@ function Write-BoundedLog([hashtable]$State, [string]$Line) {
     $State.Size += $lineBytes
 }
 
-$stdoutState = Open-LogState $stdoutLog
-$stderrState = Open-LogState $stderrLog
-$emulationFailed = $false
+function Invoke-LanMouseDaemon {
+    $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
+    $startInfo.FileName = $binary
+    $startInfo.ArgumentList.Add("daemon")
+    $startInfo.UseShellExecute = $false
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
 
-$env:RUST_LOG = "{{ lan_mouse_log_filter }}"
-$startInfo = [System.Diagnostics.ProcessStartInfo]::new()
-$startInfo.FileName = $binary
-$startInfo.ArgumentList.Add("daemon")
-$startInfo.UseShellExecute = $false
-$startInfo.RedirectStandardOutput = $true
-$startInfo.RedirectStandardError = $true
+    $process = [System.Diagnostics.Process]::new()
+    $process.StartInfo = $startInfo
+    $started = $false
+    try {
+        $started = $process.Start()
+        if (-not $started) {
+            throw "failed to start lan-mouse daemon"
+        }
 
-$process = [System.Diagnostics.Process]::new()
-$process.StartInfo = $startInfo
-$null = $process.Start()
+        $stdoutTask = $process.StandardOutput.ReadLineAsync()
+        $stderrTask = $process.StandardError.ReadLineAsync()
 
-$stdoutTask = $process.StandardOutput.ReadLineAsync()
-$stderrTask = $process.StandardError.ReadLineAsync()
+        while ($null -ne $stdoutTask -or $null -ne $stderrTask) {
+            $pending = @($stdoutTask, $stderrTask) | Where-Object { $null -ne $_ }
+            $completed = [System.Threading.Tasks.Task]::WhenAny(
+                [System.Threading.Tasks.Task[]]$pending
+            ).GetAwaiter().GetResult()
+
+            if ($null -ne $stdoutTask -and $completed -eq $stdoutTask) {
+                $line = $stdoutTask.GetAwaiter().GetResult()
+                if ($null -eq $line) {
+                    $stdoutTask = $null
+                } else {
+                    Write-BoundedLog $stdoutState $line
+                    $stdoutTask = $process.StandardOutput.ReadLineAsync()
+                }
+            }
+
+            if ($null -ne $stderrTask -and $completed -eq $stderrTask) {
+                $line = $stderrTask.GetAwaiter().GetResult()
+                if ($null -eq $line) {
+                    $stderrTask = $null
+                } else {
+                    Write-BoundedLog $stderrState $line
+                    $stderrTask = $process.StandardError.ReadLineAsync()
+                }
+            }
+        }
+
+        $process.WaitForExit()
+        return $process.ExitCode
+    } finally {
+        if ($started -and -not $process.HasExited) {
+            $process.Kill($true)
+        }
+        $process.Dispose()
+    }
+}
+
+$supervisorMutex = [System.Threading.Mutex]::new(
+    $false,
+    "Local\LanMouseDaemonSupervisor"
+)
+$supervisorLockHeld = $false
 
 try {
-    while ($null -ne $stdoutTask -or $null -ne $stderrTask) {
-        $pending = @($stdoutTask, $stderrTask) | Where-Object { $null -ne $_ }
-        $completed = [System.Threading.Tasks.Task]::WhenAny(
-            [System.Threading.Tasks.Task[]]$pending
-        ).GetAwaiter().GetResult()
-
-        if ($null -ne $stdoutTask -and $completed -eq $stdoutTask) {
-            $line = $stdoutTask.GetAwaiter().GetResult()
-            if ($null -eq $line) {
-                $stdoutTask = $null
-            } else {
-                Write-BoundedLog $stdoutState $line
-                $stdoutTask = $process.StandardOutput.ReadLineAsync()
-            }
-        }
-
-        if ($null -ne $stderrTask -and $completed -eq $stderrTask) {
-            $line = $stderrTask.GetAwaiter().GetResult()
-            if ($null -eq $line) {
-                $stderrTask = $null
-            } else {
-                Write-BoundedLog $stderrState $line
-                if ($line -match '\blan_mouse::emulation\] input emulation exited:') {
-                    $emulationFailed = $true
-                }
-                $stderrTask = $process.StandardError.ReadLineAsync()
-            }
-        }
-
-        if ($emulationFailed) {
-            throw "lan-mouse input emulation stopped; requesting a supervised restart"
-        }
+    try {
+        $supervisorLockHeld = $supervisorMutex.WaitOne(0)
+    } catch [System.Threading.AbandonedMutexException] {
+        $supervisorLockHeld = $true
     }
-    $process.WaitForExit()
-    exit $process.ExitCode
+
+    if (-not $supervisorLockHeld) {
+        exit 0
+    }
+
+    $stdoutState = Open-LogState $stdoutLog
+    $stderrState = Open-LogState $stderrLog
+    $env:RUST_LOG = "{{ lan_mouse_log_filter }}"
+
+    try {
+        while ($true) {
+            $exitCode = Invoke-LanMouseDaemon
+            Write-BoundedLog `
+                $stderrState `
+                "lan-mouse daemon exited with code $exitCode; restarting in one second"
+            Start-Sleep -Seconds 1
+        }
+    } finally {
+        $stdoutState.Writer.Dispose()
+        $stderrState.Writer.Dispose()
+    }
 } finally {
-    $stdoutState.Writer.Dispose()
-    $stderrState.Writer.Dispose()
-    if (-not $process.HasExited) {
-        $process.Kill($true)
+    if ($supervisorLockHeld) {
+        $supervisorMutex.ReleaseMutex()
     }
-    $process.Dispose()
+    $supervisorMutex.Dispose()
 }

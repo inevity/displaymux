@@ -264,7 +264,7 @@
 - name: Create scheduled task for bounded-log lan-mouse daemon
   community.windows.win_scheduled_task:
     name: LanMouseDaemon
-    description: "Runs lan-mouse at user logon and re-enables input emulation after unlock"
+    description: "Supervises lan-mouse at user logon and re-enables input emulation after unlock"
     actions:
       - path: "{{ win_pwsh.stdout | trim }}"
         arguments: '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "{{ win_wrapper }}"'
@@ -286,8 +286,6 @@
     start_when_available: true
     execution_time_limit: PT0S
     multiple_instances: 0
-    restart_count: 999
-    restart_interval: PT1M
 
 - name: Detect Windows interactive desktop for the deployment user
   ansible.windows.win_shell: |

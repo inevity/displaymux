@@ -80,8 +80,9 @@ then run their selected install and service-restart sequences concurrently.
 - Windows runs the native daemon through `LanMouseDaemon`. The task starts at
   interactive user logon. A parallel unlock-triggered invocation asks the
   existing daemon to re-enable input emulation without replacing its supervised
-  process. The task restarts when the wrapper detects that keyboard-pointer
-  emulation exited. Bounded persistent logs are under
+  process. The wrapper keeps the daemon alive across genuine process exits,
+  while temporary Windows input denial leaves the daemon connected and
+  not-ready until input emulation recovers. Bounded persistent logs are under
   `%LOCALAPPDATA%\lan-mouse\logs` with five 10 MiB backups. The playbook does not
   enable automatic Windows logon: before the first interactive logon after a
   cold boot, Windows `SendInput` cannot control the secure login desktop and the
