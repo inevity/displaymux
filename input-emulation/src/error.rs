@@ -8,16 +8,13 @@ pub enum InputEmulationError {
 
 impl InputEmulationError {
     pub fn is_transient_input_unavailable(&self) -> bool {
-        #[cfg(windows)]
-        {
-            return matches!(
-                self,
-                Self::Create(EmulationCreationError::Windows(
-                    WindowsEmulationCreationError::InputUnavailable(_)
-                )) | Self::Emulate(EmulationError::WindowsSendInput(_))
-            );
+        if let Self::Create(error) = self {
+            return error.is_transient_input_unavailable();
         }
-        #[cfg(not(windows))]
+        #[cfg(windows)]
+        if matches!(self, Self::Emulate(EmulationError::WindowsSendInput(_))) {
+            return true;
+        }
         false
     }
 }
@@ -79,6 +76,17 @@ pub enum EmulationCreationError {
 }
 
 impl EmulationCreationError {
+    pub(crate) fn is_transient_input_unavailable(&self) -> bool {
+        #[cfg(windows)]
+        if matches!(
+            self,
+            Self::Windows(WindowsEmulationCreationError::InputUnavailable(_))
+        ) {
+            return true;
+        }
+        false
+    }
+
     /// request was intentionally denied by the user
     pub(crate) fn cancelled_by_user(&self) -> bool {
         #[cfg(libei)]
@@ -199,11 +207,14 @@ mod tests {
         let runtime_error = InputEmulationError::Emulate(EmulationError::WindowsSendInput(
             io::Error::from_raw_os_error(5),
         ));
-        let creation_error = InputEmulationError::Create(EmulationCreationError::Windows(
+        let creation_error = EmulationCreationError::Windows(
             WindowsEmulationCreationError::InputUnavailable(io::Error::from_raw_os_error(5)),
-        ));
+        );
 
         assert!(runtime_error.is_transient_input_unavailable());
         assert!(creation_error.is_transient_input_unavailable());
+        assert!(
+            InputEmulationError::Create(creation_error).is_transient_input_unavailable()
+        );
     }
 }

@@ -142,6 +142,7 @@ impl InputEmulation {
                     return Ok(b);
                 }
                 Err(e) if e.cancelled_by_user() => return Err(e),
+                Err(e) if e.is_transient_input_unavailable() => return Err(e),
                 Err(e) => log::warn!("{e}"),
             }
         }
