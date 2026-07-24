@@ -6,6 +6,22 @@ pub enum InputEmulationError {
     Emulate(#[from] EmulationError),
 }
 
+impl InputEmulationError {
+    pub fn is_transient_input_unavailable(&self) -> bool {
+        #[cfg(windows)]
+        {
+            return matches!(
+                self,
+                Self::Create(EmulationCreationError::Windows(
+                    WindowsEmulationCreationError::InputUnavailable(_)
+                )) | Self::Emulate(EmulationError::WindowsSendInput(_))
+            );
+        }
+        #[cfg(not(windows))]
+        false
+    }
+}
+
 #[cfg(any(libei, rdp))]
 use ashpd::{Error::Response, desktop::ResponseError};
 use std::io;
@@ -161,4 +177,33 @@ pub enum MacOSEmulationCreationError {
 
 #[cfg(windows)]
 #[derive(Debug, Error)]
-pub enum WindowsEmulationCreationError {}
+pub enum WindowsEmulationCreationError {
+    #[error("input injection unavailable: `{0}`")]
+    InputUnavailable(io::Error),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ordinary_emulation_errors_require_explicit_reenable() {
+        let error = InputEmulationError::Emulate(EmulationError::Io(io::Error::other("failed")));
+
+        assert!(!error.is_transient_input_unavailable());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_input_denials_are_transient() {
+        let runtime_error = InputEmulationError::Emulate(EmulationError::WindowsSendInput(
+            io::Error::from_raw_os_error(5),
+        ));
+        let creation_error = InputEmulationError::Create(EmulationCreationError::Windows(
+            WindowsEmulationCreationError::InputUnavailable(io::Error::from_raw_os_error(5)),
+        ));
+
+        assert!(runtime_error.is_transient_input_unavailable());
+        assert!(creation_error.is_transient_input_unavailable());
+    }
+}

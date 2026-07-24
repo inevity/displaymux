@@ -165,6 +165,7 @@ struct PendingReleases {
 }
 
 const ENTER_HANDOFF_TIMEOUT: Duration = Duration::from_secs(2);
+const TRANSIENT_EMULATION_RETRY_DELAY: Duration = Duration::from_secs(1);
 
 enum PendingEnterStep {
     Releasing(oneshot::Receiver<bool>),
@@ -616,22 +617,36 @@ struct EmulationTask {
 impl EmulationTask {
     async fn run(mut self) {
         loop {
-            if let Err(e) = self.do_emulation().await {
-                log::warn!("input emulation exited: {e}");
-            }
+            let retry_automatically = match self.do_emulation().await {
+                Ok(()) => false,
+                Err(error) => {
+                    let retry_automatically = error.is_transient_input_unavailable();
+                    log::warn!("input emulation exited: {error}");
+                    retry_automatically
+                }
+            };
             if self.exit_requested.get() {
                 break;
             }
-            // wait for reenable request
+
+            // Windows secure desktops temporarily reject SendInput. A fixed deadline avoids
+            // a hot loop while restoring readiness promptly after the desktop becomes usable.
+            let mut retry_deadline = retry_automatically
+                .then(|| Box::pin(tokio::time::sleep(TRANSIENT_EMULATION_RETRY_DELAY)));
             loop {
-                match self.request_rx.recv().await.expect("channel closed") {
-                    ProxyRequest::Reenable => break,
-                    ProxyRequest::Terminate => return,
-                    ProxyRequest::Input(..) => { /* emulation inactive => ignore */ }
-                    ProxyRequest::CenterPointer(_, result_tx) => {
-                        let _ = result_tx.send(false);
+                select! {
+                    _ = wait_for_retry(&mut retry_deadline) => break,
+                    request = self.request_rx.recv() => {
+                        match request.expect("channel closed") {
+                            ProxyRequest::Reenable => break,
+                            ProxyRequest::Terminate => return,
+                            ProxyRequest::Input(..) => { /* emulation inactive => ignore */ }
+                            ProxyRequest::CenterPointer(_, result_tx) => {
+                                let _ = result_tx.send(false);
+                            }
+                            ProxyRequest::Remove(..) => { /* emulation inactive => ignore */ }
+                        }
                     }
-                    ProxyRequest::Remove(..) => { /* emulation inactive => ignore */ }
                 }
             }
         }
@@ -745,6 +760,13 @@ impl EmulationTask {
                 handle
             }
         }
+    }
+}
+
+async fn wait_for_retry(deadline: &mut Option<Pin<Box<Sleep>>>) {
+    match deadline {
+        Some(deadline) => deadline.as_mut().await,
+        None => future::pending().await,
     }
 }
 

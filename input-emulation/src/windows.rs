@@ -47,6 +47,7 @@ impl WindowsEmulation {
     pub(crate) fn new(
         display_selector: Option<&str>,
     ) -> Result<Self, WindowsEmulationCreationError> {
+        probe_input_available()?;
         let (error_tx, error_rx) = mpsc::channel(1);
         Ok(Self {
             display_selector: display_selector.map(ToOwned::to_owned),
@@ -267,13 +268,34 @@ impl WindowsEmulation {
     }
 }
 
-fn send_input(input: INPUT) -> Result<(), EmulationError> {
+fn try_send_input(input: INPUT) -> Result<(), io::Error> {
     let submitted = unsafe { SendInput(&[input], std::mem::size_of::<INPUT>() as i32) };
     if submitted == 1 {
         Ok(())
     } else {
-        Err(EmulationError::WindowsSendInput(io::Error::last_os_error()))
+        Err(io::Error::last_os_error())
     }
+}
+
+fn send_input(input: INPUT) -> Result<(), EmulationError> {
+    try_send_input(input).map_err(EmulationError::WindowsSendInput)
+}
+
+fn probe_input_available() -> Result<(), WindowsEmulationCreationError> {
+    let input = INPUT {
+        r#type: INPUT_MOUSE,
+        Anonymous: INPUT_0 {
+            mi: MOUSEINPUT {
+                dx: 0,
+                dy: 0,
+                mouseData: 0,
+                dwFlags: MOUSEEVENTF_MOVE,
+                time: 0,
+                dwExtraInfo: LAN_MOUSE_WINDOWS_EXTRA_INFO,
+            },
+        },
+    };
+    try_send_input(input).map_err(WindowsEmulationCreationError::InputUnavailable)
 }
 
 fn send_mouse_input(mi: MOUSEINPUT) -> Result<(), EmulationError> {
