@@ -372,9 +372,8 @@ async fn receive_loop(
             Ok(event) => {
                 log::trace!("{addr} <==<==<== {event}");
                 match event {
-                    ProtoEvent::Pong(b) => {
-                        client_manager.set_active_addr(handle, Some(addr));
-                        client_manager.set_alive(handle, b);
+                    ProtoEvent::Pong(control_ready) => {
+                        record_pong(&client_manager, handle, addr, control_ready);
                         ping_response.borrow_mut().insert(addr);
                     }
                     ProtoEvent::Hello { commit } => {
@@ -426,6 +425,18 @@ async fn receive_loop(
         ))
         .expect("channel closed");
     }
+}
+
+fn record_pong(
+    client_manager: &ClientManager,
+    handle: ClientHandle,
+    addr: SocketAddr,
+    _control_ready: bool,
+) {
+    // Receipt proves transport liveness. Atomic input availability is carried
+    // separately by Readiness and must not make a responsive daemon offline.
+    client_manager.set_active_addr(handle, Some(addr));
+    client_manager.set_alive(handle, true);
 }
 
 fn accept_readiness_epoch(
@@ -557,5 +568,17 @@ mod tests {
         assert!(!accept_readiness_epoch(&mut latest, true, true, 0));
         assert!(accept_readiness_epoch(&mut latest, true, true, 7));
         assert!(!accept_readiness_epoch(&mut latest, false, false, 0));
+    }
+
+    #[test]
+    fn pong_proves_liveness_even_when_input_is_unavailable() {
+        let client_manager = ClientManager::default();
+        let handle = client_manager.add_client();
+        let addr = "127.0.0.1:4242".parse().unwrap();
+
+        record_pong(&client_manager, handle, addr, false);
+
+        assert!(client_manager.alive(handle));
+        assert_eq!(client_manager.active_addr(handle), Some(addr));
     }
 }

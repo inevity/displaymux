@@ -61,7 +61,9 @@ pub enum ProtoEvent {
     /// Ping event for tracking unresponsive clients.
     /// A client has to respond with [`ProtoEvent::Pong`].
     Ping,
-    /// Response to [`ProtoEvent::Ping`], true if emulation is enabled / available
+    /// Response to [`ProtoEvent::Ping`]. Receipt proves peer liveness; the
+    /// payload summarizes input availability for diagnostics, while
+    /// [`ProtoEvent::Readiness`] is authoritative for input-bundle gating.
     Pong(bool),
     /// Build identification for the sending peer. Sent by the
     /// connect side once after the connection authenticates, and
@@ -95,11 +97,15 @@ impl Display for ProtoEvent {
             ProtoEvent::Ack(s) => write!(f, "Ack({s})"),
             ProtoEvent::Input(e) => write!(f, "{e}"),
             ProtoEvent::Ping => write!(f, "ping"),
-            ProtoEvent::Pong(alive) => {
+            ProtoEvent::Pong(control_ready) => {
                 write!(
                     f,
                     "pong: {}",
-                    if *alive { "alive" } else { "not available" }
+                    if *control_ready {
+                        "input ready"
+                    } else {
+                        "input unavailable"
+                    }
                 )
             }
             ProtoEvent::Hello { commit } => {
