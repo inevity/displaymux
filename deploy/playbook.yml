@@ -145,7 +145,7 @@
     win_source_dir: "{{ win_build_cache }}\\source"
     win_vendor_dir: "{{ win_build_cache }}\\lan-mouse-vendor-{{ lan_mouse_cargo_lock_sha256[:12] }}"
     win_target_dir: "{{ win_build_cache }}\\target"
-    win_install_dir: "{{ ansible_facts.env.LOCALAPPDATA | default('') }}\\Programs\\lan-mouse"
+    win_install_dir: "{{ lan_mouse_windows_install_dir }}"
     win_installed_binary: "{{ win_install_dir }}\\lan-mouse.exe"
     win_wrapper: "{{ ansible_facts.env.LOCALAPPDATA | default('') }}\\lan-mouse\\run-lan-mouse.ps1"
   tasks:

@@ -77,16 +77,18 @@ then run their selected install and service-restart sequences concurrently.
 - macOS runs the native daemon as `com.feschber.lan-mouse`; persistent logs
   are `~/Library/Logs/lan-mouse.log` and `lan-mouse.err.log`, each with five
   10 MiB backups.
-- Windows runs the native daemon through `LanMouseDaemon`. The task starts at
-  interactive user logon. A parallel unlock-triggered invocation asks the
-  existing daemon to re-enable input emulation without replacing its supervised
-  process. The wrapper keeps the daemon alive across genuine process exits,
-  while temporary Windows input denial leaves the daemon connected and
-  not-ready until input emulation recovers. Bounded persistent logs are under
-  `%LOCALAPPDATA%\lan-mouse\logs` with five 10 MiB backups. The playbook does not
-  enable automatic Windows logon: before the first interactive logon after a
-  cold boot, Windows `SendInput` cannot control the secure login desktop and the
-  peer must remain not ready.
+- Windows installs the native daemon at
+  `D:\Programs\lan-mouse\lan-mouse.exe` and runs it through
+  `LanMouseDaemon`. The task starts at interactive user logon. A parallel
+  unlock-triggered invocation asks the existing daemon to re-enable input
+  emulation without replacing its supervised process. The wrapper keeps the
+  daemon alive across genuine process exits, while temporary Windows input
+  denial leaves the daemon connected and not-ready until input emulation
+  recovers. Bounded persistent logs remain under
+  `%LOCALAPPDATA%\lan-mouse\logs` with five 10 MiB backups. The playbook does
+  not enable automatic Windows logon: before the first interactive logon after
+  a cold boot, Windows `SendInput` cannot control the secure login desktop and
+  the peer must remain not ready.
 
 Native-build runs replace the build source and build all three hosts against
 the same locked vendor archive. GitHub-release runs install the selected
