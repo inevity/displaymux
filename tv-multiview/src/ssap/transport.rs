@@ -274,11 +274,21 @@ async fn execute_effect<S: SsapSocket>(
             switch_epoch,
             ..
         } => {
+            let Some(input_id) = config.input_for(target) else {
+                coordinator
+                    .notify_safety(Event::CommandFailed {
+                        switch_epoch,
+                        reason: format!("display_route_missing:{target}"),
+                    })
+                    .await
+                    .map_err(|_| SsapError::CoordinatorClosed)?;
+                return Ok(());
+            };
             let result = request_payload(
                 socket,
                 next_id,
                 codec::SET_INPUT,
-                json!({"inputId": config.input_for(target)}),
+                json!({"inputId": input_id}),
                 config.timeouts.command_ms,
                 coordinator,
                 &config.inputs,
@@ -625,7 +635,7 @@ mod tests {
     use super::*;
     use crate::{
         coordinator,
-        domain::ProtocolState,
+        domain::{ProtocolPhase, ProtocolState},
         protocol::{Event, ProtocolTiming},
     };
     use std::{collections::VecDeque, future::pending};
@@ -917,11 +927,13 @@ windows = "HDMI_2"
         .await
         .unwrap();
         assert_eq!(current["payload"]["value"], 7);
-        wait_until(|| coordinator.snapshot().fallback_reason.is_some()).await;
-        assert_eq!(
-            coordinator.snapshot().fallback_reason.as_deref(),
-            Some("manual_tv_override")
-        );
+        wait_until(|| coordinator.snapshot().observed_input == Some(Host::Mac)).await;
+        let snapshot = coordinator.snapshot();
+        assert_eq!(snapshot.phase, ProtocolPhase::Idle);
+        assert!(!snapshot.fallback_required);
+        assert_eq!(snapshot.manual_recovery_target, None);
+        assert_eq!(snapshot.keyboard_owner, Host::Linux);
+        assert_eq!(snapshot.pointer_owner, Host::Linux);
         coordinator_task.abort();
     }
 

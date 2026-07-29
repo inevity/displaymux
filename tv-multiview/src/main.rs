@@ -36,7 +36,11 @@ async fn run(
         signal_poll_ms: config.timeouts.signal_poll_ms,
     };
     let (coordinator, effects, coordinator_task) = coordinator::spawn(
-        ProtocolState::new(config.server_host, config.limits.retained_requests),
+        ProtocolState::with_display_hosts(
+            config.server_host,
+            config.limits.retained_requests,
+            config.display_hosts(),
+        ),
         timing,
         config.limits.command_queue,
         config.limits.safety_queue,

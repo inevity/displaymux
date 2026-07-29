@@ -1,7 +1,7 @@
 use crate::domain::Host;
 use serde::Deserialize;
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     env, fs,
     net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
@@ -108,13 +108,16 @@ impl DaemonConfig {
         if self.controller_token.is_empty() {
             return Err(ConfigError::EmptyControllerToken);
         }
-        for host in Host::ALL {
-            let input = self
-                .inputs
-                .get(&host)
-                .ok_or(ConfigError::MissingInput(host))?;
+        let server_input = self
+            .inputs
+            .get(&self.server_host)
+            .ok_or(ConfigError::MissingInput(self.server_host))?;
+        if server_input.trim().is_empty() {
+            return Err(ConfigError::EmptyInput(self.server_host));
+        }
+        for (host, input) in &self.inputs {
             if input.trim().is_empty() {
-                return Err(ConfigError::EmptyInput(host));
+                return Err(ConfigError::EmptyInput(*host));
             }
         }
         for (name, value) in [
@@ -146,8 +149,12 @@ impl DaemonConfig {
         Ok(())
     }
 
-    pub fn input_for(&self, host: Host) -> &str {
-        self.inputs.get(&host).expect("validated input mapping")
+    pub fn input_for(&self, host: Host) -> Option<&str> {
+        self.inputs.get(&host).map(String::as_str)
+    }
+
+    pub fn display_hosts(&self) -> BTreeSet<Host> {
+        self.inputs.keys().copied().collect()
     }
 }
 
@@ -164,7 +171,7 @@ pub enum ConfigError {
     Toml(#[from] toml::de::Error),
     #[error("controller_token must not be empty")]
     EmptyControllerToken,
-    #[error("missing HDMI input mapping for {0}")]
+    #[error("missing HDMI input mapping for server host {0}")]
     MissingInput(Host),
     #[error("HDMI input mapping for {0} is empty")]
     EmptyInput(Host),
@@ -196,16 +203,24 @@ windows = "HDMI_2"
         let config: DaemonConfig = toml::from_str(VALID).unwrap();
         config.validate().unwrap();
         assert_eq!(config.server_host, Host::Linux);
-        assert_eq!(config.input_for(Host::Windows), "HDMI_2");
+        assert_eq!(config.input_for(Host::Windows), Some("HDMI_2"));
     }
 
     #[test]
-    fn rejects_missing_host_mapping() {
+    fn accepts_remote_host_without_display_route() {
         let config: DaemonConfig =
             toml::from_str(&VALID.replace("mac = \"HDMI_3\"\n", "")).expect("syntactically valid");
+        config.validate().unwrap();
+        assert_eq!(config.input_for(Host::Mac), None);
+    }
+
+    #[test]
+    fn rejects_missing_server_mapping() {
+        let config: DaemonConfig =
+            toml::from_str(&VALID.replace("linux = \"HDMI_4\"\n", "")).expect("syntactically valid");
         assert!(matches!(
             config.validate(),
-            Err(ConfigError::MissingInput(Host::Mac))
+            Err(ConfigError::MissingInput(Host::Linux))
         ));
     }
 

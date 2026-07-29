@@ -198,8 +198,8 @@ pub fn apply(
             store_observation(&mut next, switch_epoch, now_ms, mode, input, signals);
             if server_display_verified(&next, switch_epoch) {
                 finish_fallback(&mut next);
-            } else if manual_recovery_display_observed(&next) {
-                finish_manual_recovery(&mut next);
+            } else if manual_display_observed(&next) {
+                accept_manual_display(&mut next);
             } else {
                 begin_fallback(
                     &mut next,
@@ -536,7 +536,9 @@ pub fn apply(
                         renewed_until_ms: now_ms.saturating_add(timing.lease_ms),
                     });
                     next.phase = ProtocolPhase::RemoteOwned;
-                    next.next_signal_poll_ms = Some(now_ms.saturating_add(timing.signal_poll_ms));
+                    next.next_signal_poll_ms = next
+                        .has_display_route(target)
+                        .then(|| now_ms.saturating_add(timing.signal_poll_ms));
                 }
                 next.archive_request(request);
             }
@@ -653,14 +655,11 @@ pub fn apply(
         }
         Event::SubscriptionObserved { mode, input } => {
             next.tv_mode = mode;
-            if input.is_some() {
-                next.observed_input = input;
-            }
+            next.observed_input = input;
             let active_target = next.active_request.as_ref().map(|request| request.target);
             let session_target = next.active_session.as_ref().map(|session| session.target);
-            let target_mismatch = |target| {
-                mode != TvMode::Fullscreen || input.is_some_and(|observed| observed != target)
-            };
+            let target_mismatch =
+                |target| mode != TvMode::Fullscreen || input != Some(target);
 
             if next.fallback_required
                 && next.phase == ProtocolPhase::FallbackVerifying
@@ -690,7 +689,9 @@ pub fn apply(
                     switch_epoch,
                 );
             } else if next.phase == ProtocolPhase::GrantPending
-                && active_target.is_some_and(target_mismatch)
+                && active_target.is_some_and(|target| {
+                    next.has_display_route(target) && target_mismatch(target)
+                })
             {
                 begin_fallback(
                     &mut next,
@@ -699,7 +700,9 @@ pub fn apply(
                     timing,
                     "unexpected_tv_subscription",
                 );
-            } else if session_target.is_some_and(target_mismatch) {
+            } else if session_target.is_some_and(|target| {
+                next.has_display_route(target) && target_mismatch(target)
+            }) {
                 begin_fallback(
                     &mut next,
                     &mut effects,
@@ -707,10 +710,8 @@ pub fn apply(
                     timing,
                     "unexpected_tv_subscription",
                 );
-            } else if next.phase == ProtocolPhase::Idle
-                && manual_recovery_display_observed(&next)
-            {
-                finish_manual_recovery(&mut next);
+            } else if manual_display_observed(&next) {
+                accept_manual_display(&mut next);
             } else if next.phase == ProtocolPhase::Idle
                 && mode == TvMode::Fullscreen
                 && input == Some(next.server_host)
@@ -836,17 +837,26 @@ fn begin_switch(
 ) {
     state.switch_epoch = state.switch_epoch.saturating_add(1);
     let switch_epoch = state.switch_epoch;
-    let request = state.active_request.as_mut().expect("active request");
-    request.status = RequestStatus::Switching;
-    request.switch_epoch = Some(switch_epoch);
-    request.deadline_ms = now_ms
-        .saturating_add(timing.command_ms)
-        .saturating_add(timing.observation_ms);
-    state.commanded_input = Some(request.target);
+    let target = {
+        let request = state.active_request.as_mut().expect("active request");
+        request.status = RequestStatus::Switching;
+        request.switch_epoch = Some(switch_epoch);
+        request.deadline_ms = now_ms
+            .saturating_add(timing.command_ms)
+            .saturating_add(timing.observation_ms);
+        request.target
+    };
+    if !state.has_display_route(target) {
+        state.commanded_input = None;
+        state.phase_deadline_ms = None;
+        issue_grant(state, now_ms, timing);
+        return;
+    }
+    state.commanded_input = Some(target);
     state.phase = ProtocolPhase::Switching;
     state.phase_deadline_ms = Some(now_ms.saturating_add(timing.command_ms));
     effects.push(Effect::SetInput {
-        target: request.target,
+        target,
         switch_epoch,
         fallback: false,
     });
@@ -905,11 +915,12 @@ fn begin_fallback(
     timing: ProtocolTiming,
     reason: &str,
 ) {
+    let restore_display = display_restore_required(state);
     if let Some(target) = state
         .active_request
         .as_ref()
         .map(|request| request.target)
-        .filter(|target| *target != state.server_host)
+        .filter(|target| *target != state.server_host && state.has_display_route(*target))
     {
         state.manual_recovery_target = Some(target);
     }
@@ -926,7 +937,7 @@ fn begin_fallback(
         }
     }
     release_to_server(state);
-    state.fallback_required = true;
+    state.fallback_required = restore_display;
     state.fallback_reason = Some(reason.to_string());
     state.verified_epoch = None;
     state.pending_multiview = None;
@@ -937,10 +948,14 @@ fn begin_fallback(
         request.reason = Some(reason.to_string());
         state.archive_request(request);
     }
-    if state.daemon_healthy() {
+    if restore_display && state.daemon_healthy() {
         issue_fallback_command(state, effects, now_ms, timing);
-    } else {
+    } else if restore_display || !state.daemon_healthy() {
         state.phase = ProtocolPhase::FallbackDeferred;
+        state.phase_deadline_ms = None;
+    } else {
+        state.fallback_reason = None;
+        state.phase = ProtocolPhase::Idle;
         state.phase_deadline_ms = None;
     }
 }
@@ -956,7 +971,7 @@ fn begin_active_session_failure_fallback(
         .active_session
         .as_ref()
         .map(|session| session.target)
-        .filter(|target| *target != state.server_host)
+        .filter(|target| *target != state.server_host && state.has_display_route(*target))
     {
         state.manual_recovery_target = Some(target);
     }
@@ -992,25 +1007,37 @@ fn finish_fallback(state: &mut ProtocolState) {
     record_verified_switch(state, state.server_host);
 }
 
-fn manual_recovery_display_observed(state: &ProtocolState) -> bool {
-    state.manual_recovery_target.is_some_and(|target| {
-        state.tv_mode == TvMode::Fullscreen
-            && state.observed_input == Some(target)
-            && state.keyboard_owner == state.server_host
-            && state.pointer_owner == state.server_host
-            && state.active_request.is_none()
-            && state.active_session.is_none()
-    })
+fn manual_display_observed(state: &ProtocolState) -> bool {
+    (state.tv_mode != TvMode::Fullscreen || state.observed_input != Some(state.server_host))
+        && state.keyboard_owner == state.server_host
+        && state.pointer_owner == state.server_host
+        && state.active_request.is_none()
+        && state.active_session.is_none()
 }
 
-fn finish_manual_recovery(state: &mut ProtocolState) {
+fn accept_manual_display(state: &mut ProtocolState) {
     release_to_server(state);
+    state.commanded_input = None;
+    state.manual_recovery_target = None;
     state.fallback_required = false;
     state.fallback_reason = None;
+    state.pending_multiview = None;
     state.phase = ProtocolPhase::Idle;
     state.phase_deadline_ms = None;
     state.observation_in_flight = None;
     state.next_signal_poll_ms = None;
+}
+
+fn display_restore_required(state: &ProtocolState) -> bool {
+    state.fallback_required
+        || state.pending_multiview.is_some()
+        || state.active_request.as_ref().is_some_and(|request| {
+            request.switch_epoch.is_some() && state.has_display_route(request.target)
+        })
+        || state
+            .active_session
+            .as_ref()
+            .is_some_and(|session| state.has_display_route(session.target))
 }
 
 fn record_verified_switch(state: &mut ProtocolState, target: Host) {
@@ -1128,8 +1155,8 @@ fn complete_multiview_observation(
         );
         return;
     }
-    state.pending_multiview = None;
     if enabled {
+        state.pending_multiview = None;
         state.phase = ProtocolPhase::Idle;
         state.phase_deadline_ms = None;
     } else {
@@ -1179,6 +1206,26 @@ mod tests {
 
     fn synchronized_with_limit(retained_request_limit: usize) -> ProtocolState {
         let state = ProtocolState::new(Host::Linux, retained_request_limit);
+        apply(
+            &state,
+            Event::TransportSynchronized {
+                mode: TvMode::Fullscreen,
+                input: Some(Host::Linux),
+                signals: signals(Host::Linux),
+            },
+            1,
+            TIMING,
+        )
+        .unwrap()
+        .next
+    }
+
+    fn synchronized_without_windows_display() -> ProtocolState {
+        let state = ProtocolState::with_display_hosts(
+            Host::Linux,
+            32,
+            [Host::Linux, Host::Mac],
+        );
         apply(
             &state,
             Event::TransportSynchronized {
@@ -1318,6 +1365,84 @@ mod tests {
     }
 
     #[test]
+    fn server_owned_manual_display_selection_never_commands_the_tv() {
+        let state = synchronized();
+        let transition = apply(
+            &state,
+            Event::SubscriptionObserved {
+                mode: TvMode::Fullscreen,
+                input: None,
+            },
+            10,
+            TIMING,
+        )
+        .unwrap();
+
+        assert!(transition.effects.is_empty());
+        assert_eq!(transition.next.phase, ProtocolPhase::Idle);
+        assert_eq!(transition.next.observed_input, None);
+        assert_eq!(transition.next.keyboard_owner, Host::Linux);
+        assert_eq!(transition.next.pointer_owner, Host::Linux);
+        assert!(!transition.next.fallback_required);
+    }
+
+    #[test]
+    fn peer_without_display_route_transfers_input_without_touching_tv() {
+        let state = ready_peer(&synchronized_without_windows_display(), Host::Windows, 11);
+        let prepared = apply(
+            &state,
+            Event::CreateEnter {
+                request_id: "request-windows".to_string(),
+                client_id: "hub".to_string(),
+                target: Host::Windows,
+                lease: lease(11),
+            },
+            10,
+            TIMING,
+        )
+        .unwrap();
+
+        assert!(prepared.effects.is_empty());
+        assert_eq!(prepared.next.phase, ProtocolPhase::GrantPending);
+        assert_eq!(prepared.next.commanded_input, None);
+        let request = prepared.next.active_request.as_ref().unwrap();
+        let committed = apply(
+            &prepared.next,
+            Event::Commit {
+                request_id: request.request_id.clone(),
+                request_epoch: request.request_epoch,
+                grant_epoch: request.grant.as_ref().unwrap().grant_epoch,
+                lease_id: request.lease.lease_id.clone(),
+                lease_epoch: request.lease.lease_epoch,
+            },
+            20,
+            TIMING,
+        )
+        .unwrap()
+        .next;
+        assert_eq!(committed.keyboard_owner, Host::Windows);
+        assert_eq!(committed.pointer_owner, Host::Windows);
+        assert_eq!(committed.phase, ProtocolPhase::RemoteOwned);
+        assert_eq!(committed.next_signal_poll_ms, None);
+
+        let released = apply(
+            &committed,
+            Event::PeerReadinessUpdated {
+                host: Host::Windows,
+                readiness: PeerReadiness::default(),
+            },
+            30,
+            TIMING,
+        )
+        .unwrap();
+        assert!(released.effects.is_empty());
+        assert_eq!(released.next.keyboard_owner, Host::Linux);
+        assert_eq!(released.next.pointer_owner, Host::Linux);
+        assert_eq!(released.next.phase, ProtocolPhase::Idle);
+        assert!(!released.next.fallback_required);
+    }
+
+    #[test]
     fn retained_request_id_remains_idempotent_after_newer_request() {
         let mut state = synchronized_with_limit(2);
         let first = archived_request("request-old", 1);
@@ -1370,7 +1495,7 @@ mod tests {
     }
 
     #[test]
-    fn synchronized_wrong_input_commands_server_without_fabricating_observation() {
+    fn synchronized_manual_display_choice_is_not_overridden() {
         let state = ProtocolState::new(Host::Linux, 32);
         let transition = apply(
             &state,
@@ -1383,10 +1508,14 @@ mod tests {
             TIMING,
         )
         .unwrap();
-        assert_eq!(transition.next.commanded_input, Some(Host::Linux));
+        assert_eq!(transition.next.commanded_input, None);
         assert_eq!(transition.next.observed_input, Some(Host::Mac));
-        assert_eq!(transition.effects.len(), 1);
-        assert!(transition.next.fallback_required);
+        assert_eq!(transition.next.manual_recovery_target, None);
+        assert!(transition.effects.is_empty());
+        assert_eq!(transition.next.phase, ProtocolPhase::Idle);
+        assert!(!transition.next.fallback_required);
+        assert_eq!(transition.next.keyboard_owner, Host::Linux);
+        assert_eq!(transition.next.pointer_owner, Host::Linux);
     }
 
     #[test]
@@ -1466,7 +1595,57 @@ mod tests {
     }
 
     #[test]
-    fn manual_recovery_is_target_scoped_and_server_observation_clears_it() {
+    fn manual_display_selection_cancels_in_progress_server_fallback() {
+        let state = ready_peer(&synchronized(), Host::Mac, 11);
+        let switching = create_mac(&state).unwrap().next;
+        let fallback = apply(
+            &switching,
+            Event::CommandFailed {
+                switch_epoch: switching.switch_epoch,
+                reason: "switch failed".to_string(),
+            },
+            11,
+            TIMING,
+        )
+        .unwrap()
+        .next;
+        assert_eq!(fallback.phase, ProtocolPhase::FallbackCommandPending);
+        assert_eq!(fallback.keyboard_owner, Host::Linux);
+        assert_eq!(fallback.pointer_owner, Host::Linux);
+        let stale_fallback_epoch = fallback.switch_epoch;
+
+        let manual = apply(
+            &fallback,
+            Event::SubscriptionObserved {
+                mode: TvMode::Fullscreen,
+                input: None,
+            },
+            12,
+            TIMING,
+        )
+        .unwrap();
+        assert!(manual.effects.is_empty());
+        assert_eq!(manual.next.phase, ProtocolPhase::Idle);
+        assert_eq!(manual.next.commanded_input, None);
+        assert!(!manual.next.fallback_required);
+
+        let delayed_ack = apply(
+            &manual.next,
+            Event::CommandAcknowledged {
+                switch_epoch: stale_fallback_epoch,
+                target: Host::Linux,
+            },
+            13,
+            TIMING,
+        )
+        .unwrap();
+        assert!(delayed_ack.effects.is_empty());
+        assert_eq!(delayed_ack.next.phase, ProtocolPhase::Idle);
+        assert_eq!(delayed_ack.next.observed_input, None);
+    }
+
+    #[test]
+    fn manual_display_choice_clears_stale_recovery_target() {
         let mut state = synchronized();
         state.manual_recovery_target = Some(Host::Mac);
 
@@ -1480,13 +1659,15 @@ mod tests {
             TIMING,
         )
         .unwrap();
-        assert_eq!(
-            wrong_target.next.fallback_reason.as_deref(),
-            Some("manual_tv_override")
-        );
+        assert!(wrong_target.effects.is_empty());
+        assert_eq!(wrong_target.next.phase, ProtocolPhase::Idle);
+        assert!(!wrong_target.next.fallback_required);
+        assert_eq!(wrong_target.next.manual_recovery_target, None);
+        assert_eq!(wrong_target.next.keyboard_owner, Host::Linux);
+        assert_eq!(wrong_target.next.pointer_owner, Host::Linux);
 
         let returned = apply(
-            &state,
+            &wrong_target.next,
             Event::SubscriptionObserved {
                 mode: TvMode::Fullscreen,
                 input: Some(Host::Linux),
@@ -2273,6 +2454,36 @@ mod tests {
             changed.next.fallback_reason.as_deref(),
             Some("unexpected_tv_subscription")
         );
+    }
+
+    #[test]
+    fn fullscreen_manual_change_during_remote_ownership_falls_back() {
+        let remote = remote_owned();
+        let changed = apply(
+            &remote,
+            Event::SubscriptionObserved {
+                mode: TvMode::Fullscreen,
+                input: Some(Host::Windows),
+            },
+            40,
+            TIMING,
+        )
+        .unwrap();
+
+        assert_eq!(changed.next.keyboard_owner, Host::Linux);
+        assert_eq!(changed.next.pointer_owner, Host::Linux);
+        assert_eq!(
+            changed.next.fallback_reason.as_deref(),
+            Some("unexpected_tv_subscription")
+        );
+        assert!(matches!(
+            changed.effects.as_slice(),
+            [Effect::SetInput {
+                target: Host::Linux,
+                fallback: true,
+                ..
+            }]
+        ));
     }
 
     #[test]

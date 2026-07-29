@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     fmt,
     str::FromStr,
 };
@@ -163,6 +163,7 @@ pub struct SignalObservation {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProtocolState {
     pub server_host: Host,
+    pub display_hosts: BTreeSet<Host>,
     pub ws_state: WsState,
     pub subscribe_active: bool,
     pub synchronized: bool,
@@ -196,10 +197,24 @@ pub struct ProtocolState {
 }
 
 impl ProtocolState {
+    #[cfg(test)]
     pub fn new(server_host: Host, retained_request_limit: usize) -> Self {
+        Self::with_display_hosts(server_host, retained_request_limit, Host::ALL)
+    }
+
+    pub fn with_display_hosts(
+        server_host: Host,
+        retained_request_limit: usize,
+        display_hosts: impl IntoIterator<Item = Host>,
+    ) -> Self {
         assert!(
             retained_request_limit > 0,
             "request history must be bounded"
+        );
+        let display_hosts = display_hosts.into_iter().collect::<BTreeSet<_>>();
+        assert!(
+            display_hosts.contains(&server_host),
+            "server host must have a managed display route"
         );
         let input_signal = Host::ALL
             .into_iter()
@@ -212,6 +227,7 @@ impl ProtocolState {
         let switch_count = Host::ALL.into_iter().map(|host| (host, 0)).collect();
         Self {
             server_host,
+            display_hosts,
             ws_state: WsState::Disconnected,
             subscribe_active: false,
             synchronized: false,
@@ -243,6 +259,10 @@ impl ProtocolState {
             last_error: None,
             dropped_logs: 0,
         }
+    }
+
+    pub fn has_display_route(&self, host: Host) -> bool {
+        self.display_hosts.contains(&host)
     }
 
     pub fn daemon_healthy(&self) -> bool {
@@ -339,15 +359,16 @@ impl ProtocolState {
             if !ready {
                 return Err(InvariantViolation::RemoteOwnerNotReady);
             }
-            if self.observed_input != Some(session.target)
-                || self.verified_epoch != Some(session.switch_epoch)
-                || self.tv_mode != TvMode::Fullscreen
-                || !self
-                    .input_signal
-                    .get(&session.target)
-                    .is_some_and(|signal| {
-                        signal.present && signal.switch_epoch == session.switch_epoch
-                    })
+            if self.has_display_route(session.target)
+                && (self.observed_input != Some(session.target)
+                    || self.verified_epoch != Some(session.switch_epoch)
+                    || self.tv_mode != TvMode::Fullscreen
+                    || !self
+                        .input_signal
+                        .get(&session.target)
+                        .is_some_and(|signal| {
+                            signal.present && signal.switch_epoch == session.switch_epoch
+                        }))
             {
                 return Err(InvariantViolation::RemoteOwnerWithoutVerifiedDisplay);
             }

@@ -5,9 +5,9 @@ controller_token = "{{ lookup('ansible.builtin.file', lan_mouse_controller_token
 client_key_path = "{{ tv_multiview_client_key_path }}"
 
 [inputs]
-linux = "{{ tv_inputs.linux }}"
-mac = "{{ tv_inputs.mac }}"
-windows = "{{ tv_inputs.windows }}"
+{% for host, input in tv_inputs.items() %}
+{{ host }} = "{{ input }}"
+{% endfor %}
 
 [wake_on_lan]
 mac = "{{ mac_mac_address }}"
