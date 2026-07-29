@@ -141,7 +141,7 @@
     mac_target_dir: "{{ mac_build_cache }}/target"
     mac_installed_binary: "{{ ansible_facts.env.HOME | default('') }}/.local/bin/lan-mouse"
     mac_wrapper: "{{ ansible_facts.env.HOME | default('') }}/.local/bin/run-lan-mouse"
-    win_build_cache: "{{ ansible_facts.env.LOCALAPPDATA | default('') }}\\lan-mouse-build"
+    win_build_cache: "{{ lan_mouse_windows_build_cache }}"
     win_source_dir: "{{ win_build_cache }}\\source"
     win_vendor_dir: "{{ win_build_cache }}\\lan-mouse-vendor-{{ lan_mouse_cargo_lock_sha256[:12] }}"
     win_target_dir: "{{ win_build_cache }}\\target"

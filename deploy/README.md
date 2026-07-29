@@ -79,10 +79,11 @@ then run their selected install and service-restart sequences concurrently.
   10 MiB backups.
 - Windows installs the native daemon at
   `D:\Programs\lan-mouse\lan-mouse.exe` and runs it through
-  `LanMouseDaemon`. The task starts at interactive user logon. A parallel
-  unlock-triggered invocation asks the existing daemon to re-enable input
-  emulation without replacing its supervised process. The wrapper keeps the
-  daemon alive across genuine process exits, while temporary Windows input
+  `LanMouseDaemon`; native build assets are kept under
+  `D:\BuildCache\lan-mouse`. The task starts at interactive user logon. A
+  parallel unlock-triggered invocation asks the existing daemon to re-enable
+  input emulation without replacing its supervised process. The wrapper keeps
+  the daemon alive across genuine process exits, while temporary Windows input
   denial leaves the daemon connected and not-ready until input emulation
   recovers. Bounded persistent logs remain under
   `%LOCALAPPDATA%\lan-mouse\logs` with five 10 MiB backups. The playbook does

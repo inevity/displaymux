@@ -406,23 +406,33 @@
   when: win_interactive_desktop_available
   changed_when: false
 
-- name: Remove obsolete per-user Windows daemon binary after replacement
+- name: Remove obsolete per-user Windows installation after replacement
   ansible.windows.win_shell: |
-    $expected = [System.IO.Path]::GetFullPath("{{ win_installed_binary }}")
+    $expected = [System.IO.Path]::GetFullPath("{{ win_install_dir }}")
     $obsolete = [System.IO.Path]::GetFullPath(
-      (Join-Path $env:LOCALAPPDATA "Programs\lan-mouse\lan-mouse.exe")
+      (Join-Path $env:LOCALAPPDATA "Programs\lan-mouse")
     )
-    if ($obsolete -ne $expected -and (Test-Path -LiteralPath $obsolete -PathType Leaf)) {
-      Remove-Item -LiteralPath $obsolete -Force
-      $obsoleteDirectory = Split-Path -Parent $obsolete
-      if (-not (Get-ChildItem -LiteralPath $obsoleteDirectory -Force)) {
-        Remove-Item -LiteralPath $obsoleteDirectory -Force
-      }
+    if ($obsolete -ne $expected -and (Test-Path -LiteralPath $obsolete -PathType Container)) {
+      Remove-Item -LiteralPath $obsolete -Recurse -Force
       Write-Output "removed"
     }
-  register: win_obsolete_binary
+  register: win_obsolete_install
   when: win_interactive_desktop_available
-  changed_when: "'removed' in win_obsolete_binary.stdout"
+  changed_when: "'removed' in win_obsolete_install.stdout"
+
+- name: Remove obsolete C-drive Windows build cache after replacement
+  ansible.windows.win_shell: |
+    $expected = [System.IO.Path]::GetFullPath("{{ win_build_cache }}")
+    $obsolete = [System.IO.Path]::GetFullPath(
+      (Join-Path $env:LOCALAPPDATA "lan-mouse-build")
+    )
+    if ($obsolete -ne $expected -and (Test-Path -LiteralPath $obsolete -PathType Container)) {
+      Remove-Item -LiteralPath $obsolete -Recurse -Force
+      Write-Output "removed"
+    }
+  register: win_obsolete_build_cache
+  when: win_interactive_desktop_available
+  changed_when: "'removed' in win_obsolete_build_cache.stdout"
 
 - name: Verify persistent Windows log files exist
   ansible.windows.win_stat:
