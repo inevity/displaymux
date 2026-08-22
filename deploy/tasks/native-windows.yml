@@ -1,8 +1,12 @@
-- name: Require configured Windows install drive
+- name: Require configured Windows storage drives
   ansible.windows.win_shell: |
     $root = [System.IO.Path]::GetPathRoot("{{ win_install_dir }}")
     if (-not $root -or -not (Test-Path -LiteralPath $root -PathType Container)) {
       throw "Windows install drive is unavailable: $root"
+    }
+    $root = [System.IO.Path]::GetPathRoot("{{ win_build_cache }}")
+    if (-not $root -or -not (Test-Path -LiteralPath $root -PathType Container)) {
+      throw "Windows build drive is unavailable: $root"
     }
   changed_when: false
 
@@ -16,15 +20,155 @@
     - "{{ ansible_facts.env.LOCALAPPDATA }}\\lan-mouse"
     - "{{ ansible_facts.env.LOCALAPPDATA }}\\lan-mouse\\logs"
 
+- name: Select native Rust ABI for the Windows build
+  ansible.builtin.set_fact:
+    # Visual Studio 2022 supports Windows 10 1909 (build 18363) and newer.
+    # Older LTSC builds use Rust's GNU ABI and do not depend on Visual Studio.
+    win_use_msvc: >-
+      {{ (ansible_facts.distribution_version.split('.')[2] | int) >= 18363 }}
+    win_native_rust_toolchain: >-
+      {{ lan_mouse_rust_toolchain
+         if (ansible_facts.distribution_version.split('.')[2] | int) >= 18363
+         else lan_mouse_rust_toolchain ~ '-x86_64-pc-windows-gnu' }}
+    win_target_dir: >-
+      {{ win_build_cache }}\target-{{ 'msvc'
+         if (ansible_facts.distribution_version.split('.')[2] | int) >= 18363
+         else 'gnu' }}
+
+- name: Check Windows rustup bootstrap
+  ansible.windows.win_stat:
+    path: "{{ win_rustup_binary }}"
+  register: win_rustup
+  when: lan_mouse_install_method == 'native_build'
+
+- name: Bootstrap rustup under the configured Windows build root once
+  when:
+    - lan_mouse_install_method == 'native_build'
+    - not win_rustup.stat.exists
+  block:
+    - name: Download rustup-init for Windows
+      ansible.windows.win_get_url:
+        url: https://win.rustup.rs/x86_64
+        dest: "{{ win_build_cache }}\\rustup-init.exe"
+
+    - name: Install rustup without modifying the interactive user PATH
+      ansible.windows.win_shell: |
+        $ErrorActionPreference = 'Stop'
+        $env:CARGO_HOME = "{{ win_cargo_home }}"
+        $env:RUSTUP_HOME = "{{ win_rustup_home }}"
+        & "{{ win_build_cache }}\rustup-init.exe" -y --no-modify-path --profile minimal --default-toolchain none
+        if ($LASTEXITCODE -ne 0) { throw "rustup-init exited with code $LASTEXITCODE" }
+
 - name: Bootstrap selected Windows Rust toolchain once
   ansible.windows.win_shell: |
-    rustup toolchain install {{ lan_mouse_rust_toolchain }} --profile minimal
-    exit $LASTEXITCODE
+    $ErrorActionPreference = 'Stop'
+    $env:CARGO_HOME = "{{ win_cargo_home }}"
+    $env:RUSTUP_HOME = "{{ win_rustup_home }}"
+    & "{{ win_rustup_binary }}" toolchain install {{ win_native_rust_toolchain }} --profile minimal
+    if ($LASTEXITCODE -ne 0) { throw "rustup exited with code $LASTEXITCODE" }
   args:
     creates: >-
-      {{ ansible_facts.env.USERPROFILE }}\.rustup\toolchains\{{ lan_mouse_rust_toolchain
-      }}-x86_64-pc-windows-msvc\bin\rustc.exe
+      {{ win_rustup_home }}\toolchains\{{ win_native_rust_toolchain
+      }}{{ '-x86_64-pc-windows-msvc' if (win_use_msvc | bool) else '' }}\bin\rustc.exe
   when: lan_mouse_install_method == 'native_build'
+
+- name: Check MinGW toolchain on legacy Windows
+  ansible.windows.win_stat:
+    path: "{{ win_mingw_bin }}\\gcc.exe"
+  register: win_mingw_gcc
+  when:
+    - lan_mouse_install_method == 'native_build'
+    - not (win_use_msvc | bool)
+
+- name: Bootstrap MSYS2 MinGW toolchain once on legacy Windows
+  when:
+    - lan_mouse_install_method == 'native_build'
+    - not (win_use_msvc | bool)
+    - not win_mingw_gcc.stat.exists
+  block:
+    - name: Download MSYS2 self-extracting base archive
+      ansible.windows.win_get_url:
+        url: https://repo.msys2.org/distrib/msys2-x86_64-latest.sfx.exe
+        dest: "{{ win_build_cache }}\\msys2-x86_64-latest.sfx.exe"
+
+    - name: Extract MSYS2 under the configured Windows build root
+      ansible.windows.win_shell: |
+        $ErrorActionPreference = 'Stop'
+        & "{{ win_build_cache }}\msys2-x86_64-latest.sfx.exe" -y "-o{{ win_build_cache }}"
+        if ($LASTEXITCODE -ne 0) { throw "MSYS2 extraction exited with code $LASTEXITCODE" }
+      args:
+        creates: "{{ win_msys2_root }}\\usr\\bin\\bash.exe"
+
+    - name: Install MinGW GCC and binutils
+      ansible.windows.win_shell: |
+        $ErrorActionPreference = 'Stop'
+        & "{{ win_msys2_root }}\usr\bin\bash.exe" -lc "pacman -Sy --noconfirm --needed mingw-w64-x86_64-gcc"
+        if ($LASTEXITCODE -ne 0) { throw "MSYS2 package installation exited with code $LASTEXITCODE" }
+
+- name: Verify MinGW compiler and import-library tools
+  ansible.windows.win_stat:
+    path: "{{ win_mingw_bin }}\\{{ item }}"
+  loop:
+    - gcc.exe
+    - dlltool.exe
+    - as.exe
+  register: win_mingw_tools
+  when:
+    - lan_mouse_install_method == 'native_build'
+    - not (win_use_msvc | bool)
+
+- name: Require MinGW compiler and import-library tools
+  ansible.builtin.assert:
+    that:
+      - win_mingw_tools.results | map(attribute='stat.exists') | min
+      - win_mingw_tools.results | map(attribute='stat.size') | map('int') | min > 0
+    fail_msg: >-
+      The legacy Windows GNU build requires gcc.exe, dlltool.exe, and as.exe
+      under {{ win_mingw_bin }}.
+  when:
+    - lan_mouse_install_method == 'native_build'
+    - not (win_use_msvc | bool)
+
+- name: Probe Windows MSVC x64 Build Tools
+  ansible.windows.win_shell: |
+    $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+    if (Test-Path $vswhere) {
+      & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+    }
+  register: win_vs_installation_probe
+  changed_when: false
+  when:
+    - lan_mouse_install_method == 'native_build'
+    - win_use_msvc | bool
+
+- name: Bootstrap Windows MSVC x64 Build Tools once
+  when:
+    - lan_mouse_install_method == 'native_build'
+    - win_use_msvc | bool
+    - win_vs_installation_probe.stdout | trim | length == 0
+  block:
+    - name: Download Visual Studio Build Tools bootstrapper
+      ansible.windows.win_get_url:
+        url: https://aka.ms/vs/17/release/vs_BuildTools.exe
+        dest: "{{ win_build_cache }}\\vs_BuildTools.exe"
+
+    - name: Install Visual C++ x64 build workload
+      ansible.windows.win_shell: |
+        $arguments = @(
+          '--quiet',
+          '--wait',
+          '--norestart',
+          '--nocache',
+          '--installPath', '{{ win_msvc_dir }}',
+          '--add', 'Microsoft.VisualStudio.Workload.VCTools',
+          '--includeRecommended'
+        )
+        $process = Start-Process -FilePath "{{ win_build_cache }}\vs_BuildTools.exe" -ArgumentList $arguments -Wait -PassThru
+        if ($process.ExitCode -notin @(0, 3010)) {
+          throw "Visual Studio Build Tools installer exited with code $($process.ExitCode)"
+        }
+      async: 3600
+      poll: 5
 
 - name: Locate Windows MSVC x64 Build Tools
   ansible.windows.win_shell: |
@@ -35,7 +179,9 @@
     Write-Output $installation
   register: win_vs_installation
   changed_when: false
-  when: lan_mouse_install_method == 'native_build'
+  when:
+    - lan_mouse_install_method == 'native_build'
+    - win_use_msvc | bool
 
 - name: Locate PowerShell 7 for bounded log wrapper
   ansible.windows.win_shell: |
@@ -98,9 +244,14 @@
 
 - name: Verify Windows offline dependency resolution
   ansible.windows.win_shell: |
-    $env:RUSTUP_TOOLCHAIN = "{{ lan_mouse_rust_toolchain }}"
-    cargo metadata --frozen --format-version 1 | Out-Null
-    exit $LASTEXITCODE
+    $ErrorActionPreference = 'Stop'
+    $env:CARGO_HOME = "{{ win_cargo_home }}"
+    $env:RUSTUP_HOME = "{{ win_rustup_home }}"
+    {% if not (win_use_msvc | bool) %}
+    $env:PATH = "{{ win_mingw_bin }};$env:PATH"
+    {% endif %}
+    & "{{ win_rustup_binary }}" run {{ win_native_rust_toolchain }} cargo metadata --frozen --format-version 1 | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "cargo metadata exited with code $LASTEXITCODE" }
   args:
     chdir: "{{ win_source_dir }}"
   changed_when: false
@@ -110,12 +261,21 @@
   block:
     - name: Run no-GTK Windows workspace tests
       ansible.windows.win_shell: |
-        $env:RUSTUP_TOOLCHAIN = "{{ lan_mouse_rust_toolchain }}"
+        $ErrorActionPreference = 'Stop'
+        $env:CARGO_HOME = "{{ win_cargo_home }}"
+        $env:RUSTUP_HOME = "{{ win_rustup_home }}"
+        {% if not (win_use_msvc | bool) %}
+        $env:PATH = "{{ win_mingw_bin }};$env:PATH"
+        {% endif %}
         $env:CARGO_TARGET_DIR = "{{ win_target_dir }}"
         $env:CARGO_INCREMENTAL = "0"
-        $command = "call `"{{ win_vs_installation.stdout | trim }}\Common7\Tools\VsDevCmd.bat`" -arch=x64 -host_arch=x64 >nul && cargo test --frozen --target-dir `"{{ win_target_dir }}`" --workspace --exclude lan-mouse-gtk --no-default-features"
+        {% if win_use_msvc | bool %}
+        $command = "call `"{{ win_vs_installation.stdout | trim }}\Common7\Tools\VsDevCmd.bat`" -arch=x64 -host_arch=x64 >nul && `"{{ win_rustup_binary }}`" run {{ win_native_rust_toolchain }} cargo test --frozen --target-dir `"{{ win_target_dir }}`" --workspace --exclude lan-mouse-gtk --no-default-features"
         cmd.exe /d /c $command
-        exit $LASTEXITCODE
+        {% else %}
+        & "{{ win_rustup_binary }}" run {{ win_native_rust_toolchain }} cargo test --frozen --target-dir "{{ win_target_dir }}" --workspace --exclude lan-mouse-gtk --no-default-features
+        {% endif %}
+        if ($LASTEXITCODE -ne 0) { throw "cargo test exited with code $LASTEXITCODE" }
       args:
         chdir: "{{ win_source_dir }}"
       changed_when: false
@@ -124,12 +284,21 @@
 
     - name: Build no-GTK Windows release binary
       ansible.windows.win_shell: |
-        $env:RUSTUP_TOOLCHAIN = "{{ lan_mouse_rust_toolchain }}"
+        $ErrorActionPreference = 'Stop'
+        $env:CARGO_HOME = "{{ win_cargo_home }}"
+        $env:RUSTUP_HOME = "{{ win_rustup_home }}"
+        {% if not (win_use_msvc | bool) %}
+        $env:PATH = "{{ win_mingw_bin }};$env:PATH"
+        {% endif %}
         $env:CARGO_TARGET_DIR = "{{ win_target_dir }}"
         $env:CARGO_INCREMENTAL = "0"
-        $command = "call `"{{ win_vs_installation.stdout | trim }}\Common7\Tools\VsDevCmd.bat`" -arch=x64 -host_arch=x64 >nul && cargo build --frozen --target-dir `"{{ win_target_dir }}`" --release --bin lan-mouse --no-default-features"
+        {% if win_use_msvc | bool %}
+        $command = "call `"{{ win_vs_installation.stdout | trim }}\Common7\Tools\VsDevCmd.bat`" -arch=x64 -host_arch=x64 >nul && `"{{ win_rustup_binary }}`" run {{ win_native_rust_toolchain }} cargo build --frozen --target-dir `"{{ win_target_dir }}`" --release --bin lan-mouse --no-default-features"
         cmd.exe /d /c $command
-        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+        {% else %}
+        & "{{ win_rustup_binary }}" run {{ win_native_rust_toolchain }} cargo build --frozen --target-dir "{{ win_target_dir }}" --release --bin lan-mouse --no-default-features
+        {% endif %}
+        if ($LASTEXITCODE -ne 0) { throw "cargo build exited with code $LASTEXITCODE" }
         if (-not (Test-Path "{{ win_target_dir }}\release\lan-mouse.exe")) {
           throw "cargo succeeded without producing {{ win_target_dir }}\release\lan-mouse.exe"
         }
@@ -404,6 +573,118 @@
   delay: 1
   until: win_process.rc == 0
   when: win_interactive_desktop_available
+  changed_when: false
+
+- name: Require generated Windows Lan Mouse certificate
+  ansible.windows.win_stat:
+    path: "{{ ansible_facts.env.LOCALAPPDATA }}\\lan-mouse\\lan-mouse.pem"
+  register: win_lan_mouse_certificate
+
+- name: Validate generated Windows Lan Mouse certificate
+  ansible.builtin.assert:
+    that:
+      - win_lan_mouse_certificate.stat.exists
+      - win_lan_mouse_certificate.stat.size | int > 0
+
+- name: Read Windows Lan Mouse certificate fingerprint
+  ansible.windows.win_shell: |
+    $pem = Get-Content -LiteralPath "{{ ansible_facts.env.LOCALAPPDATA }}\lan-mouse\lan-mouse.pem" -Raw
+    $match = [regex]::Match(
+      $pem,
+      '-----BEGIN CERTIFICATE-----(.*?)-----END CERTIFICATE-----',
+      [System.Text.RegularExpressions.RegexOptions]::Singleline
+    )
+    if (-not $match.Success) { throw 'Lan Mouse PEM certificate block is missing' }
+    $der = [Convert]::FromBase64String(($match.Groups[1].Value -replace '\s', ''))
+    $sha256 = [System.Security.Cryptography.SHA256]::Create()
+    try {
+      $hash = $sha256.ComputeHash($der)
+      Write-Output (($hash | ForEach-Object { $_.ToString('x2') }) -join ':')
+    } finally {
+      $sha256.Dispose()
+    }
+  register: win_certificate_fingerprint
+  changed_when: false
+
+- name: Validate Windows Lan Mouse certificate fingerprint
+  ansible.builtin.assert:
+    that:
+      - win_certificate_fingerprint.stdout | trim is regex('^([0-9a-f]{2}:){31}[0-9a-f]{2}$')
+
+- name: Persist Windows Lan Mouse certificate fingerprint on the controller
+  ansible.builtin.copy:
+    content: "{{ win_certificate_fingerprint.stdout | trim }}\n"
+    dest: "{{ lan_mouse_windows_fingerprint_file }}"
+    mode: "0600"
+  delegate_to: localhost
+
+- name: Gather Linux hub facts for trust reconciliation
+  ansible.builtin.setup:
+  delegate_to: "{{ groups['linux_desktop'][0] }}"
+  delegate_facts: true
+
+- name: Reconcile Windows trust in the Linux hub configuration
+  ansible.builtin.template:
+    src: templates/hub-config.toml.j2
+    dest: >-
+      {{ hostvars[groups['linux_desktop'][0]].ansible_facts.env.HOME
+         }}/.config/lan-mouse/config.toml
+    mode: "0600"
+  vars:
+    windows_fingerprint: "{{ win_certificate_fingerprint.stdout | trim }}"
+  register: reconciled_hub_config
+  no_log: true
+  delegate_to: "{{ groups['linux_desktop'][0] }}"
+
+- name: Restore managed HDMI2 route in the Linux TV controller configuration
+  ansible.builtin.template:
+    src: templates/tv-multiview-config.toml.j2
+    dest: >-
+      {{ hostvars[groups['linux_desktop'][0]].ansible_facts.env.HOME
+         }}/.config/tv-multiview/config.toml
+    mode: "0600"
+  vars:
+    tv_multiview_client_key_path: >-
+      {{ hostvars[groups['linux_desktop'][0]].ansible_facts.env.HOME
+         }}/.config/lg-buddy/.aiopylgtv.sqlite
+  register: reconciled_tv_config
+  no_log: true
+  delegate_to: "{{ groups['linux_desktop'][0] }}"
+
+- name: Restart changed Linux TV controller configuration
+  ansible.builtin.systemd:
+    name: tv-multiview.service
+    scope: user
+    state: restarted
+  environment:
+    XDG_RUNTIME_DIR: >-
+      /run/user/{{ hostvars[groups['linux_desktop'][0]].ansible_facts.user_uid }}
+  when: reconciled_tv_config.changed
+  delegate_to: "{{ groups['linux_desktop'][0] }}"
+
+- name: Restart changed Linux Lan Mouse trust configuration
+  ansible.builtin.systemd:
+    name: lan-mouse.service
+    scope: user
+    state: restarted
+  environment:
+    XDG_RUNTIME_DIR: >-
+      /run/user/{{ hostvars[groups['linux_desktop'][0]].ansible_facts.user_uid }}
+  when: reconciled_hub_config.changed
+  delegate_to: "{{ groups['linux_desktop'][0] }}"
+
+- name: Wait for authenticated Windows connection to the Linux hub
+  ansible.windows.win_shell: |
+    $clients = & "{{ win_installed_binary }}" cli list --json | ConvertFrom-Json
+    if ($LASTEXITCODE -ne 0) { throw "Lan Mouse status exited with code $LASTEXITCODE" }
+    $linux = $clients | Where-Object { $_.hostname -eq "{{ groups['linux_desktop'][0] }}" }
+    if (-not $linux -or -not $linux.alive) {
+      throw 'Windows Lan Mouse is not connected to the Linux hub'
+    }
+  register: win_hub_connection
+  retries: 20
+  delay: 1
+  until: win_hub_connection.rc == 0
   changed_when: false
 
 - name: Remove obsolete per-user Windows installation after replacement
