@@ -1,0 +1,22 @@
+[workspace]
+resolver = "2"
+members = [
+    "lan-mouse",
+    "lan-mouse/input-capture",
+    "lan-mouse/input-emulation",
+    "lan-mouse/input-event",
+    "lan-mouse/lan-mouse-cli",
+    "lan-mouse/lan-mouse-clipboard",
+    "lan-mouse/lan-mouse-gtk",
+    "lan-mouse/lan-mouse-ipc",
+    "lan-mouse/lan-mouse-proto",
+    "tv-multiview",
+]
+default-members = ["lan-mouse", "tv-multiview"]
+
+[profile.lan-mouse-release]
+inherits = "release"
+codegen-units = 1
+lto = "fat"
+strip = true
+panic = "abort"
