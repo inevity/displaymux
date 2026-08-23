@@ -661,6 +661,8 @@ pub fn apply(
             let target_mismatch =
                 |target| mode != TvMode::Fullscreen || input != Some(target);
 
+            // Distinct protocol phases intentionally converge on shared effects.
+            #[allow(clippy::if_same_then_else)]
             if next.fallback_required
                 && next.phase == ProtocolPhase::FallbackVerifying
                 && mode == TvMode::Fullscreen
