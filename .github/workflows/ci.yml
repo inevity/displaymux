@@ -1,0 +1,207 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  changes:
+    runs-on: ubuntu-24.04
+    outputs:
+      rust: ${{ steps.classify.outputs.rust }}
+      deploy: ${{ steps.classify.outputs.deploy }}
+    steps:
+      - name: Check out the exact event commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Classify affected components
+        id: classify
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BEFORE_SHA: ${{ github.event.before }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          rust=false
+          deploy=false
+
+          if [[ "$EVENT_NAME" == workflow_dispatch ]]; then
+            rust=true
+            deploy=true
+          else
+            if [[ "$EVENT_NAME" == pull_request ]]; then
+              base="$PR_BASE_SHA"
+            elif [[ -z "$BEFORE_SHA" || "$BEFORE_SHA" =~ ^0+$ ]]; then
+              rust=true
+              deploy=true
+              base=""
+            else
+              base="$BEFORE_SHA"
+            fi
+
+            if [[ -n "$base" ]]; then
+              while IFS= read -r path; do
+                case "$path" in
+                  Cargo.toml|Cargo.lock|lan-mouse/*|tv-multiview/*|.github/workflows/*)
+                    rust=true
+                    ;;
+                esac
+                case "$path" in
+                  deploy/*|.github/workflows/*)
+                    deploy=true
+                    ;;
+                esac
+              done < <(git diff --name-only "$base" "$GITHUB_SHA")
+            fi
+          fi
+
+          echo "rust=$rust" >> "$GITHUB_OUTPUT"
+          echo "deploy=$deploy" >> "$GITHUB_OUTPUT"
+
+  workflow-syntax:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out the exact event commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Validate workflow syntax
+        run: go run github.com/rhysd/actionlint/cmd/actionlint@03d0035246f3e81f36aed592ffb4bebf33a03106
+
+  linux-workspace:
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out the exact event commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes libadwaita-1-dev libgtk-4-dev libx11-dev libxtst-dev
+      - name: Validate workspace metadata and lockfile
+        run: |
+          test "$(find . -path ./target -prune -o -name Cargo.lock -print | wc -l)" -eq 1
+          test "$(rg --glob Cargo.toml '^\[workspace\]$' | wc -l)" -eq 1
+          cargo metadata --locked --no-deps --format-version 1 >/dev/null
+      - name: Check the root workspace
+        run: cargo check --locked --workspace
+      - name: Test the root workspace
+        run: cargo test --locked --workspace
+      - name: Build the default GTK application
+        run: cargo build --locked -p lan-mouse
+
+  no-gtk-native:
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            features: --features layer_shell_capture,libei_capture,x11_capture,wlroots_emulation,libei_emulation,x11_emulation,rdp_emulation
+          - os: windows-2025
+            features: ''
+          - os: macos-15-intel
+            features: ''
+          - os: macos-15
+            features: ''
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Check out the exact event commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Install Linux no-GTK dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes libx11-dev libxtst-dev
+      - name: Test native no-GTK packages
+        run: >-
+          cargo test --locked
+          -p lan-mouse
+          -p input-capture
+          -p input-emulation
+          -p input-event
+          -p lan-mouse-cli
+          -p lan-mouse-clipboard
+          -p lan-mouse-ipc
+          -p lan-mouse-proto
+          --no-default-features
+          ${{ matrix.features }}
+      - name: Check the native no-GTK binary
+        run: >-
+          cargo check --locked
+          -p lan-mouse
+          --no-default-features
+          ${{ matrix.features }}
+
+  tv-multiview:
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out the exact event commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Check tv-multiview
+        run: cargo check --locked -p tv-multiview
+      - name: Test tv-multiview
+        run: cargo test --locked -p tv-multiview
+      - name: Lint tv-multiview
+        run: cargo clippy --locked -p tv-multiview --all-targets -- -D warnings
+
+  deployment:
+    needs: changes
+    if: needs.changes.outputs.deploy == 'true'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out the exact event commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Install pinned Ansible tooling
+        run: |
+          python3 -m pip install --disable-pip-version-check ansible-core==2.21.1
+          ansible-galaxy collection install -r deploy/requirements.yml
+      - name: Test release resolver
+        run: python3 -m unittest discover -s deploy/tests -v
+      - name: Check native-build playbook syntax
+        run: >-
+          ansible-playbook --syntax-check
+          -i deploy/inventory.example.ini
+          deploy/playbook.yml
+          -e @deploy/group_vars/all.example.yml
+      - name: Check GitHub-release playbook syntax
+        run: >-
+          ansible-playbook --syntax-check
+          -i deploy/inventory.example.ini
+          deploy/playbook.yml
+          -e @deploy/group_vars/all.example.yml
+          -e lan_mouse_install_method=github_release
+          -e lan_mouse_github_repository=example/osswitch
+      - name: Verify localhost check mode has no deployment hosts
+        run: >-
+          ansible-playbook --check --limit localhost
+          -i deploy/inventory.example.ini
+          deploy/playbook.yml
+          -e @deploy/group_vars/all.example.yml
