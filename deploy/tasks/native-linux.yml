@@ -45,25 +45,19 @@
     creates: "{{ lan_mouse_linux_vendor_dir }}"
   when: lan_mouse_install_method == 'native_build'
 
-- name: Remove previous lan-mouse source on Linux
+- name: Remove previous osswitch source on Linux
   ansible.builtin.file:
-    path: "{{ lan_mouse_linux_source_dir }}"
+    path: "{{ osswitch_linux_source_dir }}"
     state: absent
   when: lan_mouse_install_method == 'native_build'
 
-- name: Deploy lan-mouse source on Linux
+- name: Deploy osswitch source on Linux
   ansible.builtin.command:
     argv:
       - git
       - clone
       - "{{ lan_mouse_build_cache }}/source.bundle"
-      - "{{ lan_mouse_linux_source_dir }}"
-  when: lan_mouse_install_method == 'native_build'
-
-- name: Record source repository origin on Linux
-  ansible.builtin.command:
-    argv: [git, -C, "{{ lan_mouse_linux_source_dir }}", remote, set-url, origin, "{{ lan_mouse_repo_url }}"]
-  changed_when: false
+      - "{{ osswitch_linux_source_dir }}"
   when: lan_mouse_install_method == 'native_build'
 
 - name: Configure locked offline Cargo source on Linux
@@ -130,9 +124,6 @@
       {{ {'x86_64': 'x86_64', 'aarch64': 'aarch64'}.get(ansible_facts.architecture, '') }}
     linux_release_asset: "lan-mouse-no-gtk-linux-{{ linux_release_arch }}"
     linux_release_archive: "{{ linux_release_asset }}.tar.gz"
-    github_release_path: >-
-      {{ 'latest/download' if lan_mouse_github_release_tag == 'latest'
-         else 'download/' ~ lan_mouse_github_release_tag }}
   block:
     - name: Require a supported Linux release architecture
       ansible.builtin.assert:
@@ -149,11 +140,10 @@
 
     - name: Download no-GTK Linux release archive
       ansible.builtin.get_url:
-        url: >-
-          https://github.com/{{ lan_mouse_github_repository }}/releases/{{
-          github_release_path }}/{{ linux_release_archive }}
+        url: "{{ prepared_github_release.asset_urls[linux_release_archive] }}"
         dest: "{{ lan_mouse_build_cache }}/{{ linux_release_archive }}"
         mode: "0644"
+        checksum: "sha256:{{ prepared_github_release.asset_digests[linux_release_archive] }}"
         force: true
 
     - name: Remove previous extracted Linux release
@@ -176,26 +166,85 @@
 
 - name: Test tv-multiview daemon
   ansible.builtin.command:
-    argv: [cargo, test, --frozen]
-    chdir: "{{ playbook_dir }}/../tv-multiview"
+    argv: [cargo, test, --frozen, -p, tv-multiview]
+    chdir: "{{ playbook_dir }}/.."
   changed_when: false
+  when: lan_mouse_install_method == 'native_build'
   tags: [tv_multiview_mutation]
 
 - name: Build tv-multiview daemon
   ansible.builtin.command:
-    argv: [cargo, build, --frozen, --release]
-    chdir: "{{ playbook_dir }}/../tv-multiview"
+    argv: [cargo, build, --frozen, --release, -p, tv-multiview]
+    chdir: "{{ playbook_dir }}/.."
   changed_when: false
+  when: lan_mouse_install_method == 'native_build'
   tags: [tv_multiview_mutation]
+
+- name: Select native tv-multiview release candidate
+  ansible.builtin.set_fact:
+    tv_multiview_release_candidate: "{{ playbook_dir }}/../target/release/tv-multiview"
+  when: lan_mouse_install_method == 'native_build'
+
+- name: Download tv-multiview GitHub Release asset
+  when: lan_mouse_install_method == 'github_release'
+  vars:
+    tv_multiview_release_archive: tv-multiview-linux-x86_64.tar.gz
+    tv_multiview_release_dir: "{{ lan_mouse_build_cache }}/tv-multiview-linux-x86_64"
+  block:
+    - name: Require x86_64 for the controller release asset
+      ansible.builtin.assert:
+        that: ansible_facts.architecture == 'x86_64'
+        fail_msg: >-
+          The initial tv-multiview release supports only Linux x86_64, not
+          {{ ansible_facts.architecture }}.
+
+    - name: Download verified tv-multiview release archive
+      ansible.builtin.get_url:
+        url: "{{ prepared_github_release.asset_urls[tv_multiview_release_archive] }}"
+        dest: "{{ lan_mouse_build_cache }}/{{ tv_multiview_release_archive }}"
+        mode: "0644"
+        checksum: >-
+          sha256:{{ prepared_github_release.asset_digests[tv_multiview_release_archive] }}
+        force: true
+
+    - name: Remove previous extracted tv-multiview release
+      ansible.builtin.file:
+        path: "{{ tv_multiview_release_dir }}"
+        state: absent
+
+    - name: Extract verified tv-multiview release archive
+      ansible.builtin.unarchive:
+        src: "{{ lan_mouse_build_cache }}/{{ tv_multiview_release_archive }}"
+        dest: "{{ lan_mouse_build_cache }}"
+        remote_src: true
+
+    - name: Select downloaded tv-multiview release candidate
+      ansible.builtin.set_fact:
+        tv_multiview_release_candidate: "{{ tv_multiview_release_dir }}/tv-multiview"
 
 - name: Install tv-multiview binary
   ansible.builtin.copy:
-    src: "{{ playbook_dir }}/../tv-multiview/target/release/tv-multiview"
+    src: "{{ tv_multiview_release_candidate }}"
     dest: "{{ ansible_facts.env.HOME }}/.local/bin/tv-multiview"
     mode: "0755"
-    remote_src: false
+    remote_src: "{{ lan_mouse_install_method == 'github_release' }}"
   register: tv_multiview_binary_install
   tags: [tv_multiview_mutation]
+
+- name: Record installed GitHub release identity on Linux
+  when: lan_mouse_install_method == 'github_release'
+  block:
+    - name: Ensure Linux release state directory exists
+      ansible.builtin.file:
+        path: "{{ ansible_facts.env.HOME }}/.local/state/osswitch"
+        state: directory
+        mode: "0700"
+
+    - name: Write Linux release identity marker
+      ansible.builtin.copy:
+        content: "{{ prepared_github_release | to_nice_json }}\n"
+        dest: "{{ ansible_facts.env.HOME }}/.local/state/osswitch/release.json"
+        mode: "0600"
 
 - name: Ensure lingering is enabled (so user services survive without an active login)
   become: true

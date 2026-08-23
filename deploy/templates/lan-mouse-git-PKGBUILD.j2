@@ -8,41 +8,42 @@ pkgver=0.11.0.rlocal
 pkgrel=1
 pkgdesc="Software KVM Switch / mouse & keyboard sharing software for Local Area Networks"
 url="{{ lan_mouse_repo_url }}"
-license=("GPL-3.0-only")
+license=("GPL-3.0-or-later")
 arch=(x86_64)
 provides=("$_pkgname=${pkgver/\.r*/}")
 conflicts=("$_pkgname")
-source=("$_pkgname"::"git+file://{{ lan_mouse_linux_source_dir }}")
+source=("osswitch"::"git+file://{{ osswitch_linux_source_dir }}")
 sha256sums=('SKIP')
 depends=(libx11 libxtst glibc gcc-libs)
 makedepends=(git cargo rust cmake pkgconf)
 options=('!lto' '!debug')
 
 prepare() {
-  cd "$_pkgname"
+  cd osswitch
   export CARGO_HOME="{{ lan_mouse_linux_cargo_home }}"
   /usr/bin/cargo fetch --locked --target "$CARCH-unknown-linux-gnu"
 }
 
 build() {
-  cd "$_pkgname"
+  cd osswitch
   export CARGO_TARGET_DIR=target
   export CARGO_HOME="{{ lan_mouse_linux_cargo_home }}"
-  /usr/bin/cargo build --frozen --release --bin lan-mouse \
+  /usr/bin/cargo build --frozen --profile lan-mouse-release -p lan-mouse --bin lan-mouse \
     --no-default-features \
     -F layer_shell_capture,libei_capture,x11_capture,wlroots_emulation,libei_emulation,x11_emulation,rdp_emulation
 }
 
 check() {
-  cd "$_pkgname"
+  cd osswitch
   export CARGO_HOME="{{ lan_mouse_linux_cargo_home }}"
   /usr/bin/cargo test --frozen --workspace --exclude lan-mouse-gtk \
+    --exclude tv-multiview \
     --no-default-features -F {{ lan_mouse_linux_features }}
 }
 
 package() {
-  cd "$_pkgname"
+  cd osswitch
 
-  install -Dm0755 -t "$pkgdir/usr/bin/" "target/release/$_pkgname"
-  install -Dm0644 -t "$pkgdir/usr/share/licenses/$_pkgname" LICENSE
+  install -Dm0755 -t "$pkgdir/usr/bin/" "target/lan-mouse-release/$_pkgname"
+  install -Dm0644 -t "$pkgdir/usr/share/licenses/$_pkgname" lan-mouse/LICENSE
 }

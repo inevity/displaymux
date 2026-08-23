@@ -98,8 +98,8 @@
 
 - name: Select macOS Cargo build profile
   ansible.builtin.set_fact:
-    mac_cargo_profile: "{{ 'dev' if lan_mouse_macos_build_profile == 'debug' else 'release' }}"
-    mac_target_profile_dir: "{{ 'debug' if lan_mouse_macos_build_profile == 'debug' else 'release' }}"
+    mac_cargo_profile: "{{ 'dev' if lan_mouse_macos_build_profile == 'debug' else 'lan-mouse-release' }}"
+    mac_target_profile_dir: "{{ 'debug' if lan_mouse_macos_build_profile == 'debug' else 'lan-mouse-release' }}"
   when: lan_mouse_install_method == 'native_build'
 
 - name: Resolve selected macOS Cargo path
@@ -131,25 +131,19 @@
     creates: "{{ mac_vendor_dir }}"
   when: lan_mouse_install_method == 'native_build'
 
-- name: Remove previous lan-mouse source on macOS
+- name: Remove previous osswitch source on macOS
   ansible.builtin.file:
     path: "{{ mac_source_dir }}"
     state: absent
   when: lan_mouse_install_method == 'native_build'
 
-- name: Deploy lan-mouse source on macOS
+- name: Deploy osswitch source on macOS
   ansible.builtin.command:
     argv:
       - git
       - clone
       - "{{ mac_build_cache }}/source.bundle"
       - "{{ mac_source_dir }}"
-  when: lan_mouse_install_method == 'native_build'
-
-- name: Record source repository origin on macOS
-  ansible.builtin.command:
-    argv: [git, -C, "{{ mac_source_dir }}", remote, set-url, origin, "{{ lan_mouse_repo_url }}"]
-  changed_when: false
   when: lan_mouse_install_method == 'native_build'
 
 - name: Ensure checkout-local Cargo config directory exists on macOS
@@ -180,9 +174,22 @@
           - "{{ mac_cargo.stdout | trim }}"
           - test
           - --frozen
-          - --workspace
-          - --exclude
-          - lan-mouse-gtk
+          - -p
+          - lan-mouse
+          - -p
+          - input-capture
+          - -p
+          - input-emulation
+          - -p
+          - input-event
+          - -p
+          - lan-mouse-cli
+          - -p
+          - lan-mouse-clipboard
+          - -p
+          - lan-mouse-ipc
+          - -p
+          - lan-mouse-proto
           - --no-default-features
         chdir: "{{ mac_source_dir }}"
       changed_when: false
@@ -197,6 +204,8 @@
           - --frozen
           - --profile
           - "{{ mac_cargo_profile }}"
+          - -p
+          - lan-mouse
           - --bin
           - lan-mouse
           - --no-default-features
@@ -219,9 +228,6 @@
          ansible_facts.architecture, '') }}
     mac_release_asset: "lan-mouse-no-gtk-macos-{{ mac_release_arch }}"
     mac_release_archive: "{{ mac_release_asset }}.zip"
-    github_release_path: >-
-      {{ 'latest/download' if lan_mouse_github_release_tag == 'latest'
-         else 'download/' ~ lan_mouse_github_release_tag }}
   block:
     - name: Require a supported macOS release architecture
       ansible.builtin.assert:
@@ -232,11 +238,10 @@
 
     - name: Download no-GTK macOS release archive
       ansible.builtin.get_url:
-        url: >-
-          https://github.com/{{ lan_mouse_github_repository }}/releases/{{
-          github_release_path }}/{{ mac_release_archive }}
+        url: "{{ prepared_github_release.asset_urls[mac_release_archive] }}"
         dest: "{{ mac_build_cache }}/{{ mac_release_archive }}"
         mode: "0644"
+        checksum: "sha256:{{ prepared_github_release.asset_digests[mac_release_archive] }}"
         force: true
 
     - name: Remove previous extracted macOS release
@@ -291,6 +296,21 @@
     dest: "{{ mac_installed_binary }}"
     remote_src: true
     mode: "0755"
+
+- name: Record installed GitHub release identity on macOS
+  when: lan_mouse_install_method == 'github_release'
+  block:
+    - name: Ensure macOS release state directory exists
+      ansible.builtin.file:
+        path: "{{ ansible_facts.env.HOME }}/Library/Application Support/osswitch"
+        state: directory
+        mode: "0700"
+
+    - name: Write macOS release identity marker
+      ansible.builtin.copy:
+        content: "{{ prepared_github_release | to_nice_json }}\n"
+        dest: "{{ ansible_facts.env.HOME }}/Library/Application Support/osswitch/release.json"
+        mode: "0600"
 
 - name: Add Linux host to /etc/hosts
   become: true

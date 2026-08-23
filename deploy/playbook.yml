@@ -2,8 +2,8 @@
 # lan-mouse + tv-multiview daemon deployment
 # Run from the Arch box: ansible-playbook -i inventory.ini playbook.yml
 #
-# In native_build mode, the control host packages the local checkout and one
-# Cargo.lock vendor set. In github_release mode, every host downloads its
+# In native_build mode, the control host packages the osswitch checkout and its
+# root Cargo.lock vendor set. In github_release mode, every host downloads its
 # native no-GTK GitHub Release asset and skips the Lan Mouse source build.
 #
 # Control-node prerequisites (not handled by this playbook):
@@ -21,9 +21,10 @@
   connection: local
   gather_facts: false
   vars:
-    source_bundle: "/tmp/lan-mouse-source.bundle"
-    vendor_dir: "/tmp/lan-mouse-vendor-{{ lan_mouse_cargo_lock_sha256[:12] }}"
-    vendor_archive: "/tmp/lan-mouse-vendor-{{ lan_mouse_cargo_lock_sha256[:12] }}.zip"
+    osswitch_source_path: "{{ playbook_dir }}/.."
+    source_bundle: "/tmp/osswitch-source.bundle"
+    vendor_dir: "/tmp/osswitch-vendor-{{ prepared_cargo_lock_sha256[:12] }}"
+    vendor_archive: "/tmp/osswitch-vendor-{{ prepared_cargo_lock_sha256[:12] }}.zip"
   tasks:
     - name: Validate Lan Mouse installation method
       ansible.builtin.assert:
@@ -40,19 +41,37 @@
           lan_mouse_install_method=github_release.
       when: lan_mouse_install_method == 'github_release'
 
+    - name: Resolve one immutable GitHub release
+      ansible.builtin.command:
+        argv:
+          - python3
+          - "{{ playbook_dir }}/scripts/resolve_github_release.py"
+          - --repository
+          - "{{ lan_mouse_github_repository }}"
+          - --selector
+          - "{{ lan_mouse_github_release_tag }}"
+      environment:
+        GITHUB_TOKEN: "{{ lookup('env', 'GITHUB_TOKEN') }}"
+      register: resolved_github_release
+      changed_when: false
+      when: lan_mouse_install_method == 'github_release'
+
+    - name: Record immutable GitHub release identity
+      ansible.builtin.set_fact:
+        prepared_github_release: "{{ resolved_github_release.stdout | from_json }}"
+      when: lan_mouse_install_method == 'github_release'
+
     - name: Read locked Cargo lock hash
       ansible.builtin.command:
         argv: [sha256sum, Cargo.lock]
-        chdir: "{{ lan_mouse_source_path }}"
+        chdir: "{{ osswitch_source_path }}"
       register: local_cargo_lock_hash
       changed_when: false
-      when: lan_mouse_install_method == 'native_build'
+      check_mode: false
 
-    - name: Validate locked Cargo lock identity
-      ansible.builtin.assert:
-        that: local_cargo_lock_hash.stdout.split()[0] == lan_mouse_cargo_lock_sha256
-        fail_msg: "Cargo.lock does not match {{ lan_mouse_cargo_lock_sha256 }}"
-      when: lan_mouse_install_method == 'native_build'
+    - name: Record current root Cargo lock identity
+      ansible.builtin.set_fact:
+        prepared_cargo_lock_sha256: "{{ local_cargo_lock_hash.stdout.split()[0] }}"
 
     - name: Remove the previous local source bundle
       ansible.builtin.file:
@@ -63,7 +82,7 @@
     - name: Create the current local source bundle
       ansible.builtin.command:
         argv: [git, bundle, create, "{{ source_bundle }}", HEAD]
-        chdir: "{{ lan_mouse_source_path }}"
+        chdir: "{{ osswitch_source_path }}"
       changed_when: true
       when: lan_mouse_install_method == 'native_build'
 
@@ -81,7 +100,7 @@
           - --locked
           - --versioned-dirs
           - --manifest-path
-          - "{{ lan_mouse_source_path }}/Cargo.toml"
+          - "{{ osswitch_source_path }}/Cargo.toml"
           - "{{ vendor_dir }}"
       no_log: true
       when:
@@ -97,7 +116,7 @@
           - "{{ vendor_archive }}"
           - -C
           - /tmp
-          - "lan-mouse-vendor-{{ lan_mouse_cargo_lock_sha256[:12] }}"
+          - "osswitch-vendor-{{ prepared_cargo_lock_sha256[:12] }}"
         creates: "{{ vendor_archive }}"
       when: lan_mouse_install_method == 'native_build'
 
@@ -128,16 +147,18 @@
   gather_facts: true
   strategy: free
   vars:
-    source_bundle: "/tmp/lan-mouse-source.bundle"
-    vendor_archive: "/tmp/lan-mouse-vendor-{{ lan_mouse_cargo_lock_sha256[:12] }}.zip"
+    prepared_cargo_lock_sha256: "{{ hostvars['localhost'].prepared_cargo_lock_sha256 }}"
+    prepared_github_release: "{{ hostvars['localhost'].prepared_github_release | default({}) }}"
+    source_bundle: "/tmp/osswitch-source.bundle"
+    vendor_archive: "/tmp/osswitch-vendor-{{ prepared_cargo_lock_sha256[:12] }}.zip"
     lan_mouse_build_cache: "{{ ansible_facts.env.HOME | default('') }}/.cache/lan-mouse-build"
-    lan_mouse_linux_source_dir: "{{ lan_mouse_build_cache }}/source"
-    lan_mouse_linux_vendor_dir: "{{ lan_mouse_build_cache }}/lan-mouse-vendor-{{ lan_mouse_cargo_lock_sha256[:12] }}"
+    osswitch_linux_source_dir: "{{ lan_mouse_build_cache }}/source"
+    lan_mouse_linux_vendor_dir: "{{ lan_mouse_build_cache }}/osswitch-vendor-{{ prepared_cargo_lock_sha256[:12] }}"
     lan_mouse_linux_cargo_home: "{{ lan_mouse_build_cache }}/cargo-home"
     tv_multiview_config_path: "{{ ansible_facts.env.HOME | default('') }}/.config/tv-multiview/config.toml"
     mac_build_cache: "{{ ansible_facts.env.HOME | default('') }}/Library/Caches/lan-mouse-build"
     mac_source_dir: "{{ mac_build_cache }}/source"
-    mac_vendor_dir: "{{ mac_build_cache }}/lan-mouse-vendor-{{ lan_mouse_cargo_lock_sha256[:12] }}"
+    mac_vendor_dir: "{{ mac_build_cache }}/osswitch-vendor-{{ prepared_cargo_lock_sha256[:12] }}"
     mac_target_dir: "{{ mac_build_cache }}/target"
     mac_installed_binary: "{{ ansible_facts.env.HOME | default('') }}/.local/bin/lan-mouse"
     mac_wrapper: "{{ ansible_facts.env.HOME | default('') }}/.local/bin/run-lan-mouse"
@@ -148,7 +169,7 @@
     win_rustup_home: "{{ win_build_cache }}\\rustup"
     win_rustup_binary: "{{ win_cargo_home }}\\bin\\rustup.exe"
     win_source_dir: "{{ win_build_cache }}\\source"
-    win_vendor_dir: "{{ win_build_cache }}\\lan-mouse-vendor-{{ lan_mouse_cargo_lock_sha256[:12] }}"
+    win_vendor_dir: "{{ win_build_cache }}\\osswitch-vendor-{{ prepared_cargo_lock_sha256[:12] }}"
     win_install_dir: "{{ lan_mouse_windows_install_dir }}"
     win_msvc_dir: "{{ lan_mouse_windows_msvc_dir }}"
     win_installed_binary: "{{ win_install_dir }}\\lan-mouse.exe"
@@ -165,3 +186,33 @@
     - name: Run Windows native build and deployment sequence
       ansible.builtin.include_tasks: tasks/native-windows.yml
       when: inventory_hostname in groups['windows_desktop']
+
+- name: Revalidate the GitHub release after parallel deployment
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tasks:
+    - name: Resolve the same immutable GitHub release again
+      ansible.builtin.command:
+        argv:
+          - python3
+          - "{{ playbook_dir }}/scripts/resolve_github_release.py"
+          - --repository
+          - "{{ hostvars['localhost'].prepared_github_release.repository }}"
+          - --selector
+          - "{{ hostvars['localhost'].prepared_github_release.tag }}"
+      environment:
+        GITHUB_TOKEN: "{{ lookup('env', 'GITHUB_TOKEN') }}"
+      register: revalidated_github_release
+      changed_when: false
+      when: lan_mouse_install_method == 'github_release'
+
+    - name: Reject a GitHub release changed during deployment
+      ansible.builtin.assert:
+        that: >-
+          (revalidated_github_release.stdout | from_json) ==
+          hostvars['localhost'].prepared_github_release
+        fail_msg: >-
+          The resolved release identity, manifest, asset set, or digest changed
+          during deployment. Start a new deployment run.
+      when: lan_mouse_install_method == 'github_release'

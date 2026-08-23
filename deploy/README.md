@@ -18,14 +18,20 @@ Install the Xcode command-line tools. Native-build mode additionally requires
 Homebrew rustup. The playbook installs its selected Rust toolchain only when
 the native `rustc` is absent.
 
-**Edit before running:**
-- `inventory.ini` — real hostnames, IPs, users.
-- `group_vars/all.yml` — TV address, HDMI mapping, server host, fingerprints,
-  controller timeouts, install method, and native build features.
+**Create local configuration before running:**
+
+```bash
+cp inventory.example.ini inventory.ini
+cp group_vars/all.example.yml group_vars/all.yml
+```
+
+- `inventory.ini` contains real hostnames, addresses, and users.
+- `group_vars/all.yml` contains the TV address, input mapping, server host,
+  fingerprints, controller timeouts, install method, and native build features.
 - Windows SSH credentials — keep them in Ansible Vault or pass them as extra
   variables instead of committing new plaintext credentials.
-- The sibling `../../lan-mouse` checkout is the source deployed by the
-  playbook. There is no configured revision pin or installed build-ID cache.
+- Native-build mode uses the osswitch repository containing this `deploy/`
+  directory. There is no configured source revision or lock-digest pin.
 
 Run:
 ```bash
@@ -38,22 +44,23 @@ instead, set the repository and select either `latest` or a release tag:
 
 ```yaml
 lan_mouse_install_method: github_release
-lan_mouse_github_repository: owner/lan-mouse
+lan_mouse_github_repository: owner/osswitch
 lan_mouse_github_release_tag: latest
 ```
 
-Release mode downloads the matching Linux, macOS, or Windows asset directly on
-each host. It does not copy source, vendor Lan Mouse dependencies, or build Lan
-Mouse. The macOS host still re-signs the downloaded binary with its stable local
+Release mode resolves `latest` or the configured tag exactly once on the
+Ansible controller. It validates the release ID, tag commit, declared asset set,
+and `osswitch-release-manifest.json`, then gives every host an immutable tag URL
+and SHA-256 digest. Linux also installs the matching `tv-multiview` asset from
+that release. macOS re-signs the verified Lan Mouse binary with its stable local
 identity so the existing Accessibility grant remains valid.
 
 The first play always prepares the persistent controller token under
 `~/.local/state/lan-mouse-deploy/`. In native-build mode it also creates a git
-bundle from the local checkout and a locked Cargo vendor archive under `/tmp`.
-`--limit localhost` runs only that preparation play; it does not deploy or
-restart any host. The native-build vendor tree needs roughly 640 MiB with the
-current lockfile, plus its archive and Cargo cache. Linux, macOS, and Windows
-then run their selected install and service-restart sequences concurrently.
+bundle from the monorepo commit and a root-lockfile Cargo vendor archive under `/tmp`.
+`--limit localhost` runs only controller-side preparation and release
+revalidation; it does not deploy or restart any host. Linux, macOS, and Windows
+run their selected install and service-restart sequences concurrently.
 
 ## After running (one-time manual steps)
 
@@ -77,10 +84,9 @@ then run their selected install and service-restart sequences concurrently.
 - macOS runs the native daemon as `com.feschber.lan-mouse`; persistent logs
   are `~/Library/Logs/lan-mouse.log` and `lan-mouse.err.log`, each with five
   10 MiB backups.
-- Windows installs the native daemon at
-  `D:\Programs\lan-mouse\lan-mouse.exe` and runs it through
+- Windows installs the native daemon at `D:\lanmouse\lan-mouse.exe` and runs it through
   `LanMouseDaemon`; native build assets are kept under
-  `D:\BuildCache\lan-mouse`. The task starts at interactive user logon. A
+  `D:\lanmouse\build`. The task starts at interactive user logon. A
   parallel unlock-triggered invocation asks the existing daemon to re-enable
   input emulation without replacing its supervised process. The wrapper keeps
   the daemon alive across genuine process exits, while temporary Windows input
@@ -91,8 +97,9 @@ then run their selected install and service-restart sequences concurrently.
   a cold boot, Windows `SendInput` cannot control the secure login desktop and
   the peer must remain not ready.
 
-Native-build runs replace the build source and build all three hosts against
-the same locked vendor archive. GitHub-release runs install the selected
-release assets without a native Lan Mouse build. In both modes the GTK
-workspace member is excluded and no legacy `enter_hook` or compatibility
-protocol is used.
+Native-build runs replace the disposable build source and build all three hosts
+against the same root lockfile and vendor archive. GitHub-release runs install
+the controller-resolved, digest-verified assets without a native Lan Mouse or
+TV-controller build. Release identity markers are written on each host. In both
+modes the deployed Lan Mouse binary is the no-GTK variant and no legacy
+`enter_hook` or compatibility protocol is used.

@@ -1,2 +1,4 @@
 .aiopylgtv.sqlite
 
+/group_vars/all.yml
+/inventory.ini

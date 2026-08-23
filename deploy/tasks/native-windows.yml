@@ -209,23 +209,16 @@
     creates: "{{ win_vendor_dir }}"
   when: lan_mouse_install_method == 'native_build'
 
-- name: Remove previous lan-mouse source on Windows
+- name: Remove previous osswitch source on Windows
   ansible.windows.win_file:
     path: "{{ win_source_dir }}"
     state: absent
   when: lan_mouse_install_method == 'native_build'
 
-- name: Deploy lan-mouse source on Windows
+- name: Deploy osswitch source on Windows
   ansible.windows.win_shell: |
     git clone "{{ win_build_cache }}\source.bundle" "{{ win_source_dir }}"
     exit $LASTEXITCODE
-  when: lan_mouse_install_method == 'native_build'
-
-- name: Record source repository origin on Windows
-  ansible.windows.win_shell: |
-    git -C "{{ win_source_dir }}" remote set-url origin "{{ lan_mouse_repo_url }}"
-    exit $LASTEXITCODE
-  changed_when: false
   when: lan_mouse_install_method == 'native_build'
 
 - name: Ensure checkout-local Cargo config directory exists on Windows
@@ -270,10 +263,10 @@
         $env:CARGO_TARGET_DIR = "{{ win_target_dir }}"
         $env:CARGO_INCREMENTAL = "0"
         {% if win_use_msvc | bool %}
-        $command = "call `"{{ win_vs_installation.stdout | trim }}\Common7\Tools\VsDevCmd.bat`" -arch=x64 -host_arch=x64 >nul && `"{{ win_rustup_binary }}`" run {{ win_native_rust_toolchain }} cargo test --frozen --target-dir `"{{ win_target_dir }}`" --workspace --exclude lan-mouse-gtk --no-default-features"
+        $command = "call `"{{ win_vs_installation.stdout | trim }}\Common7\Tools\VsDevCmd.bat`" -arch=x64 -host_arch=x64 >nul && `"{{ win_rustup_binary }}`" run {{ win_native_rust_toolchain }} cargo test --frozen --target-dir `"{{ win_target_dir }}`" -p lan-mouse -p input-capture -p input-emulation -p input-event -p lan-mouse-cli -p lan-mouse-clipboard -p lan-mouse-ipc -p lan-mouse-proto --no-default-features"
         cmd.exe /d /c $command
         {% else %}
-        & "{{ win_rustup_binary }}" run {{ win_native_rust_toolchain }} cargo test --frozen --target-dir "{{ win_target_dir }}" --workspace --exclude lan-mouse-gtk --no-default-features
+        & "{{ win_rustup_binary }}" run {{ win_native_rust_toolchain }} cargo test --frozen --target-dir "{{ win_target_dir }}" -p lan-mouse -p input-capture -p input-emulation -p input-event -p lan-mouse-cli -p lan-mouse-clipboard -p lan-mouse-ipc -p lan-mouse-proto --no-default-features
         {% endif %}
         if ($LASTEXITCODE -ne 0) { throw "cargo test exited with code $LASTEXITCODE" }
       args:
@@ -293,14 +286,14 @@
         $env:CARGO_TARGET_DIR = "{{ win_target_dir }}"
         $env:CARGO_INCREMENTAL = "0"
         {% if win_use_msvc | bool %}
-        $command = "call `"{{ win_vs_installation.stdout | trim }}\Common7\Tools\VsDevCmd.bat`" -arch=x64 -host_arch=x64 >nul && `"{{ win_rustup_binary }}`" run {{ win_native_rust_toolchain }} cargo build --frozen --target-dir `"{{ win_target_dir }}`" --release --bin lan-mouse --no-default-features"
+        $command = "call `"{{ win_vs_installation.stdout | trim }}\Common7\Tools\VsDevCmd.bat`" -arch=x64 -host_arch=x64 >nul && `"{{ win_rustup_binary }}`" run {{ win_native_rust_toolchain }} cargo build --frozen --target-dir `"{{ win_target_dir }}`" --profile lan-mouse-release -p lan-mouse --bin lan-mouse --no-default-features"
         cmd.exe /d /c $command
         {% else %}
-        & "{{ win_rustup_binary }}" run {{ win_native_rust_toolchain }} cargo build --frozen --target-dir "{{ win_target_dir }}" --release --bin lan-mouse --no-default-features
+        & "{{ win_rustup_binary }}" run {{ win_native_rust_toolchain }} cargo build --frozen --target-dir "{{ win_target_dir }}" --profile lan-mouse-release -p lan-mouse --bin lan-mouse --no-default-features
         {% endif %}
         if ($LASTEXITCODE -ne 0) { throw "cargo build exited with code $LASTEXITCODE" }
-        if (-not (Test-Path "{{ win_target_dir }}\release\lan-mouse.exe")) {
-          throw "cargo succeeded without producing {{ win_target_dir }}\release\lan-mouse.exe"
+        if (-not (Test-Path "{{ win_target_dir }}\lan-mouse-release\lan-mouse.exe")) {
+          throw "cargo succeeded without producing {{ win_target_dir }}\lan-mouse-release\lan-mouse.exe"
         }
         exit $LASTEXITCODE
       args:
@@ -312,7 +305,7 @@
 
 - name: Select native Windows release candidate
   ansible.builtin.set_fact:
-    win_release_candidate: "{{ win_target_dir }}\\release\\lan-mouse.exe"
+    win_release_candidate: "{{ win_target_dir }}\\lan-mouse-release\\lan-mouse.exe"
   when: lan_mouse_install_method == 'native_build'
 
 - name: Download no-GTK Windows GitHub Release asset
@@ -321,16 +314,13 @@
     win_release_asset: lan-mouse-no-gtk-windows-x86_64
     win_release_archive: "{{ win_release_asset }}.zip"
     win_release_extract_dir: "{{ win_build_cache }}\\release-artifact"
-    github_release_path: >-
-      {{ 'latest/download' if lan_mouse_github_release_tag == 'latest'
-         else 'download/' ~ lan_mouse_github_release_tag }}
   block:
     - name: Download no-GTK Windows release archive
       ansible.windows.win_get_url:
-        url: >-
-          https://github.com/{{ lan_mouse_github_repository }}/releases/{{
-          github_release_path }}/{{ win_release_archive }}
+        url: "{{ prepared_github_release.asset_urls[win_release_archive] }}"
         dest: "{{ win_build_cache }}\\{{ win_release_archive }}"
+        checksum: "{{ prepared_github_release.asset_digests[win_release_archive] }}"
+        checksum_algorithm: sha256
         force: true
 
     - name: Remove previous extracted Windows release
@@ -404,6 +394,12 @@
     src: "{{ win_release_candidate }}"
     dest: "{{ win_installed_binary }}"
     remote_src: true
+
+- name: Record installed GitHub release identity on Windows
+  ansible.windows.win_copy:
+    content: "{{ prepared_github_release | to_nice_json }}\n"
+    dest: "{{ win_install_dir }}\\release.json"
+  when: lan_mouse_install_method == 'github_release'
 
 - name: Add Linux host to Windows hosts file
   ansible.windows.win_shell: |
