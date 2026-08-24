@@ -156,12 +156,30 @@ impl LanMouseConnection {
                     Ok(Ok(_)) => {}
                     Ok(Err(e)) => {
                         log::warn!("client {handle} failed to send: {e}");
-                        disconnect(&self.client_manager, handle, addr, &conn, &self.conns).await;
+                        fail_connection(
+                            &self.client_manager,
+                            handle,
+                            addr,
+                            &conn,
+                            &self.conns,
+                            &self.ping_response,
+                            &self.recv_tx,
+                        )
+                        .await;
                         return Err(e.into());
                     }
                     Err(_) => {
                         log::warn!("client {handle} send timed out");
-                        disconnect(&self.client_manager, handle, addr, &conn, &self.conns).await;
+                        fail_connection(
+                            &self.client_manager,
+                            handle,
+                            addr,
+                            &conn,
+                            &self.conns,
+                            &self.ping_response,
+                            &self.recv_tx,
+                        )
+                        .await;
                         return Err(LanMouseConnectionError::Timeout);
                     }
                 }
@@ -302,7 +320,15 @@ async fn connect_to_handle(
         }
 
         // poll connection for active
-        spawn_local(ping_pong(addr, conn.clone(), ping_response.clone()));
+        spawn_local(ping_pong(
+            client_manager.clone(),
+            handle,
+            addr,
+            conn.clone(),
+            conns.clone(),
+            tx.clone(),
+            ping_response.clone(),
+        ));
 
         // receiver
         spawn_local(receive_loop(
@@ -321,8 +347,12 @@ async fn connect_to_handle(
 }
 
 async fn ping_pong(
+    client_manager: ClientManager,
+    handle: ClientHandle,
     addr: SocketAddr,
     conn: Arc<dyn Conn + Send + Sync>,
+    conns: Rc<Mutex<HashMap<SocketAddr, Arc<dyn Conn + Send + Sync>>>>,
+    tx: Sender<(ClientHandle, ProtoEvent)>,
     ping_response: Rc<RefCell<HashSet<SocketAddr>>>,
 ) {
     loop {
@@ -332,8 +362,17 @@ async fn ping_pong(
         for _ in 0..4 {
             if let Err(e) = conn.send(&buf[..len]).await {
                 log::warn!("{addr}: send error `{e}`, closing connection");
-                let _ = conn.close().await;
-                break;
+                fail_connection(
+                    &client_manager,
+                    handle,
+                    addr,
+                    &conn,
+                    &conns,
+                    &ping_response,
+                    &tx,
+                )
+                .await;
+                return;
             }
             log::trace!("PING >->->->->- {addr}");
 
@@ -342,7 +381,16 @@ async fn ping_pong(
 
         if !ping_response.borrow_mut().remove(&addr) {
             log::warn!("{addr} did not respond, closing connection");
-            let _ = conn.close().await;
+            fail_connection(
+                &client_manager,
+                handle,
+                addr,
+                &conn,
+                &conns,
+                &ping_response,
+                &tx,
+            )
+            .await;
             return;
         }
     }
@@ -414,17 +462,16 @@ async fn receive_loop(
         }
     }
     log::warn!("recv error");
-    if disconnect(&client_manager, handle, addr, &conn, &conns).await {
-        tx.send((
-            handle,
-            ProtoEvent::Readiness {
-                keyboard_ready: false,
-                pointer_ready: false,
-                session_epoch: 0,
-            },
-        ))
-        .expect("channel closed");
-    }
+    fail_connection(
+        &client_manager,
+        handle,
+        addr,
+        &conn,
+        &conns,
+        &ping_response,
+        &tx,
+    )
+    .await;
 }
 
 fn record_pong(
@@ -479,6 +526,38 @@ async fn disconnect(
     client_manager.clear_peer_readiness(handle);
     log::info!("active connections: {active:?}");
     true
+}
+
+async fn fail_connection(
+    client_manager: &ClientManager,
+    handle: ClientHandle,
+    addr: SocketAddr,
+    conn: &Arc<dyn Conn + Send + Sync>,
+    conns: &Mutex<HashMap<SocketAddr, Arc<dyn Conn + Send + Sync>>>,
+    ping_response: &RefCell<HashSet<SocketAddr>>,
+    tx: &Sender<(ClientHandle, ProtoEvent)>,
+) {
+    ping_response.borrow_mut().remove(&addr);
+
+    // Reconnection state is authoritative and must not depend on a blocked
+    // receive task or on the failed transport accepting a close operation.
+    if disconnect(client_manager, handle, addr, conn, conns).await {
+        tx.send((
+            handle,
+            ProtoEvent::Readiness {
+                keyboard_ready: false,
+                pointer_ready: false,
+                session_epoch: 0,
+            },
+        ))
+        .expect("channel closed");
+    }
+
+    match timeout(CONNECTION_SEND_TIMEOUT, conn.close()).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => log::debug!("failed to close connection {addr}: {error}"),
+        Err(_) => log::warn!("timed out closing failed connection {addr}"),
+    }
 }
 
 #[cfg(test)]
@@ -580,5 +659,59 @@ mod tests {
 
         assert!(client_manager.alive(handle));
         assert_eq!(client_manager.active_addr(handle), Some(addr));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn transport_failure_clears_reconnect_gate_before_receive_loop_exit() {
+        LocalSet::new()
+            .run_until(async {
+                let client_manager = ClientManager::default();
+                let handle = client_manager.add_client();
+                let addr: SocketAddr = "127.0.0.1:4243".parse().unwrap();
+                client_manager.set_active_addr(handle, Some(addr));
+                client_manager.set_alive(handle, true);
+                client_manager.set_peer_commit(handle, Some(local_commit()));
+                assert!(client_manager.set_peer_readiness(handle, true, true, 17));
+
+                let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+                let conn: Arc<dyn Conn + Send + Sync> = Arc::new(socket);
+                let conns = Mutex::new(HashMap::from([(addr, conn.clone())]));
+                let ping_response = RefCell::new(HashSet::from([addr]));
+                let (tx, mut rx) = channel();
+
+                fail_connection(
+                    &client_manager,
+                    handle,
+                    addr,
+                    &conn,
+                    &conns,
+                    &ping_response,
+                    &tx,
+                )
+                .await;
+
+                assert_eq!(client_manager.active_addr(handle), None);
+                assert!(!client_manager.alive(handle));
+                assert_eq!(
+                    client_manager.peer_input_readiness(handle),
+                    Some((false, false, false, 0))
+                );
+                assert!(conns.lock().await.is_empty());
+                assert!(!ping_response.borrow().contains(&addr));
+                let (event_handle, event) = rx.recv().await.expect("readiness reset event");
+                assert_eq!(event_handle, handle);
+                assert!(
+                    matches!(
+                        event,
+                        ProtoEvent::Readiness {
+                            keyboard_ready: false,
+                            pointer_ready: false,
+                            session_epoch: 0,
+                        }
+                    ),
+                    "unexpected event: {event:?}"
+                );
+            })
+            .await;
     }
 }
