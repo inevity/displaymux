@@ -94,6 +94,10 @@ fn lan_mouse_event_drives_return_barrier(
         && matches!(event_type, CGEventType::MouseMoved)
 }
 
+fn crossing_requires_native_grab(lan_mouse_event: bool) -> bool {
+    !lan_mouse_event
+}
+
 fn dispatch_capture_events(
     lan_mouse_event: bool,
     capture_position: Option<Position>,
@@ -651,13 +655,19 @@ fn create_event_tap<'a>(
             } else if let Some(new_pos) = state.crossed(cg_ev) {
                 // Did we cross a barrier?
                 capture_position = Some(new_pos);
-                state
-                    .start_capture(cg_ev, new_pos)
-                    .unwrap_or_else(|e| log::warn!("{e}"));
+                if crossing_requires_native_grab(lan_mouse_event) {
+                    state
+                        .start_capture(cg_ev, new_pos)
+                        .unwrap_or_else(|e| log::warn!("{e}"));
+                    notify_tx
+                        .send(ProducerEvent::Grab(new_pos))
+                        .expect("Failed to send notification");
+                } else {
+                    log::info!(
+                        "remote pointer reached {new_pos} edge; requesting server return without native cursor grab"
+                    );
+                }
                 res_events.push(CaptureEvent::Begin);
-                notify_tx
-                    .send(ProducerEvent::Grab(new_pos))
-                    .expect("Failed to send notification");
             }
         }
 
@@ -1103,6 +1113,12 @@ mod tests {
 
         assert_eq!(delivered, vec![(Position::Left, CaptureEvent::Begin)]);
         assert!(!drop_event);
+    }
+
+    #[test]
+    fn remote_return_crossing_does_not_grab_native_cursor() {
+        assert!(!crossing_requires_native_grab(true));
+        assert!(crossing_requires_native_grab(false));
     }
 }
 
