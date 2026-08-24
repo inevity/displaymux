@@ -681,6 +681,7 @@
   retries: 20
   delay: 1
   until: win_hub_connection.rc == 0
+  when: win_interactive_desktop_available
   changed_when: false
 
 - name: Remove obsolete per-user Windows installation after replacement
@@ -718,10 +719,12 @@
     - lan-mouse.log
     - lan-mouse.err.log
   register: win_logs
+  when: win_interactive_desktop_available
 
 - name: Require persistent Windows log sources
   ansible.builtin.assert:
     that: win_logs.results | selectattr('stat.exists', 'equalto', true) | list | length == 2
+  when: win_interactive_desktop_available
 
 - name: Open Windows Firewall for lan-mouse (UDP {{ lan_mouse_port }})
   ansible.windows.win_shell: |
