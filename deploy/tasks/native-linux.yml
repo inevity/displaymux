@@ -80,7 +80,7 @@
   block:
     - name: Remove stale makepkg VCS source clone
       ansible.builtin.file:
-        path: "{{ ansible_facts.env.HOME }}/.cache/lan-mouse-pkgbuild/lan-mouse"
+        path: "{{ ansible_facts.env.HOME }}/.cache/lan-mouse-pkgbuild/osswitch"
         state: absent
 
     - name: Build and test package as the desktop user
