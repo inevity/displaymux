@@ -3,6 +3,7 @@ name = "tv-multiview"
 version = "0.1.0"
 edition = "2021"
 description = "MultiView-aware HDMI input switch daemon for lan-mouse + LG WebOS TV"
+license = "GPL-3.0-or-later"
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
