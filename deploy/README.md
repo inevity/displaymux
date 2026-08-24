@@ -57,7 +57,9 @@ identity so the existing Accessibility grant remains valid.
 
 The first play always prepares the persistent controller token under
 `~/.local/state/lan-mouse-deploy/`. In native-build mode it also creates a git
-bundle from the monorepo commit and a root-lockfile Cargo vendor archive under `/tmp`.
+bundle from the monorepo commit and a root-lockfile Cargo vendor archive under
+the ignored `deploy/` paths `osswitch-source.bundle` and
+`osswitch-vendor-<lock-hash>.zip`.
 `--limit localhost` runs only controller-side preparation and release
 revalidation; it does not deploy or restart any host. Linux, macOS, and Windows
 run their selected install and service-restart sequences concurrently.

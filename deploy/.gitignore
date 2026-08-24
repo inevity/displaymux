@@ -2,3 +2,7 @@
 
 /group_vars/all.yml
 /inventory.ini
+/osswitch-source.bundle
+/osswitch-vendor-*/
+/osswitch-vendor-*.zip
+/ansible-local-*/

@@ -22,9 +22,9 @@
   gather_facts: false
   vars:
     osswitch_source_path: "{{ playbook_dir }}/.."
-    source_bundle: "/tmp/osswitch-source.bundle"
-    vendor_dir: "/tmp/osswitch-vendor-{{ prepared_cargo_lock_sha256[:12] }}"
-    vendor_archive: "/tmp/osswitch-vendor-{{ prepared_cargo_lock_sha256[:12] }}.zip"
+    source_bundle: "{{ playbook_dir }}/osswitch-source.bundle"
+    vendor_dir: "{{ playbook_dir }}/osswitch-vendor-{{ prepared_cargo_lock_sha256[:12] }}"
+    vendor_archive: "{{ playbook_dir }}/osswitch-vendor-{{ prepared_cargo_lock_sha256[:12] }}.zip"
   tasks:
     - name: Validate Lan Mouse installation method
       ansible.builtin.assert:
@@ -115,7 +115,7 @@
           - -cf
           - "{{ vendor_archive }}"
           - -C
-          - /tmp
+          - "{{ playbook_dir }}"
           - "osswitch-vendor-{{ prepared_cargo_lock_sha256[:12] }}"
         creates: "{{ vendor_archive }}"
       when: lan_mouse_install_method == 'native_build'
@@ -149,8 +149,8 @@
   vars:
     prepared_cargo_lock_sha256: "{{ hostvars['localhost'].prepared_cargo_lock_sha256 }}"
     prepared_github_release: "{{ hostvars['localhost'].prepared_github_release | default({}) }}"
-    source_bundle: "/tmp/osswitch-source.bundle"
-    vendor_archive: "/tmp/osswitch-vendor-{{ prepared_cargo_lock_sha256[:12] }}.zip"
+    source_bundle: "{{ playbook_dir }}/osswitch-source.bundle"
+    vendor_archive: "{{ playbook_dir }}/osswitch-vendor-{{ prepared_cargo_lock_sha256[:12] }}.zip"
     lan_mouse_build_cache: "{{ ansible_facts.env.HOME | default('') }}/.cache/lan-mouse-build"
     osswitch_linux_source_dir: "{{ lan_mouse_build_cache }}/source"
     lan_mouse_linux_vendor_dir: "{{ lan_mouse_build_cache }}/osswitch-vendor-{{ prepared_cargo_lock_sha256[:12] }}"

@@ -36,7 +36,7 @@
   ansible.builtin.shell: |
     set -euo pipefail
     umask 077
-    identity_dir="$(mktemp -d "${TMPDIR:-/tmp}/lan-mouse-codesign.XXXXXX")"
+    identity_dir="$(mktemp -d "{{ mac_build_cache }}/lan-mouse-codesign.XXXXXX")"
     trap 'rm -rf "$identity_dir"' EXIT
     identity_password="$(openssl rand -hex 32)"
 
