@@ -640,7 +640,7 @@
          }}/.config/tv-multiview/config.toml
     mode: "0600"
   vars:
-    tv_multiview_client_key_path: >-
+    effective_tv_multiview_client_key_path: >-
       {{ hostvars[groups['linux_desktop'][0]].ansible_facts.env.HOME
          }}/.config/lg-buddy/.aiopylgtv.sqlite
   register: reconciled_tv_config

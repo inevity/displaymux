@@ -2,7 +2,7 @@ bind_address = "{{ hostvars[groups['linux_desktop'][0]].ansible_host }}:{{ daemo
 tv_ip = "{{ tv_ip }}"
 server_host = "{{ lan_mouse_server_host }}"
 controller_token = "{{ lookup('ansible.builtin.file', lan_mouse_controller_token_file) | trim }}"
-client_key_path = "{{ tv_multiview_client_key_path }}"
+client_key_path = "{{ effective_tv_multiview_client_key_path | default(tv_multiview_client_key_path) }}"
 
 [inputs]
 {% for host, input in tv_inputs.items() %}
