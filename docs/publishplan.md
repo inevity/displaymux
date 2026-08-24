@@ -1154,7 +1154,9 @@ Release rules:
 Verification:
 
 - Workflow YAML validates locally with the available validator.
-- Exact Linux build and packaging commands pass locally.
+- Linux packaging runs only on GitHub-hosted release runners. The private
+  staging workflow must pass before the first release tag; the development host
+  does not generate release archives.
 - GitHub native Windows and macOS jobs pass on the pushed branch before the
   first release tag.
 - Archive inspection verifies names, executable paths, licenses, and checksums.

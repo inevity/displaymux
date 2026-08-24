@@ -1,0 +1,453 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing v-prefixed tag to build
+        required: true
+        type: string
+      prerelease:
+        description: Publish as a prerelease
+        required: true
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release-inputs:
+    runs-on: ubuntu-24.04
+    outputs:
+      tag: ${{ steps.resolve.outputs.tag }}
+      commit: ${{ steps.resolve.outputs.commit }}
+      prerelease: ${{ steps.resolve.outputs.prerelease }}
+    steps:
+      - name: Check out refs without persisted credentials
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Resolve immutable release tag input
+        id: resolve
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_TAG: ${{ github.ref_name }}
+          EVENT_SHA: ${{ github.sha }}
+          INPUT_TAG: ${{ inputs.tag }}
+          INPUT_PRERELEASE: ${{ inputs.prerelease }}
+        run: |
+          if [[ "$EVENT_NAME" == push ]]; then
+            tag="$EVENT_TAG"
+            prerelease=false
+          else
+            tag="$INPUT_TAG"
+            prerelease="$INPUT_PRERELEASE"
+          fi
+          [[ "$tag" == v* ]]
+          git show-ref --verify --quiet "refs/tags/$tag"
+          commit="$(git rev-list -n 1 "refs/tags/$tag")"
+          [[ "$commit" =~ ^[0-9a-f]{40}$ ]]
+          if [[ "$EVENT_NAME" == push ]]; then
+            test "$commit" = "$EVENT_SHA"
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+          echo "prerelease=$prerelease" >> "$GITHUB_OUTPUT"
+
+  gtk-linux:
+    needs: release-inputs
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            artifact: lan-mouse-gtk-linux-x86_64
+          - runner: ubuntu-24.04-arm
+            artifact: lan-mouse-gtk-linux-aarch64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Check out the release commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.release-inputs.outputs.commit }}
+          persist-credentials: false
+      - name: Verify checked-out commit
+        shell: bash
+        run: test "$(git rev-parse HEAD)" = '${{ needs.release-inputs.outputs.commit }}'
+      - name: Install Linux GTK build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes libadwaita-1-dev libgtk-4-dev libx11-dev libxtst-dev
+      - name: Install pinned cargo-bundle
+        run: cargo install cargo-bundle --version 0.11.0 --locked
+      - name: Build default GTK application
+        run: cargo build --locked --profile lan-mouse-release -p lan-mouse
+      - name: Build GTK Debian and AppImage packages
+        run: |
+          cargo bundle --profile lan-mouse-release -p lan-mouse --format deb
+          cargo bundle --profile lan-mouse-release -p lan-mouse --format appimage
+          git diff --exit-code -- Cargo.lock
+      - name: Package default GTK Linux artifacts
+        shell: bash
+        run: |
+          stage='${{ matrix.artifact }}'
+          mkdir "$stage"
+          cp target/lan-mouse-release/lan-mouse "$stage/lan-mouse"
+          mapfile -t debs < <(find target/lan-mouse-release/bundle/deb -maxdepth 1 -type f -name '*.deb')
+          mapfile -t appimages < <(find target/lan-mouse-release/bundle/appimage -maxdepth 1 -type f -name '*.AppImage')
+          test "${#debs[@]}" -eq 1
+          test "${#appimages[@]}" -eq 1
+          cp "${debs[0]}" "$stage/"
+          cp "${appimages[0]}" "$stage/"
+          cp LICENSE "$stage/LICENSE"
+          cp lan-mouse/README.md "$stage/README.md"
+          tar -czf "$stage.tar.gz" "$stage"
+      - name: Upload default GTK Linux archive
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}.tar.gz
+          if-no-files-found: error
+
+  gtk-windows:
+    needs: release-inputs
+    runs-on: windows-2025
+    steps:
+      - name: Check out the release commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.release-inputs.outputs.commit }}
+          persist-credentials: false
+      - name: Verify checked-out commit
+        shell: bash
+        run: test "$(git rev-parse HEAD)" = '${{ needs.release-inputs.outputs.commit }}'
+      - name: Select Python for pinned gvsbuild
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.12'
+      - name: Create Windows GTK cache directory
+        shell: pwsh
+        run: New-Item -ItemType Directory -Force -Path C:\gtk-build\gtk\x64\release
+      - name: Restore Windows GTK build
+        id: gtk-cache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: C:\gtk-build\gtk\x64\release\**
+          key: gvsbuild-2026.6.0-gtk4-libadwaita-librsvg
+      - name: Build Windows GTK dependencies
+        if: steps.gtk-cache.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          python -m pip install --disable-pip-version-check gvsbuild==2026.6.0
+          Move-Item 'C:\Program Files\Git\usr\bin' 'C:\Program Files\Git\usr\notbin'
+          Move-Item 'C:\Program Files\Git\bin' 'C:\Program Files\Git\notbin'
+          gvsbuild build --msys-dir=C:\msys64 gtk4 libadwaita librsvg
+          Move-Item 'C:\Program Files\Git\usr\notbin' 'C:\Program Files\Git\usr\bin'
+          Move-Item 'C:\Program Files\Git\notbin' 'C:\Program Files\Git\bin'
+      - name: Configure Windows GTK environment
+        shell: pwsh
+        run: |
+          'PKG_CONFIG=C:\gtk-build\gtk\x64\release\bin\pkgconf.exe' | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          'C:\gtk-build\gtk\x64\release\bin' | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+      - name: Build default GTK Windows application
+        run: cargo build --locked --profile lan-mouse-release -p lan-mouse
+      - name: Package default GTK Windows artifact
+        shell: pwsh
+        run: |
+          $stage = 'lan-mouse-gtk-windows-x86_64'
+          New-Item -ItemType Directory -Path $stage
+          Get-ChildItem -Path 'C:\gtk-build\gtk\x64\release\bin\*.dll' -File -Recurse | Copy-Item -Destination $stage
+          Copy-Item 'target\lan-mouse-release\lan-mouse.exe' "$stage\lan-mouse.exe"
+          Copy-Item 'LICENSE' "$stage\LICENSE"
+          Copy-Item 'lan-mouse\README.md' "$stage\README.md"
+          Compress-Archive -Path "$stage\*" -DestinationPath "$stage.zip"
+      - name: Upload default GTK Windows archive
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: lan-mouse-gtk-windows-x86_64
+          path: lan-mouse-gtk-windows-x86_64.zip
+          if-no-files-found: error
+
+  gtk-macos:
+    needs: release-inputs
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15-intel
+            artifact: lan-mouse-gtk-macos-x86_64
+          - runner: macos-15
+            artifact: lan-mouse-gtk-macos-aarch64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Check out the release commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.release-inputs.outputs.commit }}
+          persist-credentials: false
+      - name: Verify checked-out commit
+        run: test "$(git rev-parse HEAD)" = '${{ needs.release-inputs.outputs.commit }}'
+      - name: Install macOS GTK build dependencies
+        run: |
+          brew install --cask inkscape
+          brew install gtk4 libadwaita imagemagick librsvg
+      - name: Install pinned cargo-bundle
+        run: cargo install cargo-bundle --version 0.11.0 --locked
+      - name: Build default GTK macOS application
+        run: cargo build --locked --profile lan-mouse-release -p lan-mouse
+      - name: Build macOS application bundle
+        run: |
+          (cd lan-mouse && scripts/makeicns.sh)
+          cargo bundle --profile lan-mouse-release -p lan-mouse --format osx
+          lan-mouse/scripts/copy-macos-dylib.sh 'target/lan-mouse-release/bundle/osx/Lan Mouse.app/Contents/MacOS/lan-mouse'
+          git diff --exit-code -- Cargo.lock
+      - name: Package default GTK macOS artifact
+        run: |
+          stage='${{ matrix.artifact }}'
+          mkdir "$stage"
+          cp -R 'target/lan-mouse-release/bundle/osx/Lan Mouse.app' "$stage/"
+          cp LICENSE "$stage/LICENSE"
+          cp lan-mouse/README.md "$stage/README.md"
+          zip -r "$stage.zip" "$stage"
+      - name: Upload default GTK macOS archive
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}.zip
+          if-no-files-found: error
+
+  no-gtk:
+    needs: release-inputs
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            artifact: lan-mouse-no-gtk-linux-x86_64
+            archive: lan-mouse-no-gtk-linux-x86_64.tar.gz
+            features: --features layer_shell_capture,libei_capture,x11_capture,wlroots_emulation,libei_emulation,x11_emulation,rdp_emulation
+          - runner: ubuntu-24.04-arm
+            artifact: lan-mouse-no-gtk-linux-aarch64
+            archive: lan-mouse-no-gtk-linux-aarch64.tar.gz
+            features: --features layer_shell_capture,libei_capture,x11_capture,wlroots_emulation,libei_emulation,x11_emulation,rdp_emulation
+          - runner: windows-2025
+            artifact: lan-mouse-no-gtk-windows-x86_64
+            archive: lan-mouse-no-gtk-windows-x86_64.zip
+            features: ''
+          - runner: macos-15-intel
+            artifact: lan-mouse-no-gtk-macos-x86_64
+            archive: lan-mouse-no-gtk-macos-x86_64.zip
+            features: ''
+          - runner: macos-15
+            artifact: lan-mouse-no-gtk-macos-aarch64
+            archive: lan-mouse-no-gtk-macos-aarch64.zip
+            features: ''
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Check out the release commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.release-inputs.outputs.commit }}
+          persist-credentials: false
+      - name: Verify checked-out commit
+        shell: bash
+        run: test "$(git rev-parse HEAD)" = '${{ needs.release-inputs.outputs.commit }}'
+      - name: Install Linux no-GTK dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes libx11-dev libxtst-dev
+      - name: Test native no-GTK packages
+        run: >-
+          cargo test --locked
+          -p lan-mouse
+          -p input-capture
+          -p input-emulation
+          -p input-event
+          -p lan-mouse-cli
+          -p lan-mouse-clipboard
+          -p lan-mouse-ipc
+          -p lan-mouse-proto
+          --no-default-features
+          ${{ matrix.features }}
+      - name: Build native no-GTK binary
+        run: >-
+          cargo build --locked
+          --profile lan-mouse-release
+          -p lan-mouse
+          --bin lan-mouse
+          --no-default-features
+          ${{ matrix.features }}
+      - name: Package no-GTK Linux archive
+        if: runner.os == 'Linux'
+        run: |
+          stage='${{ matrix.artifact }}'
+          mkdir "$stage"
+          cp target/lan-mouse-release/lan-mouse "$stage/lan-mouse"
+          cp LICENSE "$stage/LICENSE"
+          cp lan-mouse/README.md "$stage/README.md"
+          tar -czf '${{ matrix.archive }}' "$stage"
+      - name: Package no-GTK Windows archive
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $stage = '${{ matrix.artifact }}'
+          New-Item -ItemType Directory -Path $stage
+          Copy-Item 'target\lan-mouse-release\lan-mouse.exe' "$stage\lan-mouse.exe"
+          Copy-Item 'LICENSE' "$stage\LICENSE"
+          Copy-Item 'lan-mouse\README.md' "$stage\README.md"
+          Compress-Archive -Path "$stage\*" -DestinationPath '${{ matrix.archive }}'
+      - name: Package no-GTK macOS archive
+        if: runner.os == 'macOS'
+        run: |
+          stage='${{ matrix.artifact }}'
+          mkdir "$stage"
+          cp target/lan-mouse-release/lan-mouse "$stage/lan-mouse"
+          cp LICENSE "$stage/LICENSE"
+          cp lan-mouse/README.md "$stage/README.md"
+          zip -r '${{ matrix.archive }}' "$stage"
+      - name: Upload no-GTK archive
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.archive }}
+          if-no-files-found: error
+
+  tv-multiview:
+    needs: release-inputs
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out the release commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.release-inputs.outputs.commit }}
+          persist-credentials: false
+      - name: Verify checked-out commit
+        run: test "$(git rev-parse HEAD)" = '${{ needs.release-inputs.outputs.commit }}'
+      - name: Test controller
+        run: cargo test --locked -p tv-multiview
+      - name: Build controller
+        run: cargo build --locked --release -p tv-multiview
+      - name: Package controller archive
+        run: |
+          stage=tv-multiview-linux-x86_64
+          mkdir "$stage"
+          cp target/release/tv-multiview "$stage/tv-multiview"
+          cp LICENSE "$stage/LICENSE"
+          cp tv-multiview/README.md "$stage/README.md"
+          tar -czf "$stage.tar.gz" "$stage"
+      - name: Upload controller archive
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: tv-multiview-linux-x86_64
+          path: tv-multiview-linux-x86_64.tar.gz
+          if-no-files-found: error
+
+  publish-draft:
+    needs:
+      - release-inputs
+      - gtk-linux
+      - gtk-windows
+      - gtk-macos
+      - no-gtk
+      - tv-multiview
+    runs-on: ubuntu-24.04
+    environment: release
+    permissions:
+      contents: write
+    steps:
+      - name: Check out the release commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.release-inputs.outputs.commit }}
+          persist-credentials: false
+      - name: Download complete artifact matrix
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Validate local artifact matrix
+        run: python3 scripts/release_manifest.py verify --assets-dir dist
+      - name: Refuse an existing release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.release-inputs.outputs.tag }}
+        run: |
+          rc=0
+          error="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" 2>&1)" || rc=$?
+          if [[ "$rc" -eq 0 ]]; then
+            echo 'release already exists' >&2
+            exit 1
+          fi
+          grep -q 'HTTP 404' <<< "$error"
+      - name: Create unpublished draft and manifest
+        id: draft
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.release-inputs.outputs.tag }}
+          COMMIT: ${{ needs.release-inputs.outputs.commit }}
+          PRERELEASE: ${{ needs.release-inputs.outputs.prerelease }}
+        run: |
+          jq -n \
+            --arg tag "$TAG" \
+            --arg commit "$COMMIT" \
+            --argjson prerelease "$PRERELEASE" \
+            '{tag_name:$tag,target_commitish:$commit,name:$tag,draft:true,prerelease:$prerelease,generate_release_notes:true}' \
+            | gh api --method POST "repos/$GITHUB_REPOSITORY/releases" --input - > draft.json
+          release_id="$(jq -r '.id' draft.json)"
+          test "$(jq -r '.draft' draft.json)" = true
+          python3 scripts/release_manifest.py create \
+            --assets-dir dist \
+            --repository "$GITHUB_REPOSITORY" \
+            --release-id "$release_id" \
+            --tag "$TAG" \
+            --commit "$COMMIT" \
+            --output osswitch-release-manifest.json
+          echo "release_id=$release_id" >> "$GITHUB_OUTPUT"
+      - name: Upload complete matrix to draft
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.release-inputs.outputs.tag }}
+        run: gh release upload "$TAG" dist/* osswitch-release-manifest.json
+      - name: Download and verify every remote draft byte
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_ID: ${{ steps.draft.outputs.release_id }}
+        run: |
+          gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" > release.json
+          mkdir remote
+          while IFS=$'\t' read -r asset_id asset_name; do
+            test "$(basename "$asset_name")" = "$asset_name"
+            gh api \
+              -H 'Accept: application/octet-stream' \
+              "repos/$GITHUB_REPOSITORY/releases/assets/$asset_id" \
+              > "remote/$asset_name"
+          done < <(jq -r '.assets[] | [.id, .name] | @tsv' release.json)
+          python3 scripts/release_manifest.py verify-remote \
+            --release-json release.json \
+            --assets-dir dist \
+            --remote-dir remote \
+            --manifest osswitch-release-manifest.json
+      - name: Publish verified draft
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_ID: ${{ steps.draft.outputs.release_id }}
+        run: |
+          gh api --method PATCH \
+            "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" \
+            -F draft=false > published.json
+          test "$(jq -r '.draft' published.json)" = false

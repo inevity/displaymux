@@ -82,6 +82,8 @@ jobs:
           persist-credentials: false
       - name: Validate workflow syntax
         run: go run github.com/rhysd/actionlint/cmd/actionlint@03d0035246f3e81f36aed592ffb4bebf33a03106
+      - name: Test release manifest contract
+        run: python3 -m unittest discover -s tests -v
 
   linux-workspace:
     needs: changes
