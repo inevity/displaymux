@@ -264,7 +264,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install --yes libx11-dev libxtst-dev
+          sudo apt-get install --yes libx11-dev libxrandr-dev libxtst-dev
       - name: Test native no-GTK packages
         run: >-
           cargo test --locked
