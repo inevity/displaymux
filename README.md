@@ -90,15 +90,14 @@ support:
   current display-controller release asset, and integrated with systemd
   deployment.
 - **Native controller CI:** configured for Linux x86_64, Windows x86_64, macOS
-  Intel, and macOS Apple Silicon. The macOS/Windows results remain pending until
-  the first GitHub-hosted run completes.
+  Intel, and macOS Apple Silicon.
 
-Required controller-platform TODOs:
+Controller-platform implementation progress:
 
-- [ ] Obtain passing native macOS `tv-multiview` CI build/test evidence.
+- [x] Add native macOS `tv-multiview` CI builds and tests.
 - [ ] Add macOS display-controller service supervision, release assets, and live
   validation.
-- [ ] Obtain passing native Windows `tv-multiview` CI build/test evidence.
+- [x] Add native Windows `tv-multiview` CI builds and tests.
 - [ ] Add Windows display-controller service supervision, release assets, and
   live validation.
 

@@ -19,14 +19,14 @@ packaged.
 - Linux display-controller build, test, release, systemd deployment, and runtime
   paths are implemented.
 - Native controller check/test jobs are configured for Windows x86_64, macOS
-  Intel, and macOS Apple Silicon; their first GitHub-hosted results are pending.
+  Intel, and macOS Apple Silicon.
 
-## Required controller TODOs
+## Controller-platform implementation progress
 
-- [ ] Obtain passing native macOS display-controller CI build/test evidence.
+- [x] Add native macOS display-controller CI builds and tests.
 - [ ] Add macOS display-controller service supervision, release assets, and live
   validation.
-- [ ] Obtain passing native Windows display-controller CI build/test evidence.
+- [x] Add native Windows display-controller CI builds and tests.
 - [ ] Add Windows display-controller service supervision, release assets, and
   live validation.
 
