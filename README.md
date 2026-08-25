@@ -294,18 +294,26 @@ cargo test --locked -p tv-multiview
 
 ## Deployment
 
-Start with the sanitized examples in `deploy/`:
+The Ansible playbook reconciles one DisplayMux topology: a Linux Lan Mouse hub
+and display controller plus macOS and Windows Lan Mouse peers. It installs the
+selected binaries, renders authenticated hub/spoke configuration, reconciles
+certificate trust, configures native service supervision and logs, restarts
+changed runtimes, and verifies service health and peer connectivity.
+
+Install the required Ansible collections, then create ignored local
+configuration from the sanitized examples:
 
 ```bash
+ansible-galaxy collection install ansible.windows community.general
 cd deploy
 cp inventory.example.ini inventory.ini
 cp group_vars/all.example.yml group_vars/all.yml
-ansible-playbook -i inventory.ini playbook.yml
 ```
 
-Real inventory, credentials, fingerprints, display addresses, and display
-mappings remain ignored local files. See `deploy/README.md` for native-build and
-immutable release-manifest deployment semantics.
+Populate the inventory and group variables with the three hosts, display
+mapping, fingerprints, controller settings, and one installation mode. Real
+inventory, credentials, fingerprints, display addresses, and display mappings
+remain ignored local files.
 
 The playbook supports two installation modes:
 
@@ -313,6 +321,42 @@ The playbook supports two installation modes:
   and vendor archive.
 - `github_release` resolves one immutable release identity and verifies every
   downloaded asset digest before installation.
+
+For a native build, retain the default:
+
+```yaml
+lan_mouse_install_method: native_build
+```
+
+For GitHub Release deployment, set an explicit published tag when practical:
+
+```yaml
+lan_mouse_install_method: github_release
+lan_mouse_github_repository: inevity/displaymux
+lan_mouse_github_release_tag: REPLACE_WITH_RELEASE_TAG
+```
+
+`latest` is also accepted. `GITHUB_TOKEN` is optional for this public
+repository and can be exported to raise GitHub API rate limits. Validate the
+playbook and resolve controller-side inputs before the full deployment:
+
+```bash
+ansible-playbook -i inventory.ini playbook.yml --syntax-check
+ansible-playbook -i inventory.ini playbook.yml --limit localhost
+ansible-playbook -i inventory.ini playbook.yml
+```
+
+In `github_release` mode, Ansible deploys no-GTK Lan Mouse archives on Linux,
+macOS, and Windows and the `tv-multiview-linux-x86_64.tar.gz` controller on the
+Linux hub. The published Windows and macOS `tv-multiview` archives are not yet
+deployed as services. Every download is checked against
+`osswitch-release-manifest.json`; release identity is recorded on each host and
+resolved again after deployment to reject a release that changed mid-run.
+
+After deployment, Linux must report both user services active; macOS must have
+the LaunchAgent loaded; and Windows must have the `LanMouseDaemon` scheduled
+task. Detailed prerequisites, one-time permissions, install locations, logs,
+and recovery checks are in [`deploy/README.md`](deploy/README.md).
 
 Deployment is intentionally separate from publication. Creating a GitHub
 Release does not install binaries, restart services, or change the display input.
@@ -338,9 +382,11 @@ cover the standard local configuration and generated native-build artifacts.
 
 One release tag identifies the workspace source and complete native artifact
 set. Default GTK archives remain available alongside no-GTK Linux, Windows, and
-macOS assets. The initial controller asset is Linux x86_64 only. Every archive
-contains applicable license and README material, and the generated release
-manifest binds the release ID, tag commit, names, sizes, and SHA-256 digests.
+macOS assets. Controller archives are published for Linux x86_64, Windows
+x86_64, macOS Intel, and macOS Apple Silicon; Ansible service deployment
+currently consumes only the Linux controller archive. Every archive contains
+applicable license and README material, and the generated release manifest
+binds the release ID, tag commit, names, sizes, and SHA-256 digests.
 
 Release automation creates and verifies a draft before publication. It does not
 deploy binaries or restart hosts.

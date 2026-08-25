@@ -1,5 +1,27 @@
 # lan-mouse + tv-multiview deployment
 
+## Aim and scope
+
+This Ansible playbook deploys the current three-host DisplayMux topology. It
+installs a no-GTK Lan Mouse daemon on the Linux hub and the macOS and Windows
+peers, installs `tv-multiview` on the Linux controller host, renders the
+authenticated configurations, reconciles peer trust, configures native service
+supervision and bounded logs, restarts changed runtimes, and verifies service
+health and peer connectivity.
+
+Two binary sources are supported:
+
+- `native_build` distributes one source bundle and Cargo vendor archive, then
+  builds the native binaries on their target hosts.
+- `github_release` downloads the published native archives, verifies their
+  manifest-provided SHA-256 digests, and skips native compilation.
+
+Release mode deploys no-GTK Lan Mouse on Linux x86_64/ARM64, macOS
+Intel/Apple Silicon, and Windows x86_64. It deploys `tv-multiview` only on the
+Linux x86_64 controller. The Windows and macOS controller archives are
+published for manual use but are not yet installed or supervised by this
+playbook.
+
 ## Before running
 
 **On the control node (example-user, running Ansible):**
@@ -32,39 +54,78 @@ cp group_vars/all.example.yml group_vars/all.yml
   `rust-toolchain.toml` so native builds and release builds use the same compiler.
 - Windows SSH credentials — keep them in Ansible Vault or pass them as extra
   variables instead of committing new plaintext credentials.
-- Native-build mode uses the osswitch repository containing this `deploy/`
+- Native-build mode uses the DisplayMux repository containing this `deploy/`
   directory. There is no configured source revision or lock-digest pin.
 
-Run:
+## Usage
+
+First validate the playbook and prepare only controller-side inputs:
+
+```bash
+ansible-playbook -i inventory.ini playbook.yml --syntax-check
+ansible-playbook -i inventory.ini playbook.yml --limit localhost
+```
+
+`--limit localhost` creates the persistent controller token and either prepares
+the native source/vendor inputs or resolves and validates the selected GitHub
+Release. It does not install or restart software on the managed hosts.
+
+The default native-build configuration is:
+
+```yaml
+lan_mouse_install_method: native_build
+```
+
+To deploy published artifacts instead, use:
+
+```yaml
+lan_mouse_install_method: github_release
+lan_mouse_github_repository: inevity/displaymux
+lan_mouse_github_release_tag: REPLACE_WITH_RELEASE_TAG
+```
+
+`latest` is also supported. An explicit immutable tag is recommended for a
+repeatable deployment. `GITHUB_TOKEN` is optional for this public repository;
+export it when authenticated GitHub API rate limits are needed.
+
+Run the complete deployment with:
+
 ```bash
 ansible-playbook -i inventory.ini playbook.yml
 ```
 
-The default `lan_mouse_install_method: native_build` preserves the existing
-local-checkout build. To deploy no-GTK binaries from a public GitHub Release
-instead, set the repository and select either `latest` or a release tag:
-
-```yaml
-lan_mouse_install_method: github_release
-lan_mouse_github_repository: owner/osswitch
-lan_mouse_github_release_tag: latest
-```
-
 Release mode resolves `latest` or the configured tag exactly once on the
-Ansible controller. It validates the release ID, tag commit, declared asset set,
-and `osswitch-release-manifest.json`, then gives every host an immutable tag URL
-and SHA-256 digest. Linux also installs the matching `tv-multiview` asset from
-that release. macOS re-signs the verified Lan Mouse binary with its stable local
-identity so the existing Accessibility grant remains valid.
+Ansible controller. It rejects drafts, identity mismatches, duplicate or
+missing assets, undeclared remote assets, and invalid digests. It validates the
+release ID, tag commit, complete remote asset set, and
+`osswitch-release-manifest.json`, then gives each host immutable tag URLs and
+SHA-256 digests. The platform tasks verify the digest while downloading,
+install the selected archive, and record the resolved identity. The controller
+resolves the same tag again after the parallel host deployment and fails if the
+release changed during the run. macOS re-signs the verified Lan Mouse binary
+with its persistent local identity so the existing Accessibility grant remains
+valid.
 
 The first play always prepares the persistent controller token under
 `~/.local/state/lan-mouse-deploy/`. In native-build mode it also creates a git
 bundle from the monorepo commit and a root-lockfile Cargo vendor archive under
 the ignored `deploy/` paths `osswitch-source.bundle` and
 `osswitch-vendor-<lock-hash>.zip`.
-`--limit localhost` runs only controller-side preparation and release
-revalidation; it does not deploy or restart any host. Linux, macOS, and Windows
-run their selected install and service-restart sequences concurrently.
+Linux, macOS, and Windows run their selected install and service-restart
+sequences concurrently.
+
+### What GitHub Release mode installs
+
+- Linux: the architecture-matched no-GTK Lan Mouse archive into
+  `~/.local/bin/lan-mouse`, plus the Linux x86_64 controller archive into
+  `~/.local/bin/tv-multiview`.
+- macOS: the architecture-matched no-GTK Lan Mouse archive into
+  `~/.local/bin/lan-mouse`, re-signed with the configured persistent identity.
+- Windows: the no-GTK x86_64 Lan Mouse archive into the configured
+  `lan_mouse_windows_install_dir` (by default `D:\lanmouse`).
+
+GTK application archives and the Windows/macOS `tv-multiview` archives are not
+consumed by this playbook.
 
 ## After running (one-time manual steps)
 
