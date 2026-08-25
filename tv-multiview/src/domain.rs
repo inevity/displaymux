@@ -9,19 +9,19 @@ use thiserror::Error;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Host {
-    Linux,
-    Mac,
-    Windows,
+    Controller,
+    Right,
+    Left,
 }
 
 impl Host {
-    pub const ALL: [Self; 3] = [Self::Linux, Self::Mac, Self::Windows];
+    pub const ALL: [Self; 3] = [Self::Controller, Self::Left, Self::Right];
 
     pub const fn as_str(self) -> &'static str {
         match self {
-            Self::Linux => "linux",
-            Self::Mac => "mac",
-            Self::Windows => "windows",
+            Self::Controller => "controller",
+            Self::Right => "right",
+            Self::Left => "left",
         }
     }
 }
@@ -41,9 +41,9 @@ impl FromStr for Host {
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value {
-            "linux" => Ok(Self::Linux),
-            "mac" => Ok(Self::Mac),
-            "windows" => Ok(Self::Windows),
+            "controller" => Ok(Self::Controller),
+            "right" => Ok(Self::Right),
+            "left" => Ok(Self::Left),
             _ => Err(HostParseError(value.to_string())),
         }
     }

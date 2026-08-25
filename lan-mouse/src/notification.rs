@@ -29,7 +29,7 @@ impl SystemNotifier {
         Self {
             enabled: false,
             local_host: None,
-            server_host: SwitchHost::Linux,
+            server_host: SwitchHost::Controller,
         }
     }
 
@@ -178,9 +178,9 @@ async fn send_notification(notification: Notification) -> Result<(), String> {
 
 fn host_label(host: SwitchHost) -> &'static str {
     match host {
-        SwitchHost::Linux => "Linux",
-        SwitchHost::Mac => "macOS",
-        SwitchHost::Windows => "Windows",
+        SwitchHost::Controller => "controller",
+        SwitchHost::Right => "right client",
+        SwitchHost::Left => "left client",
     }
 }
 
@@ -190,32 +190,35 @@ mod tests {
 
     #[test]
     fn notifier_is_enabled_only_on_the_configured_server_host() {
-        assert!(SystemNotifier::new(SwitchHost::Mac, SwitchHost::Mac).enabled);
-        assert!(!SystemNotifier::new(SwitchHost::Windows, SwitchHost::Mac).enabled);
+        assert!(SystemNotifier::new(SwitchHost::Right, SwitchHost::Right).enabled);
+        assert!(!SystemNotifier::new(SwitchHost::Left, SwitchHost::Right).enabled);
     }
 
     #[test]
     fn failure_notification_names_target_reason_and_fallback_host() {
         let notification = switch_failure_notification(
-            Some(SwitchHost::Windows),
-            SwitchHost::Mac,
+            Some(SwitchHost::Left),
+            SwitchHost::Right,
             "peer_bundle_not_ready",
             describe_reason("peer_bundle_not_ready"),
         );
 
-        assert_eq!(notification.title, "Lan Mouse: switch to Windows failed");
+        assert_eq!(
+            notification.title,
+            "Lan Mouse: switch to left client failed"
+        );
         assert!(notification.body.contains("keyboard and pointer bundle"));
-        assert!(notification.body.contains("Input remains on macOS"));
+        assert!(notification.body.contains("Input remains on right client"));
         assert!(notification.body.contains("peer_bundle_not_ready"));
         assert_eq!(notification.timeout, Timeout::Never);
     }
 
     #[test]
     fn clipboard_permission_notification_is_actionable_and_preserves_input() {
-        let notification = clipboard_permission_notification(SwitchHost::Mac);
+        let notification = clipboard_permission_notification(SwitchHost::Right);
         assert!(notification.body.contains("Always Allow"));
         assert!(notification.body.contains("Input switching still works"));
-        assert!(notification.body.contains("macOS"));
+        assert!(notification.body.contains("right client"));
         assert_eq!(notification.timeout, Timeout::Never);
     }
 }

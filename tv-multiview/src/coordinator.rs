@@ -486,18 +486,18 @@ mod tests {
     fn synchronized_event() -> Event {
         Event::TransportSynchronized {
             mode: TvMode::Fullscreen,
-            input: Some(Host::Linux),
+            input: Some(Host::Controller),
             signals: BTreeMap::from([
-                (Host::Linux, true),
-                (Host::Mac, false),
-                (Host::Windows, false),
+                (Host::Controller, true),
+                (Host::Right, false),
+                (Host::Left, false),
             ]),
         }
     }
 
     fn remote_owned_state() -> ProtocolState {
         let synchronized = protocol::apply(
-            &ProtocolState::new(Host::Linux, 32),
+            &ProtocolState::new(Host::Controller, 32),
             synchronized_event(),
             1,
             TIMING,
@@ -507,7 +507,7 @@ mod tests {
         let ready = protocol::apply(
             &synchronized,
             Event::PeerReadinessUpdated {
-                host: Host::Mac,
+                host: Host::Right,
                 readiness: PeerReadiness {
                     online: true,
                     keyboard_ready: true,
@@ -526,7 +526,7 @@ mod tests {
             Event::CreateEnter {
                 request_id: "request-1".to_string(),
                 client_id: "client-1".to_string(),
-                target: Host::Mac,
+                target: Host::Right,
                 lease: LeaseIdentity {
                     lease_id: "lease-1".to_string(),
                     lease_epoch: 1,
@@ -544,7 +544,7 @@ mod tests {
             &switching,
             Event::CommandAcknowledged {
                 switch_epoch,
-                target: Host::Mac,
+                target: Host::Right,
             },
             11,
             TIMING,
@@ -556,11 +556,11 @@ mod tests {
             Event::Observation {
                 switch_epoch,
                 mode: TvMode::Fullscreen,
-                input: Some(Host::Mac),
+                input: Some(Host::Right),
                 signals: BTreeMap::from([
-                    (Host::Linux, false),
-                    (Host::Mac, true),
-                    (Host::Windows, false),
+                    (Host::Controller, false),
+                    (Host::Right, true),
+                    (Host::Left, false),
                 ]),
             },
             20,
@@ -587,7 +587,7 @@ mod tests {
 
     #[tokio::test]
     async fn publishes_coherent_snapshot_after_transition() {
-        let (handle, _, task) = spawn(ProtocolState::new(Host::Linux, 32), TIMING, 4, 2);
+        let (handle, _, task) = spawn(ProtocolState::new(Host::Controller, 32), TIMING, 4, 2);
         let snapshot = handle.apply_safety(synchronized_event()).await.unwrap();
         assert!(snapshot.ready());
         assert_eq!(snapshot.keyboard_owner, snapshot.pointer_owner);
@@ -597,11 +597,12 @@ mod tests {
 
     #[tokio::test]
     async fn effect_channel_is_bounded_and_observable() {
-        let (handle, mut effects, task) = spawn(ProtocolState::new(Host::Linux, 32), TIMING, 1, 1);
+        let (handle, mut effects, task) =
+            spawn(ProtocolState::new(Host::Controller, 32), TIMING, 1, 1);
         handle.apply_safety(synchronized_event()).await.unwrap();
         handle
             .apply_safety(Event::PeerReadinessUpdated {
-                host: Host::Mac,
+                host: Host::Right,
                 readiness: PeerReadiness {
                     online: true,
                     keyboard_ready: true,
@@ -617,7 +618,7 @@ mod tests {
             .apply(Event::CreateEnter {
                 request_id: "request-1".to_string(),
                 client_id: "client-1".to_string(),
-                target: Host::Mac,
+                target: Host::Right,
                 lease: LeaseIdentity {
                     lease_id: "lease-1".to_string(),
                     lease_epoch: 1,
@@ -656,8 +657,8 @@ mod tests {
             .unwrap();
 
         let snapshot = response_rx.await.unwrap().unwrap();
-        assert_eq!(snapshot.keyboard_owner, Host::Linux);
-        assert_eq!(snapshot.pointer_owner, Host::Linux);
+        assert_eq!(snapshot.keyboard_owner, Host::Controller);
+        assert_eq!(snapshot.pointer_owner, Host::Controller);
         assert_eq!(
             snapshot.fallback_reason.as_deref(),
             Some("lease_renewal_rejected")

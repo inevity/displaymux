@@ -244,7 +244,7 @@ mod tests {
     fn client_status_serializes_bundle_readiness_identity() {
         let config = ClientConfig {
             hostname: Some("mac".to_string()),
-            switch_target: Some(SwitchHost::Mac),
+            switch_target: Some(SwitchHost::Right),
             ..ClientConfig::default()
         };
         let state = ClientState {
@@ -260,7 +260,7 @@ mod tests {
         let status = ClientStatus::from_client(3, config, state);
         let json = serde_json::to_value(status).unwrap();
         assert_eq!(json["id"], 3);
-        assert_eq!(json["switch_target"], "mac");
+        assert_eq!(json["switch_target"], "right");
         assert_eq!(json["alive"], true);
         assert_eq!(json["keyboard_ready"], true);
         assert_eq!(json["pointer_ready"], true);

@@ -70,10 +70,15 @@ transition.
 | Packaged `tv-multiview` service | Yes | Not yet | Not yet |
 | Native Ansible deployment | Yes | Yes | Yes |
 
-Managed `tv-multiview` service integration is currently available only when
-Linux is selected as the Lan Mouse hub/server. macOS and Windows controller
-archives are available, but managed service integration is not yet provided on
-those platforms.
+Managed `tv-multiview` service integration is currently available only when the
+assigned controller host runs Linux. macOS and Windows controller archives are
+available, but managed service integration is not yet provided on those
+platforms.
+
+DisplayMux currently supports exactly three hosts: one controller host, one
+left client, and one right client. The three hosts may use any supported
+combination of Linux, macOS, and Windows; operating system groups select native
+deployment tasks and do not determine controller/client roles.
 
 ## Current Display Support and Implementation Status
 
@@ -140,15 +145,17 @@ The Ansible deployment derives every generated role from one variable in
 `deploy/group_vars/all.yml`:
 
 ```yaml
-lan_mouse_server_host: linux  # linux|mac|windows
+displaymux_host_assignments:
+  controller: linux-host
+  left: windows-host
+  right: mac-host
 ```
 
 After the inventory, displays, fingerprints, and controller key paths have been
-configured once, changing only `lan_mouse_server_host` causes the selected host
-to receive the Lan Mouse hub and `tv-multiview` configuration. The other two
-hosts receive Lan Mouse client configurations that point to the selected host.
-Controller URLs, bind address, trust entries, client identities, and edge
-positions are generated from the same selector.
+configured once, changing this one assignment mapping selects the controller
+and places the other hosts to its left and right. Ansible generates the hub,
+both client configurations, controller URLs, bind address, trust entries, and
+inverse return edges from the same mapping.
 
 The fingerprint shown by Lan Mouse on one host must be placed in
 `authorized_fingerprints` on the host accepting that connection. See the
@@ -164,9 +171,9 @@ from the sanitized inventory and group-variable examples.
 
 ### 5. Move between hosts
 
-Movement follows `lan_mouse_host_positions` in the Ansible configuration. The
-selected hub uses its row for both clients; each generated client uses the
-inverse entry to return to the hub.
+Movement follows `displaymux_host_assignments`. The controller reaches the left
+client through its left edge and the right client through its right edge. Each
+generated client uses the inverse edge to return to the controller.
 
 Leaving the server for a non-server host uses a deliberate two-crossing guard:
 
@@ -216,12 +223,12 @@ cargo test --locked -p tv-multiview
 
 ## Deployment
 
-The Ansible playbook manages one Linux, one macOS, and one Windows host. The
-`lan_mouse_server_host` variable selects which generated configuration is the
-hub/controller and which two are clients. The playbook installs selected
-binaries, renders authenticated configuration, reconciles certificate trust,
-configures native service supervision and logs, restarts changed runtimes, and
-verifies the implemented service paths.
+The Ansible playbook manages exactly three hosts in any supported platform mix.
+`displaymux_host_assignments` assigns one inventory host as controller and the
+others as left/right clients. The playbook installs selected binaries, renders
+authenticated configuration, validates certificate identity, configures native
+service supervision and logs, restarts changed runtimes, and verifies the
+implemented service paths.
 
 Install the required Ansible collections, then create ignored local
 configuration from the sanitized examples:
@@ -270,9 +277,9 @@ ansible-playbook -i inventory.ini playbook.yml
 ```
 
 In `github_release` mode, Ansible deploys no-GTK Lan Mouse archives on Linux,
-macOS, and Windows. When Linux is selected as `lan_mouse_server_host`, it also
-deploys the managed `tv-multiview-linux-x86_64.tar.gz` service. For macOS or
-Windows selection, Ansible generates the controller configuration but does not
+macOS, and Windows. When the assigned controller host runs Linux, it also
+deploys the managed `tv-multiview-linux-x86_64.tar.gz` service. For a macOS or
+Windows controller, Ansible generates the controller configuration but does not
 yet supervise the controller process. Every download is checked against
 `osswitch-release-manifest.json`; release identity is recorded on each host and
 resolved again after deployment to reject a release that changed mid-run.

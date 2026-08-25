@@ -2,48 +2,56 @@
 
 ## Objective
 
-Make `lan_mouse_server_host` the single Ansible selector for generated
-DisplayMux roles. The selected logical host receives the Lan Mouse hub and
-display-controller configuration; the other hosts receive Lan Mouse spoke
-configuration.
+Make one host-assignment mapping the Ansible source of truth for generated
+DisplayMux roles. Three distinct inventory hosts are assigned to controller,
+left-client, and right-client roles independently of their operating systems.
 
 ## Scope
 
-- Accept `linux`, `mac`, or `windows` as `lan_mouse_server_host`.
-- Derive inventory hosts, addresses, fingerprints, and peer positions from the
-  logical role.
+- Support exactly three inventory hosts in any Linux, macOS, or Windows mix.
+- Assign one host as controller and the other two as left/right clients.
+- Derive addresses, fingerprints, display mappings, and peer positions from
+  stable inventory host identities and the configured role assignment.
 - Render one hub configuration and two spoke configurations automatically.
 - Render `tv-multiview/config.toml` on the selected controller host.
-- Preserve the current rendered behavior when `lan_mouse_server_host: linux`.
-- Update connection checks and post-deployment trust reconciliation to use the
-  selected hub where their platform modules allow it.
+- Replace OS-named Rust protocol identities with controller/left/right roles.
+- Preserve the current effective controller, left-client, and right-client
+  topology after migrating the ignored configuration.
+- Update connection checks and certificate-identity validation to use the
+  assigned controller independently of platform.
 
 ## Non-goals
 
 - Adding macOS or Windows `tv-multiview` service supervision.
 - Moving controller binaries between hosts.
-- Changing the DisplayMux protocol, Rust runtime, or physical host layout.
+- Supporting more or fewer than three hosts.
+- Changing the physical host layout.
 - Exposing real inventory, tokens, addresses, or certificate fingerprints.
 
 ## Invariants
 
 1. Exactly one generated Lan Mouse configuration is a hub configuration.
-2. Every other generated Lan Mouse configuration points to that selected hub.
-3. Every `switch_controller.url` and controller `bind_address` uses the selected
-   host address.
-4. Hub clients exclude the hub itself and include every spoke exactly once.
-5. Spoke trust authorizes the selected hub fingerprint.
-6. Changing only `lan_mouse_server_host` changes the generated roles.
-7. The `linux` selector preserves the existing effective topology.
+2. Exactly two generated Lan Mouse configurations are client configurations.
+3. Controller, left, and right assignments name three distinct inventory hosts.
+4. Platform groups select deployment tasks only; they never identify roles.
+5. Every client configuration points to the assigned controller host.
+6. The controller places the left client on its left edge and the right client
+   on its right edge; each client uses the inverse edge to return.
+7. Every `switch_controller.url` and controller `bind_address` uses the assigned
+   controller host address.
+8. Hub clients exclude the controller and include both clients exactly once.
+9. Client trust authorizes the assigned controller fingerprint.
+10. Changing only the host-assignment mapping regenerates all three roles.
 
 ## Implementation checklist
 
-- [x] Validate the selector and one-host-per-role inventory shape.
-- [x] Define shared logical-role mappings in the deployment play.
-- [x] Generalize hub, spoke, and controller templates.
-- [x] Select hub/spoke templates in Linux, macOS, and Windows tasks.
-- [x] Generate the controller configuration on the selected host.
-- [x] Remove or explicitly gate configuration checks tied to the Linux service.
-- [x] Add Ansible-native selector and topology validation.
-- [x] Update sanitized examples and usage documentation.
-- [x] Run Ansible-native validation, syntax checks, and source diff validation.
+- [x] Replace the invalid OS-keyed plan with host assignments and platform-neutral roles.
+- [x] Replace Rust OS-named switch identities with controller/left/right roles.
+- [x] Validate exactly three distinct assigned inventory hosts.
+- [x] Key host-specific settings by inventory host identity.
+- [x] Generalize hub, client, and controller templates.
+- [x] Select controller/client templates independently of platform task files.
+- [x] Update connection checks and certificate-identity validation.
+- [x] Migrate sanitized examples and the ignored current configuration.
+- [x] Document the current three-host limit.
+- [ ] Run Rust, Ansible, deployment, and idempotence verification.

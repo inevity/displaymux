@@ -2,11 +2,11 @@
 
 ## Aim and scope
 
-This Ansible playbook manages one Linux, one macOS, and one Windows DisplayMux
-host. `lan_mouse_server_host` selects which generated configuration is the
-Lan Mouse hub/controller and which two are clients. The selected host receives
-the hub and `tv-multiview` configuration; every other host receives a client
-configuration that points to it.
+This Ansible playbook currently manages exactly three DisplayMux hosts in any
+supported Linux, macOS, or Windows mix. `displaymux_host_assignments` assigns
+one inventory host as controller and the other two as left/right clients. The
+controller receives the Lan Mouse hub and `tv-multiview` configuration; both
+clients receive configurations that point back to it.
 
 Two binary sources are supported:
 
@@ -47,9 +47,9 @@ cp group_vars/all.example.yml group_vars/all.yml
 ```
 
 - `inventory.ini` contains real hostnames, addresses, and users.
-- `group_vars/all.yml` contains the TV address, input mapping, server host,
-  fingerprints, pairwise edge positions, controller key paths and timeouts,
-  install method, and native build features.
+- `group_vars/all.yml` contains the display address, host assignment, host-keyed
+  input mappings, fingerprints, controller key paths and timeouts, install
+  method, and native build features.
 - Keep `lan_mouse_rust_toolchain` aligned with the version pinned by the root
   `rust-toolchain.toml` so native builds and release builds use the same compiler.
 - Windows SSH credentials — keep them in Ansible Vault or pass them as extra
@@ -74,12 +74,16 @@ The default native-build configuration is:
 
 ```yaml
 lan_mouse_install_method: native_build
-lan_mouse_server_host: linux  # linux|mac|windows
+displaymux_host_assignments:
+  controller: linux-host
+  left: windows-host
+  right: mac-host
 ```
 
 After the host-specific values are populated once, changing only
-`lan_mouse_server_host` regenerates one hub/controller configuration and two
-client configurations. No inventory group or task file is selected manually.
+`displaymux_host_assignments` regenerates one hub/controller configuration and
+two positioned client configurations. Platform inventory groups select native
+tasks only; no playbook or task file is selected manually.
 
 To deploy published artifacts instead, use:
 
@@ -116,7 +120,7 @@ The first play always prepares the persistent controller token under
 bundle from the monorepo commit and a root-lockfile Cargo vendor archive under
 the ignored `deploy/` paths `osswitch-source.bundle` and
 `osswitch-vendor-<lock-hash>.zip`.
-Linux, macOS, and Windows run their selected install and service-restart
+The three assigned hosts run their platform install and service-restart
 sequences concurrently.
 
 ### What GitHub Release mode installs

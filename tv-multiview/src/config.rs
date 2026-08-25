@@ -188,39 +188,39 @@ mod tests {
     const VALID: &str = r#"
 bind_address = "127.0.0.1:8765"
 tv_ip = "192.0.2.10"
-server_host = "linux"
+server_host = "controller"
 controller_token = "test-token"
 client_key_path = "/tmp/key.sqlite"
 
 [inputs]
-linux = "HDMI_4"
-mac = "HDMI_3"
-windows = "HDMI_2"
+controller = "HDMI_4"
+right = "HDMI_3"
+left = "HDMI_2"
 "#;
 
     #[test]
     fn parses_complete_configuration() {
         let config: DaemonConfig = toml::from_str(VALID).unwrap();
         config.validate().unwrap();
-        assert_eq!(config.server_host, Host::Linux);
-        assert_eq!(config.input_for(Host::Windows), Some("HDMI_2"));
+        assert_eq!(config.server_host, Host::Controller);
+        assert_eq!(config.input_for(Host::Left), Some("HDMI_2"));
     }
 
     #[test]
     fn accepts_remote_host_without_display_route() {
-        let config: DaemonConfig =
-            toml::from_str(&VALID.replace("mac = \"HDMI_3\"\n", "")).expect("syntactically valid");
+        let config: DaemonConfig = toml::from_str(&VALID.replace("right = \"HDMI_3\"\n", ""))
+            .expect("syntactically valid");
         config.validate().unwrap();
-        assert_eq!(config.input_for(Host::Mac), None);
+        assert_eq!(config.input_for(Host::Right), None);
     }
 
     #[test]
     fn rejects_missing_server_mapping() {
-        let config: DaemonConfig =
-            toml::from_str(&VALID.replace("linux = \"HDMI_4\"\n", "")).expect("syntactically valid");
+        let config: DaemonConfig = toml::from_str(&VALID.replace("controller = \"HDMI_4\"\n", ""))
+            .expect("syntactically valid");
         assert!(matches!(
             config.validate(),
-            Err(ConfigError::MissingInput(Host::Linux))
+            Err(ConfigError::MissingInput(Host::Controller))
         ));
     }
 

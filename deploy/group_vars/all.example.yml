@@ -16,11 +16,18 @@ lan_mouse_windows_build_cache: "{{ lan_mouse_windows_root }}\\build"
 lan_mouse_windows_msvc_dir: "{{ lan_mouse_windows_build_cache }}\\msvc"
 lan_mouse_linux_features: "layer_shell_capture,libei_capture,x11_capture,wlroots_emulation,libei_emulation,x11_emulation,rdp_emulation"
 lan_mouse_log_filter: "lan_mouse=info,lan_mouse::clipboard=debug,lan_mouse::clipboard_transport=debug,lan_mouse_clipboard=debug"
-lan_mouse_server_host: linux  # linux|mac|windows; selects hub/controller configs
+displaymux_host_assignments:
+  controller: linux-host
+  left: windows-host
+  right: mac-host
 lan_mouse_emulation_displays:
-  linux: "REPLACE_LINUX_DISPLAY_NAME"
-  mac: "REPLACE_MACOS_DISPLAY_NAME"
-  windows: "REPLACE_WINDOWS_DISPLAY_NAME"
+  linux-host: "REPLACE_LINUX_DISPLAY_NAME"
+  mac-host: "REPLACE_MACOS_DISPLAY_NAME"
+  windows-host: "REPLACE_WINDOWS_DISPLAY_NAME"
+lan_mouse_fingerprints:
+  linux-host: "REPLACE_LINUX_TLS_FINGERPRINT"
+  mac-host: "REPLACE_MACOS_TLS_FINGERPRINT"
+  windows-host: "REPLACE_WINDOWS_TLS_FINGERPRINT"
 lan_mouse_port: 4243
 lan_mouse_clipboard_enabled: true
 lan_mouse_clipboard_max_bytes: 3145728
@@ -33,16 +40,18 @@ lan_mouse_controller_renew_interval_ms: 5000
 lan_mouse_log_max_bytes: 10485760
 lan_mouse_log_backups: 5
 lan_mouse_controller_token_file: "{{ lookup('env', 'HOME') }}/.local/state/lan-mouse-deploy/controller-token"
-lan_mouse_windows_fingerprint_file: "{{ lan_mouse_windows_root }}\\peer-fingerprints.toml"
+lan_mouse_fingerprint_files:
+  windows-host: >-
+    {{ lookup('env', 'HOME') }}/.local/state/lan-mouse-deploy/windows-host-fingerprint
 
 # Display-controller configuration.
 tv_ip: "REPLACE_TV_ADDRESS"
 daemon_port: 8765
 tv_multiview_log_level: info  # debug|info|warn|error|trace
 tv_multiview_client_key_paths:
-  linux: "/home/REPLACE_LINUX_USER/.config/lg-buddy/.aiopylgtv.sqlite"
-  mac: "/Users/REPLACE_MACOS_USER/.config/lg-buddy/.aiopylgtv.sqlite"
-  windows: "C:/Users/REPLACE_WINDOWS_USER/AppData/Local/lg-buddy/.aiopylgtv.sqlite"
+  linux-host: "/home/REPLACE_LINUX_USER/.config/lg-buddy/.aiopylgtv.sqlite"
+  mac-host: "/Users/REPLACE_MACOS_USER/.config/lg-buddy/.aiopylgtv.sqlite"
+  windows-host: "C:/Users/REPLACE_WINDOWS_USER/AppData/Local/lg-buddy/.aiopylgtv.sqlite"
 tv_multiview_command_timeout_ms: 10000
 tv_multiview_observation_timeout_ms: 5000
 tv_multiview_grant_timeout_ms: 5000
@@ -52,28 +61,11 @@ tv_multiview_reconnect_alert_after: 10
 tv_multiview_deploy_ready_retries: 75
 tv_multiview_deploy_ready_delay_seconds: 2
 tv_inputs:
-  linux: REPLACE_LINUX_TV_INPUT
-  mac: REPLACE_MACOS_TV_INPUT
-  windows: REPLACE_WINDOWS_TV_INPUT
-
-# Pairwise edge used to reach each possible peer. Changing only
-# lan_mouse_server_host selects the matching hub row and inverse spoke entries.
-lan_mouse_host_positions:
-  linux:
-    mac: right
-    windows: left
-  mac:
-    linux: left
-    windows: right
-  windows:
-    linux: right
-    mac: left
+  linux-host: REPLACE_LINUX_TV_INPUT
+  mac-host: REPLACE_MACOS_TV_INPUT
+  windows-host: REPLACE_WINDOWS_TV_INPUT
 
 # Wake-on-LAN addresses.
-mac_mac_address: "REPLACE_MACOS_MAC_ADDRESS"
-windows_mac_address: "REPLACE_WINDOWS_MAC_ADDRESS"
-
-# Colon-separated SHA-256 fingerprints from each host's lan-mouse.pem.
-mac_fingerprint: "REPLACE_MACOS_TLS_FINGERPRINT"
-windows_fingerprint: "REPLACE_WINDOWS_TLS_FINGERPRINT"
-hub_fingerprint: "REPLACE_LINUX_TLS_FINGERPRINT"
+wake_on_lan:
+  mac-host: "REPLACE_MACOS_MAC_ADDRESS"
+  windows-host: "REPLACE_WINDOWS_MAC_ADDRESS"

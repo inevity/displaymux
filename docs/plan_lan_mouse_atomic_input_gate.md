@@ -258,7 +258,8 @@ The macOS and Windows task sequences run concurrently under one Ansible
 `strategy: free` play, and their native test/build commands use bounded async
 polling. Each native build links the platform notification implementation into
 lan-mouse; deployment has no notification-command or runtime-package
-prerequisite. `lan_mouse_server_host` selects the sole emitting instance.
+prerequisite. The `controller` entry in `displaymux_host_assignments` selects
+the sole emitting instance.
 
 - Replace generated `enter_hook = "curl ..."` authorization with explicit switch-controller configuration understood by the patched lan-mouse build.
 - Remove shell-hook authorization entirely when fenced capture is enabled; no compatibility option is implemented.

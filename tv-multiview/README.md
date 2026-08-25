@@ -8,8 +8,8 @@ failures to the configured Lan Mouse server host.
 Managed display-controller service integration is currently available only for
 Linux. Display-controller archives are available for macOS and Windows, but
 managed service integration is not yet provided on those platforms. Ansible
-generates the controller configuration on the host selected by
-`lan_mouse_server_host`.
+generates the controller configuration on the inventory host assigned to the
+`controller` slot in `displaymux_host_assignments`.
 
 ## Current display support
 

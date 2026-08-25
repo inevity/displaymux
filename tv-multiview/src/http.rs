@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, str::FromStr, sync::Arc};
 use tokio::sync::watch;
 
-const PROTOCOL_VERSION: u16 = 1;
+const PROTOCOL_VERSION: u16 = 2;
 const AUTHORIZATION: &str = "authorization";
 
 #[derive(Clone)]
@@ -834,22 +834,22 @@ mod tests {
 
     async fn ready_app() -> (Router, CoordinatorHandle, coordinator::EffectReceivers) {
         let (handle, effects, _) =
-            coordinator::spawn(ProtocolState::new(Host::Linux, 32), TIMING, 8, 4);
+            coordinator::spawn(ProtocolState::new(Host::Controller, 32), TIMING, 8, 4);
         handle
             .apply_safety(Event::TransportSynchronized {
                 mode: TvMode::Fullscreen,
-                input: Some(Host::Linux),
+                input: Some(Host::Controller),
                 signals: BTreeMap::from([
-                    (Host::Linux, true),
-                    (Host::Mac, false),
-                    (Host::Windows, false),
+                    (Host::Controller, true),
+                    (Host::Right, false),
+                    (Host::Left, false),
                 ]),
             })
             .await
             .unwrap();
         handle
             .apply_safety(Event::PeerReadinessUpdated {
-                host: Host::Mac,
+                host: Host::Right,
                 readiness: PeerReadiness {
                     online: true,
                     keyboard_ready: true,
@@ -877,7 +877,7 @@ mod tests {
         let (app, _, _) = ready_app().await;
         let response = app
             .oneshot(
-                authenticated(Request::builder().method("GET").uri("/enter/mac"))
+                authenticated(Request::builder().method("GET").uri("/enter/right"))
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -893,7 +893,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/enter/mac")
+                    .uri("/enter/right")
                     .header("content-type", "application/json")
                     .body(Body::from("{}"))
                     .unwrap(),
@@ -908,7 +908,7 @@ mod tests {
         let (app, handle, mut effects) = ready_app().await;
         let response = app
             .oneshot(
-                authenticated(Request::builder().method("POST").uri("/enter/mac"))
+                authenticated(Request::builder().method("POST").uri("/enter/right"))
                     .header("content-type", "application/json")
                     .body(Body::from(
                         json!({
@@ -933,11 +933,11 @@ mod tests {
         let lease_expires_at_ms = body["data"]["lease"]["expires_at_ms"].as_u64().unwrap();
         assert!(lease_expires_at_ms >= server_now_ms);
         assert!(lease_expires_at_ms - server_now_ms <= 300);
-        assert_eq!(handle.snapshot().keyboard_owner, Host::Linux);
+        assert_eq!(handle.snapshot().keyboard_owner, Host::Controller);
         assert!(matches!(
             effects.ordinary.recv().await,
             Some(crate::protocol::Effect::SetInput {
-                target: Host::Mac,
+                target: Host::Right,
                 fallback: false,
                 ..
             })
@@ -950,7 +950,7 @@ mod tests {
         let create_response = app
             .clone()
             .oneshot(
-                authenticated(Request::builder().method("POST").uri("/enter/mac"))
+                authenticated(Request::builder().method("POST").uri("/enter/right"))
                     .header("content-type", "application/json")
                     .body(Body::from(
                         json!({
@@ -973,7 +973,7 @@ mod tests {
         handle
             .apply(Event::CommandAcknowledged {
                 switch_epoch,
-                target: Host::Mac,
+                target: Host::Right,
             })
             .await
             .unwrap();
@@ -981,11 +981,11 @@ mod tests {
             .apply(Event::Observation {
                 switch_epoch,
                 mode: TvMode::Fullscreen,
-                input: Some(Host::Mac),
+                input: Some(Host::Right),
                 signals: BTreeMap::from([
-                    (Host::Linux, true),
-                    (Host::Mac, true),
-                    (Host::Windows, false),
+                    (Host::Controller, true),
+                    (Host::Right, true),
+                    (Host::Left, false),
                 ]),
             })
             .await
@@ -1071,12 +1071,12 @@ mod tests {
             .unwrap();
         assert_eq!(status_response.status(), StatusCode::OK);
         let body = body_json(status_response).await;
-        assert_eq!(body["data"]["keyboard_owner"], "linux");
+        assert_eq!(body["data"]["keyboard_owner"], "controller");
         assert_eq!(body["data"]["mode"], "fullscreen");
         assert_eq!(body["data"]["protocol_phase"], "idle");
         assert_eq!(body["data"]["healthy"], true);
         assert_eq!(body["data"]["ready"], true);
-        assert_eq!(body["data"]["input_signal"]["linux"], true);
+        assert_eq!(body["data"]["input_signal"]["controller"], true);
         assert_eq!(body["data"]["queues"]["ordinary_commands"]["depth"], 0);
         assert_eq!(body["data"]["runtime"]["dropped_logs"], 0);
         assert_eq!(body["data"]["runtime"]["retry_alert"], false);
@@ -1090,7 +1090,7 @@ mod tests {
         let malformed = app
             .clone()
             .oneshot(
-                authenticated(Request::builder().method("POST").uri("/enter/mac"))
+                authenticated(Request::builder().method("POST").uri("/enter/right"))
                     .header("content-type", "application/json")
                     .body(Body::from("{"))
                     .unwrap(),
@@ -1102,7 +1102,7 @@ mod tests {
 
         let zero_epoch = app
             .oneshot(
-                authenticated(Request::builder().method("POST").uri("/enter/mac"))
+                authenticated(Request::builder().method("POST").uri("/enter/right"))
                     .header("content-type", "application/json")
                     .body(Body::from(
                         json!({
@@ -1129,7 +1129,7 @@ mod tests {
         let first = app
             .clone()
             .oneshot(
-                authenticated(Request::builder().method("POST").uri("/enter/mac"))
+                authenticated(Request::builder().method("POST").uri("/enter/right"))
                     .header("content-type", "application/json")
                     .body(create_body("request-1", "lease-1"))
                     .unwrap(),
@@ -1142,7 +1142,7 @@ mod tests {
         let duplicate = app
             .clone()
             .oneshot(
-                authenticated(Request::builder().method("POST").uri("/enter/mac"))
+                authenticated(Request::builder().method("POST").uri("/enter/right"))
                     .header("content-type", "application/json")
                     .body(create_body("request-1", "lease-1"))
                     .unwrap(),
@@ -1159,7 +1159,7 @@ mod tests {
 
         let conflict = app
             .oneshot(
-                authenticated(Request::builder().method("POST").uri("/enter/mac"))
+                authenticated(Request::builder().method("POST").uri("/enter/right"))
                     .header("content-type", "application/json")
                     .body(create_body("request-2", "lease-2"))
                     .unwrap(),
@@ -1178,7 +1178,7 @@ mod tests {
         let created = app
             .clone()
             .oneshot(
-                authenticated(Request::builder().method("POST").uri("/enter/mac"))
+                authenticated(Request::builder().method("POST").uri("/enter/right"))
                     .header("content-type", "application/json")
                     .body(create_body("request-1", "lease-1"))
                     .unwrap(),
@@ -1212,7 +1212,7 @@ mod tests {
         handle
             .apply(Event::CommandAcknowledged {
                 switch_epoch,
-                target: Host::Mac,
+                target: Host::Right,
             })
             .await
             .unwrap();
@@ -1220,11 +1220,11 @@ mod tests {
             .apply(Event::Observation {
                 switch_epoch,
                 mode: TvMode::Fullscreen,
-                input: Some(Host::Mac),
+                input: Some(Host::Right),
                 signals: BTreeMap::from([
-                    (Host::Linux, true),
-                    (Host::Mac, true),
-                    (Host::Windows, false),
+                    (Host::Controller, true),
+                    (Host::Right, true),
+                    (Host::Left, false),
                 ]),
             })
             .await
@@ -1254,7 +1254,7 @@ mod tests {
             .unwrap();
         assert_eq!(stale_commit.status(), StatusCode::CONFLICT);
         assert_eq!(body_json(stale_commit).await["code"], "request_conflict");
-        assert_eq!(handle.snapshot().keyboard_owner, Host::Linux);
+        assert_eq!(handle.snapshot().keyboard_owner, Host::Controller);
 
         let cancelled = app
             .oneshot(
@@ -1271,7 +1271,7 @@ mod tests {
             .unwrap();
         assert_eq!(cancelled.status(), StatusCode::CONFLICT);
         assert_eq!(body_json(cancelled).await["data"]["status"], "cancelled");
-        assert_eq!(handle.snapshot().pointer_owner, Host::Linux);
+        assert_eq!(handle.snapshot().pointer_owner, Host::Controller);
     }
 
     #[tokio::test]
@@ -1283,7 +1283,7 @@ mod tests {
                 authenticated(
                     Request::builder()
                         .method("POST")
-                        .uri("/internal/readiness/windows"),
+                        .uri("/internal/readiness/left"),
                 )
                 .header("content-type", "application/json")
                 .body(Body::from(
@@ -1301,7 +1301,7 @@ mod tests {
             .unwrap();
         assert_eq!(readiness.status(), StatusCode::OK);
         let body = body_json(readiness).await;
-        assert_eq!(body["data"]["host"], "windows");
+        assert_eq!(body["data"]["host"], "left");
         assert_eq!(body["data"]["readiness"]["pointer_ready"], false);
 
         let multiview = app
@@ -1328,7 +1328,7 @@ mod tests {
                 authenticated(
                     Request::builder()
                         .method("POST")
-                        .uri("/internal/manual-recovery/windows"),
+                        .uri("/internal/manual-recovery/left"),
                 )
                 .body(Body::empty())
                 .unwrap(),
@@ -1338,12 +1338,9 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::OK);
         let body = body_json(response).await;
-        assert_eq!(body["data"]["target"], "windows");
+        assert_eq!(body["data"]["target"], "left");
         assert_eq!(body["data"]["armed"], true);
-        assert_eq!(
-            handle.snapshot().manual_recovery_target,
-            Some(Host::Windows)
-        );
+        assert_eq!(handle.snapshot().manual_recovery_target, Some(Host::Left));
         assert!(tokio::time::timeout(
             std::time::Duration::from_millis(10),
             effects.ordinary.recv(),
@@ -1354,13 +1351,13 @@ mod tests {
         let manual = handle
             .apply_safety(Event::SubscriptionObserved {
                 mode: TvMode::Fullscreen,
-                input: Some(Host::Windows),
+                input: Some(Host::Left),
             })
             .await
             .unwrap();
         assert_eq!(manual.phase, ProtocolPhase::Idle);
         assert!(!manual.fallback_required);
-        assert_eq!(manual.keyboard_owner, Host::Linux);
-        assert_eq!(manual.pointer_owner, Host::Linux);
+        assert_eq!(manual.keyboard_owner, Host::Controller);
+        assert_eq!(manual.pointer_owner, Host::Controller);
     }
 }

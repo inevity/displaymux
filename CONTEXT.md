@@ -30,5 +30,21 @@ atomic unit.
 _Avoid_: Input owner, input ownership without qualification
 
 **Controller host**:
-The configured hub/server host that owns the display-controller role.
+The one configured host assigned the Lan Mouse hub/server and display-controller
+roles.
 _Avoid_: Linux host when referring to the architecture
+
+**Client host**:
+One of the two configured non-controller hosts. Each client host is placed to
+the left or right of the controller host.
+_Avoid_: macOS client or Windows client when referring to the role
+
+**Host assignment**:
+The configuration that assigns three distinct hosts to the controller, left
+client, and right client roles.
+_Avoid_: Using an operating system as a host identity
+
+**Platform**:
+The operating system that determines a host's native build, installation, and
+service integration. Platform does not determine host identity or role.
+_Avoid_: Linux, macOS, or Windows as a controller/client identifier

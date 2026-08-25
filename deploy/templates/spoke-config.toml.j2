@@ -4,17 +4,17 @@
 
 # optional port (defaults to 4242, explicit here for clarity)
 port = {{ lan_mouse_port }}
-emulation_display = "{{ lan_mouse_emulation_displays[displaymux_host_role] }}"
+emulation_display = "{{ lan_mouse_emulation_displays[inventory_hostname] }}"
 
 [clipboard]
 enabled = {{ lan_mouse_clipboard_enabled | lower }}
 max_bytes = {{ lan_mouse_clipboard_max_bytes }}
 
 [switch_controller]
-url = "http://{{ hostvars[displaymux_inventory_hosts[lan_mouse_server_host]].ansible_host }}:{{ daemon_port }}"
+url = "http://{{ hostvars[displaymux_controller_inventory_host].ansible_host }}:{{ daemon_port }}"
 token = "{{ lookup('ansible.builtin.file', lan_mouse_controller_token_file) | trim }}"
 local_host = "{{ displaymux_host_role }}"
-server_host = "{{ lan_mouse_server_host }}"
+server_host = "controller"
 http_timeout_ms = {{ lan_mouse_controller_http_timeout_ms }}
 request_timeout_ms = {{ lan_mouse_controller_request_timeout_ms }}
 poll_interval_ms = {{ lan_mouse_controller_poll_interval_ms }}
@@ -24,12 +24,12 @@ renew_interval_ms = {{ lan_mouse_controller_renew_interval_ms }}
 
 # authorize the hub's certificate for incoming connections
 [authorized_fingerprints]
-"{{ displaymux_host_fingerprints[lan_mouse_server_host] }}" = "{{ displaymux_inventory_hosts[lan_mouse_server_host] }}"
+"{{ displaymux_host_fingerprints['controller'] }}" = "{{ displaymux_controller_inventory_host }}"
 
 [[clients]]
-hostname = "{{ displaymux_inventory_hosts[lan_mouse_server_host] }}"
-ips = [ "{{ hostvars[displaymux_inventory_hosts[lan_mouse_server_host]].ansible_host }}" ]
+hostname = "{{ displaymux_controller_inventory_host }}"
+ips = [ "{{ hostvars[displaymux_controller_inventory_host].ansible_host }}" ]
 port = {{ lan_mouse_port }}
-position = "{{ displaymux_host_positions[displaymux_host_role][lan_mouse_server_host] }}"
+position = "{{ 'right' if displaymux_host_role == 'left' else 'left' }}"
 activate_on_startup = true
-switch_target = "{{ lan_mouse_server_host }}"
+switch_target = "controller"

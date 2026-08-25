@@ -683,14 +683,14 @@ mod tests {
             r#"
 bind_address = "127.0.0.1:8765"
 tv_ip = "192.0.2.10"
-server_host = "linux"
+server_host = "controller"
 controller_token = "test-token"
 client_key_path = "/tmp/client-key.sqlite"
 
 [inputs]
-linux = "HDMI_4"
-mac = "HDMI_3"
-windows = "HDMI_2"
+controller = "HDMI_4"
+right = "HDMI_3"
+left = "HDMI_2"
 "#,
         )
         .unwrap()
@@ -786,8 +786,12 @@ windows = "HDMI_2"
     #[tokio::test]
     async fn connected_session_registers_subscribes_and_resynchronizes() {
         let config = test_config();
-        let (coordinator, mut effects, coordinator_task) =
-            coordinator::spawn(ProtocolState::new(Host::Linux, 32), timing(&config), 8, 4);
+        let (coordinator, mut effects, coordinator_task) = coordinator::spawn(
+            ProtocolState::new(Host::Controller, 32),
+            timing(&config),
+            8,
+            4,
+        );
         let mut socket = ScriptedSocket::new(synchronized_messages());
         let mut backoff = ReconnectBackoff::new(1_000, 60_000);
         assert_eq!(backoff.failed(), (1_000, 1));
@@ -806,8 +810,8 @@ windows = "HDMI_2"
         wait_until(|| coordinator.snapshot().ready()).await;
         let snapshot = coordinator.snapshot();
         assert!(snapshot.ready());
-        assert_eq!(snapshot.observed_input, Some(Host::Linux));
-        assert!(snapshot.input_signal[&Host::Linux].present);
+        assert_eq!(snapshot.observed_input, Some(Host::Controller));
+        assert!(snapshot.input_signal[&Host::Controller].present);
         assert_eq!(backoff.failed(), (1_000, 1));
         let sent: Vec<Value> = socket
             .sent
@@ -838,8 +842,12 @@ windows = "HDMI_2"
     #[tokio::test]
     async fn disconnected_session_resubscribes_and_resynchronizes_on_next_connection() {
         let config = test_config();
-        let (coordinator, mut effects, coordinator_task) =
-            coordinator::spawn(ProtocolState::new(Host::Linux, 32), timing(&config), 8, 4);
+        let (coordinator, mut effects, coordinator_task) = coordinator::spawn(
+            ProtocolState::new(Host::Controller, 32),
+            timing(&config),
+            8,
+            4,
+        );
         let mut backoff = ReconnectBackoff::new(1_000, 60_000);
         let metrics = RuntimeMetrics::default();
         let mut first = ScriptedSocket::new(synchronized_messages());
@@ -891,16 +899,20 @@ windows = "HDMI_2"
     #[tokio::test]
     async fn wait_for_id_handles_callback_and_discards_delayed_old_response() {
         let config = test_config();
-        let (coordinator, _effects, coordinator_task) =
-            coordinator::spawn(ProtocolState::new(Host::Linux, 32), timing(&config), 8, 4);
+        let (coordinator, _effects, coordinator_task) = coordinator::spawn(
+            ProtocolState::new(Host::Controller, 32),
+            timing(&config),
+            8,
+            4,
+        );
         coordinator
             .apply_safety(Event::TransportSynchronized {
                 mode: TvMode::Fullscreen,
-                input: Some(Host::Linux),
+                input: Some(Host::Controller),
                 signals: BTreeMap::from([
-                    (Host::Linux, true),
-                    (Host::Mac, false),
-                    (Host::Windows, false),
+                    (Host::Controller, true),
+                    (Host::Right, false),
+                    (Host::Left, false),
                 ]),
             })
             .await
@@ -927,13 +939,13 @@ windows = "HDMI_2"
         .await
         .unwrap();
         assert_eq!(current["payload"]["value"], 7);
-        wait_until(|| coordinator.snapshot().observed_input == Some(Host::Mac)).await;
+        wait_until(|| coordinator.snapshot().observed_input == Some(Host::Right)).await;
         let snapshot = coordinator.snapshot();
         assert_eq!(snapshot.phase, ProtocolPhase::Idle);
         assert!(!snapshot.fallback_required);
         assert_eq!(snapshot.manual_recovery_target, None);
-        assert_eq!(snapshot.keyboard_owner, Host::Linux);
-        assert_eq!(snapshot.pointer_owner, Host::Linux);
+        assert_eq!(snapshot.keyboard_owner, Host::Controller);
+        assert_eq!(snapshot.pointer_owner, Host::Controller);
         coordinator_task.abort();
     }
 
@@ -952,8 +964,12 @@ windows = "HDMI_2"
     #[tokio::test]
     async fn response_timeout_is_bounded() {
         let config = test_config();
-        let (coordinator, _effects, coordinator_task) =
-            coordinator::spawn(ProtocolState::new(Host::Linux, 32), timing(&config), 8, 4);
+        let (coordinator, _effects, coordinator_task) = coordinator::spawn(
+            ProtocolState::new(Host::Controller, 32),
+            timing(&config),
+            8,
+            4,
+        );
         let mut socket = ScriptedSocket {
             incoming: VecDeque::from([ReadStep::Pending]),
             sent: Vec::new(),
@@ -969,8 +985,12 @@ windows = "HDMI_2"
         let mut config = test_config();
         config.timeouts.keepalive_ms = 1;
         config.timeouts.keepalive_timeout_ms = 2;
-        let (coordinator, mut effects, coordinator_task) =
-            coordinator::spawn(ProtocolState::new(Host::Linux, 32), timing(&config), 8, 4);
+        let (coordinator, mut effects, coordinator_task) = coordinator::spawn(
+            ProtocolState::new(Host::Controller, 32),
+            timing(&config),
+            8,
+            4,
+        );
         let mut incoming: VecDeque<_> = synchronized_messages()
             .into_iter()
             .map(ReadStep::Message)

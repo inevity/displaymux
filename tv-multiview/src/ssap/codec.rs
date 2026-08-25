@@ -184,9 +184,9 @@ mod tests {
 
     fn inputs() -> BTreeMap<Host, String> {
         BTreeMap::from([
-            (Host::Linux, "HDMI_4".to_string()),
-            (Host::Mac, "HDMI_3".to_string()),
-            (Host::Windows, "HDMI_2".to_string()),
+            (Host::Controller, "HDMI_4".to_string()),
+            (Host::Right, "HDMI_3".to_string()),
+            (Host::Left, "HDMI_2".to_string()),
         ])
     }
 
@@ -194,7 +194,7 @@ mod tests {
     fn parses_live_g4_input_and_signal_fields() {
         assert_eq!(
             parse_current_input(&json!({"appId": "com.webos.app.hdmi4"}), &inputs()).unwrap(),
-            Some(Host::Linux)
+            Some(Host::Controller)
         );
         let signals = parse_signals(
             &json!({
@@ -207,8 +207,8 @@ mod tests {
             &inputs(),
         )
         .unwrap();
-        assert_eq!(signals.get(&Host::Linux), Some(&true));
-        assert_eq!(signals.get(&Host::Windows), Some(&false));
+        assert_eq!(signals.get(&Host::Controller), Some(&true));
+        assert_eq!(signals.get(&Host::Left), Some(&false));
     }
 
     #[test]

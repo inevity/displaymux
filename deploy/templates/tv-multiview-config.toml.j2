@@ -1,17 +1,18 @@
-bind_address = "{{ hostvars[displaymux_inventory_hosts[lan_mouse_server_host]].ansible_host }}:{{ daemon_port }}"
+bind_address = "{{ hostvars[displaymux_controller_inventory_host].ansible_host }}:{{ daemon_port }}"
 tv_ip = "{{ tv_ip }}"
-server_host = "{{ lan_mouse_server_host }}"
+server_host = "controller"
 controller_token = "{{ lookup('ansible.builtin.file', lan_mouse_controller_token_file) | trim }}"
-client_key_path = "{{ effective_tv_multiview_client_key_path | default(tv_multiview_client_key_path) }}"
+client_key_path = "{{ effective_tv_multiview_client_key_path }}"
 
 [inputs]
-{% for host, input in tv_inputs.items() %}
-{{ host }} = "{{ input }}"
+{% for role in displaymux_host_roles if displaymux_inventory_hosts[role] in tv_inputs %}
+{{ role }} = "{{ tv_inputs[displaymux_inventory_hosts[role]] }}"
 {% endfor %}
 
 [wake_on_lan]
-mac = "{{ mac_mac_address }}"
-windows = "{{ windows_mac_address }}"
+{% for role in ['left', 'right'] if displaymux_inventory_hosts[role] in wake_on_lan %}
+{{ role }} = "{{ wake_on_lan[displaymux_inventory_hosts[role]] }}"
+{% endfor %}
 
 [timeouts]
 command_ms = {{ tv_multiview_command_timeout_ms }}

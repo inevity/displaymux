@@ -317,15 +317,15 @@
   ansible.builtin.lineinfile:
     path: /etc/hosts
     line: >-
-      {{ hostvars[displaymux_inventory_hosts[lan_mouse_server_host]].ansible_host }}
-      {{ displaymux_inventory_hosts[lan_mouse_server_host] }}
+      {{ hostvars[displaymux_controller_inventory_host].ansible_host }}
+      {{ displaymux_controller_inventory_host }}
     state: present
 
 - name: Deploy role-selected lan-mouse configuration on macOS
   ansible.builtin.template:
     src: >-
       {{ 'templates/hub-config.toml.j2'
-         if displaymux_host_role == lan_mouse_server_host
+         if displaymux_host_role == 'controller'
          else 'templates/spoke-config.toml.j2' }}
     dest: "{{ ansible_facts.env.HOME }}/.config/lan-mouse/config.toml"
     mode: "0600"
@@ -336,7 +336,7 @@
     path: "{{ ansible_facts.env.HOME }}/.config/tv-multiview"
     state: directory
     mode: "0700"
-  when: displaymux_host_role == lan_mouse_server_host
+  when: displaymux_host_role == 'controller'
 
 - name: Deploy selected macOS controller configuration
   ansible.builtin.template:
@@ -346,17 +346,17 @@
   vars:
     effective_tv_multiview_client_key_path: >-
       {{ (tv_multiview_client_key_paths | default({})).get(
-           displaymux_host_role,
+           inventory_hostname,
            ansible_facts.env.HOME ~ '/.config/lg-buddy/.aiopylgtv.sqlite'
          ) }}
   no_log: true
-  when: displaymux_host_role == lan_mouse_server_host
+  when: displaymux_host_role == 'controller'
 
 - name: Remove stale macOS controller configuration
   ansible.builtin.file:
     path: "{{ tv_multiview_config_path }}"
     state: absent
-  when: displaymux_host_role != lan_mouse_server_host
+  when: displaymux_host_role != 'controller'
 
 - name: Deploy bounded macOS log wrapper
   ansible.builtin.template:

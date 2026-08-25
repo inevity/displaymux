@@ -658,8 +658,7 @@ pub fn apply(
             next.observed_input = input;
             let active_target = next.active_request.as_ref().map(|request| request.target);
             let session_target = next.active_session.as_ref().map(|session| session.target);
-            let target_mismatch =
-                |target| mode != TvMode::Fullscreen || input != Some(target);
+            let target_mismatch = |target| mode != TvMode::Fullscreen || input != Some(target);
 
             // Distinct protocol phases intentionally converge on shared effects.
             #[allow(clippy::if_same_then_else)]
@@ -691,9 +690,8 @@ pub fn apply(
                     switch_epoch,
                 );
             } else if next.phase == ProtocolPhase::GrantPending
-                && active_target.is_some_and(|target| {
-                    next.has_display_route(target) && target_mismatch(target)
-                })
+                && active_target
+                    .is_some_and(|target| next.has_display_route(target) && target_mismatch(target))
             {
                 begin_fallback(
                     &mut next,
@@ -702,9 +700,9 @@ pub fn apply(
                     timing,
                     "unexpected_tv_subscription",
                 );
-            } else if session_target.is_some_and(|target| {
-                next.has_display_route(target) && target_mismatch(target)
-            }) {
+            } else if session_target
+                .is_some_and(|target| next.has_display_route(target) && target_mismatch(target))
+            {
                 begin_fallback(
                     &mut next,
                     &mut effects,
@@ -1226,13 +1224,13 @@ mod tests {
     }
 
     fn synchronized_with_limit(retained_request_limit: usize) -> ProtocolState {
-        let state = ProtocolState::new(Host::Linux, retained_request_limit);
+        let state = ProtocolState::new(Host::Controller, retained_request_limit);
         apply(
             &state,
             Event::TransportSynchronized {
                 mode: TvMode::Fullscreen,
-                input: Some(Host::Linux),
-                signals: signals(Host::Linux),
+                input: Some(Host::Controller),
+                signals: signals(Host::Controller),
             },
             1,
             TIMING,
@@ -1243,16 +1241,16 @@ mod tests {
 
     fn synchronized_without_windows_display() -> ProtocolState {
         let state = ProtocolState::with_display_hosts(
-            Host::Linux,
+            Host::Controller,
             32,
-            [Host::Linux, Host::Mac],
+            [Host::Controller, Host::Right],
         );
         apply(
             &state,
             Event::TransportSynchronized {
                 mode: TvMode::Fullscreen,
-                input: Some(Host::Linux),
-                signals: signals(Host::Linux),
+                input: Some(Host::Controller),
+                signals: signals(Host::Controller),
             },
             1,
             TIMING,
@@ -1265,7 +1263,7 @@ mod tests {
         EnterRequest {
             request_id: request_id.to_string(),
             client_id: "hub".to_string(),
-            target: Host::Mac,
+            target: Host::Right,
             request_epoch,
             lease: LeaseIdentity {
                 lease_id: format!("lease-{request_id}"),
@@ -1316,7 +1314,7 @@ mod tests {
             Event::CreateEnter {
                 request_id: "request-1".to_string(),
                 client_id: "hub".to_string(),
-                target: Host::Mac,
+                target: Host::Right,
                 lease: lease(11),
             },
             10,
@@ -1346,8 +1344,8 @@ mod tests {
             Event::Observation {
                 switch_epoch: verifying.switch_epoch,
                 mode: TvMode::Fullscreen,
-                input: Some(Host::Mac),
-                signals: signals(Host::Mac),
+                input: Some(Host::Right),
+                signals: signals(Host::Right),
             },
             20,
             TIMING,
@@ -1357,7 +1355,7 @@ mod tests {
     }
 
     fn remote_owned() -> ProtocolState {
-        let state = ready_peer(&synchronized(), Host::Mac, 11);
+        let state = ready_peer(&synchronized(), Host::Right, 11);
         let granted = grant_mac(&state);
         let request = granted.active_request.as_ref().unwrap();
         apply(
@@ -1378,9 +1376,9 @@ mod tests {
 
     #[test]
     fn startup_is_local_and_not_ready_until_server_is_observed() {
-        let state = ProtocolState::new(Host::Linux, 32);
-        assert_eq!(state.keyboard_owner, Host::Linux);
-        assert_eq!(state.pointer_owner, Host::Linux);
+        let state = ProtocolState::new(Host::Controller, 32);
+        assert_eq!(state.keyboard_owner, Host::Controller);
+        assert_eq!(state.pointer_owner, Host::Controller);
         assert!(state.fallback_required);
         assert!(!state.ready());
     }
@@ -1402,20 +1400,20 @@ mod tests {
         assert!(transition.effects.is_empty());
         assert_eq!(transition.next.phase, ProtocolPhase::Idle);
         assert_eq!(transition.next.observed_input, None);
-        assert_eq!(transition.next.keyboard_owner, Host::Linux);
-        assert_eq!(transition.next.pointer_owner, Host::Linux);
+        assert_eq!(transition.next.keyboard_owner, Host::Controller);
+        assert_eq!(transition.next.pointer_owner, Host::Controller);
         assert!(!transition.next.fallback_required);
     }
 
     #[test]
     fn peer_without_display_route_transfers_input_without_touching_tv() {
-        let state = ready_peer(&synchronized_without_windows_display(), Host::Windows, 11);
+        let state = ready_peer(&synchronized_without_windows_display(), Host::Left, 11);
         let prepared = apply(
             &state,
             Event::CreateEnter {
                 request_id: "request-windows".to_string(),
                 client_id: "hub".to_string(),
-                target: Host::Windows,
+                target: Host::Left,
                 lease: lease(11),
             },
             10,
@@ -1441,15 +1439,15 @@ mod tests {
         )
         .unwrap()
         .next;
-        assert_eq!(committed.keyboard_owner, Host::Windows);
-        assert_eq!(committed.pointer_owner, Host::Windows);
+        assert_eq!(committed.keyboard_owner, Host::Left);
+        assert_eq!(committed.pointer_owner, Host::Left);
         assert_eq!(committed.phase, ProtocolPhase::RemoteOwned);
         assert_eq!(committed.next_signal_poll_ms, None);
 
         let released = apply(
             &committed,
             Event::PeerReadinessUpdated {
-                host: Host::Windows,
+                host: Host::Left,
                 readiness: PeerReadiness::default(),
             },
             30,
@@ -1457,8 +1455,8 @@ mod tests {
         )
         .unwrap();
         assert!(released.effects.is_empty());
-        assert_eq!(released.next.keyboard_owner, Host::Linux);
-        assert_eq!(released.next.pointer_owner, Host::Linux);
+        assert_eq!(released.next.keyboard_owner, Host::Controller);
+        assert_eq!(released.next.pointer_owner, Host::Controller);
         assert_eq!(released.next.phase, ProtocolPhase::Idle);
         assert!(!released.next.fallback_required);
     }
@@ -1517,33 +1515,33 @@ mod tests {
 
     #[test]
     fn synchronized_manual_display_choice_is_not_overridden() {
-        let state = ProtocolState::new(Host::Linux, 32);
+        let state = ProtocolState::new(Host::Controller, 32);
         let transition = apply(
             &state,
             Event::TransportSynchronized {
                 mode: TvMode::Fullscreen,
-                input: Some(Host::Mac),
-                signals: signals(Host::Mac),
+                input: Some(Host::Right),
+                signals: signals(Host::Right),
             },
             1,
             TIMING,
         )
         .unwrap();
         assert_eq!(transition.next.commanded_input, None);
-        assert_eq!(transition.next.observed_input, Some(Host::Mac));
+        assert_eq!(transition.next.observed_input, Some(Host::Right));
         assert_eq!(transition.next.manual_recovery_target, None);
         assert!(transition.effects.is_empty());
         assert_eq!(transition.next.phase, ProtocolPhase::Idle);
         assert!(!transition.next.fallback_required);
-        assert_eq!(transition.next.keyboard_owner, Host::Linux);
-        assert_eq!(transition.next.pointer_owner, Host::Linux);
+        assert_eq!(transition.next.keyboard_owner, Host::Controller);
+        assert_eq!(transition.next.pointer_owner, Host::Controller);
     }
 
     #[test]
     fn partial_readiness_denies_before_tv_command() {
         let mut state = synchronized();
         state.peers.insert(
-            Host::Mac,
+            Host::Right,
             PeerReadiness {
                 online: true,
                 keyboard_ready: true,
@@ -1556,14 +1554,14 @@ mod tests {
         let request = denied.next.request("request-1").unwrap();
         assert_eq!(request.status, RequestStatus::Denied);
         assert_eq!(request.reason.as_deref(), Some("target_input_not_ready"));
-        assert_eq!(denied.next.manual_recovery_target, Some(Host::Mac));
+        assert_eq!(denied.next.manual_recovery_target, Some(Host::Right));
         assert_eq!(denied.next.commanded_input, None);
         assert!(denied.effects.is_empty());
     }
 
     #[test]
     fn failed_enter_arms_exact_manual_recovery_target_after_server_fallback() {
-        let state = ready_peer(&synchronized(), Host::Mac, 11);
+        let state = ready_peer(&synchronized(), Host::Right, 11);
         let switching = create_mac(&state).unwrap().next;
         let failed = apply(
             &switching,
@@ -1576,7 +1574,7 @@ mod tests {
         )
         .unwrap()
         .next;
-        assert_eq!(failed.manual_recovery_target, Some(Host::Mac));
+        assert_eq!(failed.manual_recovery_target, Some(Host::Right));
         assert!(failed.fallback_required);
 
         let verifying = acknowledge_switch(&failed, 12);
@@ -1585,8 +1583,8 @@ mod tests {
             Event::Observation {
                 switch_epoch: verifying.switch_epoch,
                 mode: TvMode::Fullscreen,
-                input: Some(Host::Linux),
-                signals: signals(Host::Linux),
+                input: Some(Host::Controller),
+                signals: signals(Host::Controller),
             },
             13,
             TIMING,
@@ -1595,13 +1593,13 @@ mod tests {
         .next;
         assert_eq!(recovered.phase, ProtocolPhase::Idle);
         assert!(!recovered.fallback_required);
-        assert_eq!(recovered.manual_recovery_target, Some(Host::Mac));
+        assert_eq!(recovered.manual_recovery_target, Some(Host::Right));
 
         let manual = apply(
             &recovered,
             Event::SubscriptionObserved {
                 mode: TvMode::Fullscreen,
-                input: Some(Host::Mac),
+                input: Some(Host::Right),
             },
             14,
             TIMING,
@@ -1610,14 +1608,14 @@ mod tests {
         assert!(manual.effects.is_empty());
         assert_eq!(manual.next.phase, ProtocolPhase::Idle);
         assert!(!manual.next.fallback_required);
-        assert_eq!(manual.next.observed_input, Some(Host::Mac));
-        assert_eq!(manual.next.keyboard_owner, Host::Linux);
-        assert_eq!(manual.next.pointer_owner, Host::Linux);
+        assert_eq!(manual.next.observed_input, Some(Host::Right));
+        assert_eq!(manual.next.keyboard_owner, Host::Controller);
+        assert_eq!(manual.next.pointer_owner, Host::Controller);
     }
 
     #[test]
     fn manual_display_selection_cancels_in_progress_server_fallback() {
-        let state = ready_peer(&synchronized(), Host::Mac, 11);
+        let state = ready_peer(&synchronized(), Host::Right, 11);
         let switching = create_mac(&state).unwrap().next;
         let fallback = apply(
             &switching,
@@ -1631,8 +1629,8 @@ mod tests {
         .unwrap()
         .next;
         assert_eq!(fallback.phase, ProtocolPhase::FallbackCommandPending);
-        assert_eq!(fallback.keyboard_owner, Host::Linux);
-        assert_eq!(fallback.pointer_owner, Host::Linux);
+        assert_eq!(fallback.keyboard_owner, Host::Controller);
+        assert_eq!(fallback.pointer_owner, Host::Controller);
         let stale_fallback_epoch = fallback.switch_epoch;
 
         let manual = apply(
@@ -1654,7 +1652,7 @@ mod tests {
             &manual.next,
             Event::CommandAcknowledged {
                 switch_epoch: stale_fallback_epoch,
-                target: Host::Linux,
+                target: Host::Controller,
             },
             13,
             TIMING,
@@ -1668,13 +1666,13 @@ mod tests {
     #[test]
     fn manual_display_choice_clears_stale_recovery_target() {
         let mut state = synchronized();
-        state.manual_recovery_target = Some(Host::Mac);
+        state.manual_recovery_target = Some(Host::Right);
 
         let wrong_target = apply(
             &state,
             Event::SubscriptionObserved {
                 mode: TvMode::Fullscreen,
-                input: Some(Host::Windows),
+                input: Some(Host::Left),
             },
             10,
             TIMING,
@@ -1684,14 +1682,14 @@ mod tests {
         assert_eq!(wrong_target.next.phase, ProtocolPhase::Idle);
         assert!(!wrong_target.next.fallback_required);
         assert_eq!(wrong_target.next.manual_recovery_target, None);
-        assert_eq!(wrong_target.next.keyboard_owner, Host::Linux);
-        assert_eq!(wrong_target.next.pointer_owner, Host::Linux);
+        assert_eq!(wrong_target.next.keyboard_owner, Host::Controller);
+        assert_eq!(wrong_target.next.pointer_owner, Host::Controller);
 
         let returned = apply(
             &wrong_target.next,
             Event::SubscriptionObserved {
                 mode: TvMode::Fullscreen,
-                input: Some(Host::Linux),
+                input: Some(Host::Controller),
             },
             10,
             TIMING,
@@ -1705,9 +1703,7 @@ mod tests {
         let state = synchronized();
         let armed = apply(
             &state,
-            Event::ArmManualRecovery {
-                target: Host::Windows,
-            },
+            Event::ArmManualRecovery { target: Host::Left },
             10,
             TIMING,
         )
@@ -1715,15 +1711,15 @@ mod tests {
 
         assert!(armed.effects.is_empty());
         assert_eq!(armed.next.phase, ProtocolPhase::Idle);
-        assert_eq!(armed.next.keyboard_owner, Host::Linux);
-        assert_eq!(armed.next.pointer_owner, Host::Linux);
-        assert_eq!(armed.next.manual_recovery_target, Some(Host::Windows));
+        assert_eq!(armed.next.keyboard_owner, Host::Controller);
+        assert_eq!(armed.next.pointer_owner, Host::Controller);
+        assert_eq!(armed.next.manual_recovery_target, Some(Host::Left));
 
         let manual = apply(
             &armed.next,
             Event::SubscriptionObserved {
                 mode: TvMode::Fullscreen,
-                input: Some(Host::Windows),
+                input: Some(Host::Left),
             },
             11,
             TIMING,
@@ -1737,9 +1733,7 @@ mod tests {
         assert_eq!(
             apply(
                 &remote,
-                Event::ArmManualRecovery {
-                    target: Host::Windows,
-                },
+                Event::ArmManualRecovery { target: Host::Left },
                 40,
                 TIMING,
             )
@@ -1750,7 +1744,7 @@ mod tests {
             apply(
                 &state,
                 Event::ArmManualRecovery {
-                    target: Host::Linux,
+                    target: Host::Controller,
                 },
                 10,
                 TIMING,
@@ -1762,15 +1756,15 @@ mod tests {
 
     #[test]
     fn create_keeps_both_owners_local_until_commit() {
-        let state = ready_peer(&synchronized(), Host::Mac, 11);
+        let state = ready_peer(&synchronized(), Host::Right, 11);
         let transition = create_mac(&state).unwrap();
-        assert_eq!(transition.next.keyboard_owner, Host::Linux);
-        assert_eq!(transition.next.pointer_owner, Host::Linux);
+        assert_eq!(transition.next.keyboard_owner, Host::Controller);
+        assert_eq!(transition.next.pointer_owner, Host::Controller);
         assert_eq!(transition.next.phase, ProtocolPhase::Switching);
         assert!(matches!(
             transition.effects.as_slice(),
             [Effect::SetInput {
-                target: Host::Mac,
+                target: Host::Right,
                 fallback: false,
                 ..
             }]
@@ -1779,7 +1773,7 @@ mod tests {
 
     #[test]
     fn stale_observation_cannot_issue_grant() {
-        let state = ready_peer(&synchronized(), Host::Mac, 11);
+        let state = ready_peer(&synchronized(), Host::Right, 11);
         let transition = create_mac(&state).unwrap();
         let epoch = transition.next.switch_epoch;
         let stale = apply(
@@ -1787,8 +1781,8 @@ mod tests {
             Event::Observation {
                 switch_epoch: epoch.saturating_sub(1),
                 mode: TvMode::Fullscreen,
-                input: Some(Host::Mac),
-                signals: signals(Host::Mac),
+                input: Some(Host::Right),
+                signals: signals(Host::Right),
             },
             20,
             TIMING,
@@ -1802,7 +1796,7 @@ mod tests {
 
     #[test]
     fn correct_observation_issues_grant_but_does_not_move_owners() {
-        let state = ready_peer(&synchronized(), Host::Mac, 11);
+        let state = ready_peer(&synchronized(), Host::Right, 11);
         let switching = create_mac(&state).unwrap().next;
         let verifying = acknowledge_switch(&switching, 11);
         let epoch = verifying.switch_epoch;
@@ -1811,8 +1805,8 @@ mod tests {
             Event::Observation {
                 switch_epoch: epoch,
                 mode: TvMode::Fullscreen,
-                input: Some(Host::Mac),
-                signals: signals(Host::Mac),
+                input: Some(Host::Right),
+                signals: signals(Host::Right),
             },
             20,
             TIMING,
@@ -1820,8 +1814,8 @@ mod tests {
         .unwrap()
         .next;
         assert_eq!(observed.phase, ProtocolPhase::GrantPending);
-        assert_eq!(observed.keyboard_owner, Host::Linux);
-        assert_eq!(observed.pointer_owner, Host::Linux);
+        assert_eq!(observed.keyboard_owner, Host::Controller);
+        assert_eq!(observed.pointer_owner, Host::Controller);
         assert_eq!(
             observed.active_request.as_ref().unwrap().status,
             RequestStatus::Grant
@@ -1830,21 +1824,21 @@ mod tests {
 
     #[test]
     fn expired_grant_restores_server_display_before_manual_recovery() {
-        let state = ready_peer(&synchronized(), Host::Mac, 11);
+        let state = ready_peer(&synchronized(), Host::Right, 11);
         let granted = grant_mac(&state);
         let deadline = granted.active_request.as_ref().unwrap().deadline_ms;
 
         let expired = apply(&granted, Event::Tick, deadline, TIMING).unwrap();
 
-        assert_eq!(expired.next.keyboard_owner, Host::Linux);
-        assert_eq!(expired.next.pointer_owner, Host::Linux);
-        assert_eq!(expired.next.manual_recovery_target, Some(Host::Mac));
+        assert_eq!(expired.next.keyboard_owner, Host::Controller);
+        assert_eq!(expired.next.pointer_owner, Host::Controller);
+        assert_eq!(expired.next.manual_recovery_target, Some(Host::Right));
         assert_eq!(expired.next.phase, ProtocolPhase::FallbackCommandPending);
         assert!(expired.next.fallback_required);
         assert!(matches!(
             expired.effects.as_slice(),
             [Effect::SetInput {
-                target: Host::Linux,
+                target: Host::Controller,
                 fallback: true,
                 ..
             }]
@@ -1856,7 +1850,7 @@ mod tests {
 
     #[test]
     fn transient_wrong_or_missing_target_signal_waits_for_convergence() {
-        let state = ready_peer(&synchronized(), Host::Mac, 11);
+        let state = ready_peer(&synchronized(), Host::Right, 11);
         let switching = create_mac(&state).unwrap().next;
         let verifying = acknowledge_switch(&switching, 11);
         let switch_epoch = verifying.switch_epoch;
@@ -1865,16 +1859,16 @@ mod tests {
             Event::Observation {
                 switch_epoch,
                 mode: TvMode::Fullscreen,
-                input: Some(Host::Mac),
-                signals: signals(Host::Linux),
+                input: Some(Host::Right),
+                signals: signals(Host::Controller),
             },
             20,
             TIMING,
         )
         .unwrap();
 
-        assert_eq!(pending.next.keyboard_owner, Host::Linux);
-        assert_eq!(pending.next.pointer_owner, Host::Linux);
+        assert_eq!(pending.next.keyboard_owner, Host::Controller);
+        assert_eq!(pending.next.pointer_owner, Host::Controller);
         assert_eq!(pending.next.phase, ProtocolPhase::Verifying);
         assert!(pending.next.active_request.is_some());
         assert!(!pending.next.fallback_required);
@@ -1883,7 +1877,7 @@ mod tests {
 
     #[test]
     fn target_subscription_reobserves_without_extending_deadline() {
-        let state = ready_peer(&synchronized(), Host::Mac, 11);
+        let state = ready_peer(&synchronized(), Host::Right, 11);
         let switching = create_mac(&state).unwrap().next;
         let verifying = acknowledge_switch(&switching, 11);
         let switch_epoch = verifying.switch_epoch;
@@ -1892,8 +1886,8 @@ mod tests {
             Event::Observation {
                 switch_epoch,
                 mode: TvMode::Fullscreen,
-                input: Some(Host::Linux),
-                signals: signals(Host::Linux),
+                input: Some(Host::Controller),
+                signals: signals(Host::Controller),
             },
             20,
             TIMING,
@@ -1906,7 +1900,7 @@ mod tests {
             &pending,
             Event::SubscriptionObserved {
                 mode: TvMode::Fullscreen,
-                input: Some(Host::Mac),
+                input: Some(Host::Right),
             },
             30,
             TIMING,
@@ -1926,7 +1920,7 @@ mod tests {
 
     #[test]
     fn transient_mismatch_falls_back_only_at_observation_deadline() {
-        let state = ready_peer(&synchronized(), Host::Mac, 11);
+        let state = ready_peer(&synchronized(), Host::Right, 11);
         let switching = create_mac(&state).unwrap().next;
         let verifying = acknowledge_switch(&switching, 11);
         let pending = apply(
@@ -1934,8 +1928,8 @@ mod tests {
             Event::Observation {
                 switch_epoch: verifying.switch_epoch,
                 mode: TvMode::Fullscreen,
-                input: Some(Host::Linux),
-                signals: signals(Host::Linux),
+                input: Some(Host::Controller),
+                signals: signals(Host::Controller),
             },
             20,
             TIMING,
@@ -1950,8 +1944,8 @@ mod tests {
             TIMING,
         )
         .unwrap();
-        assert_eq!(timed_out.next.keyboard_owner, Host::Linux);
-        assert_eq!(timed_out.next.pointer_owner, Host::Linux);
+        assert_eq!(timed_out.next.keyboard_owner, Host::Controller);
+        assert_eq!(timed_out.next.pointer_owner, Host::Controller);
         assert_eq!(
             timed_out.next.fallback_reason.as_deref(),
             Some("target_input_not_observed")
@@ -1960,7 +1954,7 @@ mod tests {
 
     #[test]
     fn target_signal_absence_is_reported_at_verification_deadline() {
-        let state = ready_peer(&synchronized(), Host::Mac, 11);
+        let state = ready_peer(&synchronized(), Host::Right, 11);
         let switching = create_mac(&state).unwrap().next;
         let verifying = acknowledge_switch(&switching, 11);
         let pending = apply(
@@ -1968,8 +1962,8 @@ mod tests {
             Event::Observation {
                 switch_epoch: verifying.switch_epoch,
                 mode: TvMode::Fullscreen,
-                input: Some(Host::Mac),
-                signals: signals(Host::Linux),
+                input: Some(Host::Right),
+                signals: signals(Host::Controller),
             },
             20,
             TIMING,
@@ -1989,20 +1983,20 @@ mod tests {
             timed_out.next.fallback_reason.as_deref(),
             Some("target_signal_absent")
         );
-        assert_eq!(timed_out.next.keyboard_owner, Host::Linux);
-        assert_eq!(timed_out.next.pointer_owner, Host::Linux);
+        assert_eq!(timed_out.next.keyboard_owner, Host::Controller);
+        assert_eq!(timed_out.next.pointer_owner, Host::Controller);
     }
 
     #[test]
     fn duplicate_command_ack_does_not_queue_second_observation() {
-        let state = ready_peer(&synchronized(), Host::Mac, 11);
+        let state = ready_peer(&synchronized(), Host::Right, 11);
         let switching = create_mac(&state).unwrap().next;
         let switch_epoch = switching.switch_epoch;
         let acknowledged = apply(
             &switching,
             Event::CommandAcknowledged {
                 switch_epoch,
-                target: Host::Mac,
+                target: Host::Right,
             },
             11,
             TIMING,
@@ -2015,7 +2009,7 @@ mod tests {
             &acknowledged.next,
             Event::CommandAcknowledged {
                 switch_epoch,
-                target: Host::Mac,
+                target: Host::Right,
             },
             12,
             TIMING,
@@ -2028,7 +2022,7 @@ mod tests {
 
     #[test]
     fn duplicate_valid_observation_does_not_regenerate_grant() {
-        let state = ready_peer(&synchronized(), Host::Mac, 11);
+        let state = ready_peer(&synchronized(), Host::Right, 11);
         let switching = create_mac(&state).unwrap().next;
         let verifying = acknowledge_switch(&switching, 11);
         let switch_epoch = verifying.switch_epoch;
@@ -2037,8 +2031,8 @@ mod tests {
             Event::Observation {
                 switch_epoch,
                 mode: TvMode::Fullscreen,
-                input: Some(Host::Mac),
-                signals: signals(Host::Mac),
+                input: Some(Host::Right),
+                signals: signals(Host::Right),
             },
             20,
             TIMING,
@@ -2047,15 +2041,15 @@ mod tests {
         .next;
         let grant = observed.active_request.as_ref().unwrap().grant.clone();
         let grant_epoch = observed.grant_epoch;
-        assert_eq!(observed.switch_count[&Host::Mac], 1);
+        assert_eq!(observed.switch_count[&Host::Right], 1);
 
         let duplicate = apply(
             &observed,
             Event::Observation {
                 switch_epoch,
                 mode: TvMode::Fullscreen,
-                input: Some(Host::Mac),
-                signals: signals(Host::Mac),
+                input: Some(Host::Right),
+                signals: signals(Host::Right),
             },
             21,
             TIMING,
@@ -2064,12 +2058,12 @@ mod tests {
         assert!(duplicate.effects.is_empty());
         assert_eq!(duplicate.next.grant_epoch, grant_epoch);
         assert_eq!(duplicate.next.active_request.as_ref().unwrap().grant, grant);
-        assert_eq!(duplicate.next.switch_count[&Host::Mac], 1);
+        assert_eq!(duplicate.next.switch_count[&Host::Right], 1);
     }
 
     #[test]
     fn commit_moves_keyboard_and_pointer_atomically() {
-        let state = ready_peer(&synchronized(), Host::Mac, 11);
+        let state = ready_peer(&synchronized(), Host::Right, 11);
         let granted = grant_mac(&state);
         let request = granted.active_request.as_ref().unwrap();
         let committed = apply(
@@ -2086,15 +2080,15 @@ mod tests {
         )
         .unwrap()
         .next;
-        assert_eq!(committed.keyboard_owner, Host::Mac);
-        assert_eq!(committed.pointer_owner, Host::Mac);
+        assert_eq!(committed.keyboard_owner, Host::Right);
+        assert_eq!(committed.pointer_owner, Host::Right);
         assert_eq!(committed.phase, ProtocolPhase::RemoteOwned);
         committed.validate(30).unwrap();
     }
 
     #[test]
     fn cancelling_committed_session_releases_input_and_is_idempotent() {
-        let state = ready_peer(&synchronized(), Host::Mac, 11);
+        let state = ready_peer(&synchronized(), Host::Right, 11);
         let granted = grant_mac(&state);
         let request = granted.active_request.as_ref().unwrap();
         let committed = apply(
@@ -2122,8 +2116,8 @@ mod tests {
             TIMING,
         )
         .unwrap();
-        assert_eq!(cancelled.next.keyboard_owner, Host::Linux);
-        assert_eq!(cancelled.next.pointer_owner, Host::Linux);
+        assert_eq!(cancelled.next.keyboard_owner, Host::Controller);
+        assert_eq!(cancelled.next.pointer_owner, Host::Controller);
         assert!(cancelled.next.active_session.is_none());
         assert_eq!(
             cancelled.next.request_history.back().unwrap().status,
@@ -2132,7 +2126,7 @@ mod tests {
         assert!(matches!(
             cancelled.effects.as_slice(),
             [Effect::SetInput {
-                target: Host::Linux,
+                target: Host::Controller,
                 fallback: true,
                 ..
             }]
@@ -2159,7 +2153,7 @@ mod tests {
         let fallback = apply(
             &remote,
             Event::PeerReadinessUpdated {
-                host: Host::Mac,
+                host: Host::Right,
                 readiness: PeerReadiness::default(),
             },
             40,
@@ -2188,24 +2182,24 @@ mod tests {
 
     #[test]
     fn readiness_loss_before_commit_revokes_grant_and_falls_back() {
-        let state = ready_peer(&synchronized(), Host::Mac, 11);
+        let state = ready_peer(&synchronized(), Host::Right, 11);
         let granted = grant_mac(&state);
         let lost = apply(
             &granted,
             Event::PeerReadinessUpdated {
-                host: Host::Mac,
+                host: Host::Right,
                 readiness: PeerReadiness::default(),
             },
             21,
             TIMING,
         )
         .unwrap();
-        assert_eq!(lost.next.keyboard_owner, Host::Linux);
+        assert_eq!(lost.next.keyboard_owner, Host::Controller);
         assert!(lost.next.fallback_required);
         assert!(matches!(
             lost.effects.as_slice(),
             [Effect::SetInput {
-                target: Host::Linux,
+                target: Host::Controller,
                 fallback: true,
                 ..
             }]
@@ -2214,7 +2208,7 @@ mod tests {
 
     #[test]
     fn disconnect_while_remote_owned_releases_input_before_reconnect() {
-        let state = ready_peer(&synchronized(), Host::Mac, 11);
+        let state = ready_peer(&synchronized(), Host::Right, 11);
         let granted = grant_mac(&state);
         let request = granted.active_request.as_ref().unwrap();
         let remote = apply(
@@ -2240,8 +2234,8 @@ mod tests {
             TIMING,
         )
         .unwrap();
-        assert_eq!(disconnected.next.keyboard_owner, Host::Linux);
-        assert_eq!(disconnected.next.pointer_owner, Host::Linux);
+        assert_eq!(disconnected.next.keyboard_owner, Host::Controller);
+        assert_eq!(disconnected.next.pointer_owner, Host::Controller);
         assert_eq!(disconnected.next.phase, ProtocolPhase::FallbackDeferred);
         assert!(disconnected.effects.is_empty());
     }
@@ -2255,7 +2249,7 @@ mod tests {
         assert!(matches!(
             transition.effects.as_slice(),
             [Effect::Wake {
-                target: Host::Mac,
+                target: Host::Right,
                 ..
             }]
         ));
@@ -2263,7 +2257,7 @@ mod tests {
 
     #[test]
     fn command_failure_releases_locally_and_starts_verified_fallback() {
-        let state = ready_peer(&synchronized(), Host::Mac, 11);
+        let state = ready_peer(&synchronized(), Host::Right, 11);
         let switching = create_mac(&state).unwrap().next;
         let failed = apply(
             &switching,
@@ -2276,13 +2270,13 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(failed.next.keyboard_owner, Host::Linux);
-        assert_eq!(failed.next.pointer_owner, Host::Linux);
+        assert_eq!(failed.next.keyboard_owner, Host::Controller);
+        assert_eq!(failed.next.pointer_owner, Host::Controller);
         assert_eq!(failed.next.phase, ProtocolPhase::FallbackCommandPending);
         assert!(matches!(
             failed.effects.as_slice(),
             [Effect::SetInput {
-                target: Host::Linux,
+                target: Host::Controller,
                 fallback: true,
                 ..
             }]
@@ -2326,8 +2320,8 @@ mod tests {
         let deadline = remote.active_session.as_ref().unwrap().renewed_until_ms;
         let expired = apply(&remote, Event::Tick, deadline, TIMING).unwrap();
 
-        assert_eq!(expired.next.keyboard_owner, Host::Linux);
-        assert_eq!(expired.next.pointer_owner, Host::Linux);
+        assert_eq!(expired.next.keyboard_owner, Host::Controller);
+        assert_eq!(expired.next.pointer_owner, Host::Controller);
         assert!(expired.next.active_session.is_none());
         assert_eq!(
             expired.next.fallback_reason.as_deref(),
@@ -2336,7 +2330,7 @@ mod tests {
         assert!(matches!(
             expired.effects.as_slice(),
             [Effect::SetInput {
-                target: Host::Linux,
+                target: Host::Controller,
                 fallback: true,
                 ..
             }]
@@ -2376,7 +2370,7 @@ mod tests {
             TIMING,
         )
         .unwrap();
-        assert_eq!(timed_out.next.keyboard_owner, Host::Linux);
+        assert_eq!(timed_out.next.keyboard_owner, Host::Controller);
         assert_eq!(
             timed_out.next.fallback_reason.as_deref(),
             Some("observation_timeout")
@@ -2399,7 +2393,7 @@ mod tests {
             TIMING,
         )
         .unwrap();
-        assert_eq!(invalid_renewal.next.keyboard_owner, Host::Linux);
+        assert_eq!(invalid_renewal.next.keyboard_owner, Host::Controller);
         assert_eq!(
             invalid_renewal.next.fallback_reason.as_deref(),
             Some("lease_renewal_rejected")
@@ -2408,14 +2402,14 @@ mod tests {
         let readiness_lost = apply(
             &remote,
             Event::PeerReadinessUpdated {
-                host: Host::Mac,
+                host: Host::Right,
                 readiness: PeerReadiness::default(),
             },
             40,
             TIMING,
         )
         .unwrap();
-        assert_eq!(readiness_lost.next.keyboard_owner, Host::Linux);
+        assert_eq!(readiness_lost.next.keyboard_owner, Host::Controller);
         assert_eq!(
             readiness_lost.next.fallback_reason.as_deref(),
             Some("active_peer_readiness_lost")
@@ -2428,7 +2422,7 @@ mod tests {
         let failed = apply(
             &remote,
             Event::PeerReadinessUpdated {
-                host: Host::Mac,
+                host: Host::Right,
                 readiness: PeerReadiness::default(),
             },
             40,
@@ -2437,9 +2431,9 @@ mod tests {
         .unwrap()
         .next;
 
-        assert_eq!(failed.keyboard_owner, Host::Linux);
-        assert_eq!(failed.pointer_owner, Host::Linux);
-        assert_eq!(failed.manual_recovery_target, Some(Host::Mac));
+        assert_eq!(failed.keyboard_owner, Host::Controller);
+        assert_eq!(failed.pointer_owner, Host::Controller);
+        assert_eq!(failed.manual_recovery_target, Some(Host::Right));
         assert_eq!(
             failed.fallback_reason.as_deref(),
             Some("active_peer_readiness_lost")
@@ -2451,8 +2445,8 @@ mod tests {
             Event::Observation {
                 switch_epoch: verifying.switch_epoch,
                 mode: TvMode::Fullscreen,
-                input: Some(Host::Linux),
-                signals: signals(Host::Linux),
+                input: Some(Host::Controller),
+                signals: signals(Host::Controller),
             },
             42,
             TIMING,
@@ -2461,13 +2455,13 @@ mod tests {
         .next;
         assert_eq!(recovered.phase, ProtocolPhase::Idle);
         assert!(!recovered.fallback_required);
-        assert_eq!(recovered.manual_recovery_target, Some(Host::Mac));
+        assert_eq!(recovered.manual_recovery_target, Some(Host::Right));
 
         let manual = apply(
             &recovered,
             Event::SubscriptionObserved {
                 mode: TvMode::Fullscreen,
-                input: Some(Host::Mac),
+                input: Some(Host::Right),
             },
             43,
             TIMING,
@@ -2476,9 +2470,9 @@ mod tests {
         assert!(manual.effects.is_empty());
         assert_eq!(manual.next.phase, ProtocolPhase::Idle);
         assert!(!manual.next.fallback_required);
-        assert_eq!(manual.next.observed_input, Some(Host::Mac));
-        assert_eq!(manual.next.keyboard_owner, Host::Linux);
-        assert_eq!(manual.next.pointer_owner, Host::Linux);
+        assert_eq!(manual.next.observed_input, Some(Host::Right));
+        assert_eq!(manual.next.keyboard_owner, Host::Controller);
+        assert_eq!(manual.next.pointer_owner, Host::Controller);
     }
 
     #[test]
@@ -2495,7 +2489,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(changed.next.keyboard_owner, Host::Linux);
+        assert_eq!(changed.next.keyboard_owner, Host::Controller);
         assert_eq!(changed.next.manual_recovery_target, None);
         assert_eq!(
             changed.next.fallback_reason.as_deref(),
@@ -2510,15 +2504,15 @@ mod tests {
             &remote,
             Event::SubscriptionObserved {
                 mode: TvMode::Fullscreen,
-                input: Some(Host::Windows),
+                input: Some(Host::Left),
             },
             40,
             TIMING,
         )
         .unwrap();
 
-        assert_eq!(changed.next.keyboard_owner, Host::Linux);
-        assert_eq!(changed.next.pointer_owner, Host::Linux);
+        assert_eq!(changed.next.keyboard_owner, Host::Controller);
+        assert_eq!(changed.next.pointer_owner, Host::Controller);
         assert_eq!(
             changed.next.fallback_reason.as_deref(),
             Some("unexpected_tv_subscription")
@@ -2526,7 +2520,7 @@ mod tests {
         assert!(matches!(
             changed.effects.as_slice(),
             [Effect::SetInput {
-                target: Host::Linux,
+                target: Host::Controller,
                 fallback: true,
                 ..
             }]
@@ -2535,7 +2529,7 @@ mod tests {
 
     #[test]
     fn unexpected_subscription_while_grant_pending_revokes_grant() {
-        let state = ready_peer(&synchronized(), Host::Mac, 11);
+        let state = ready_peer(&synchronized(), Host::Right, 11);
         let granted = grant_mac(&state);
         assert_eq!(granted.phase, ProtocolPhase::GrantPending);
 
@@ -2549,7 +2543,7 @@ mod tests {
             TIMING,
         )
         .unwrap();
-        assert_eq!(changed.next.keyboard_owner, Host::Linux);
+        assert_eq!(changed.next.keyboard_owner, Host::Controller);
         assert!(changed.next.active_request.is_none());
         assert_eq!(
             changed.next.fallback_reason.as_deref(),
@@ -2559,7 +2553,7 @@ mod tests {
 
     #[test]
     fn transport_disconnect_during_fallback_remains_local_and_deferred() {
-        let state = ready_peer(&synchronized(), Host::Mac, 11);
+        let state = ready_peer(&synchronized(), Host::Right, 11);
         let switching = create_mac(&state).unwrap().next;
         let fallback = apply(
             &switching,
@@ -2582,8 +2576,8 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(disconnected.next.keyboard_owner, Host::Linux);
-        assert_eq!(disconnected.next.pointer_owner, Host::Linux);
+        assert_eq!(disconnected.next.keyboard_owner, Host::Controller);
+        assert_eq!(disconnected.next.pointer_owner, Host::Controller);
         assert_eq!(disconnected.next.phase, ProtocolPhase::FallbackDeferred);
         assert!(disconnected.effects.is_empty());
     }
@@ -2622,8 +2616,8 @@ mod tests {
             Event::Observation {
                 switch_epoch,
                 mode: TvMode::Multiview,
-                input: Some(Host::Linux),
-                signals: signals(Host::Linux),
+                input: Some(Host::Controller),
+                signals: signals(Host::Controller),
             },
             12,
             TIMING,
@@ -2656,8 +2650,8 @@ mod tests {
             Event::Observation {
                 switch_epoch: off_epoch,
                 mode: TvMode::Fullscreen,
-                input: Some(Host::Linux),
-                signals: signals(Host::Linux),
+                input: Some(Host::Controller),
+                signals: signals(Host::Controller),
             },
             22,
             TIMING,
@@ -2667,7 +2661,7 @@ mod tests {
         assert!(matches!(
             observed.effects.as_slice(),
             [Effect::SetInput {
-                target: Host::Linux,
+                target: Host::Controller,
                 fallback: true,
                 ..
             }]
@@ -2679,8 +2673,8 @@ mod tests {
         let remote = remote_owned();
         let shutdown = apply(&remote, Event::Shutdown, 40, TIMING).unwrap();
 
-        assert_eq!(shutdown.next.keyboard_owner, Host::Linux);
-        assert_eq!(shutdown.next.pointer_owner, Host::Linux);
+        assert_eq!(shutdown.next.keyboard_owner, Host::Controller);
+        assert_eq!(shutdown.next.pointer_owner, Host::Controller);
         assert_eq!(shutdown.next.phase, ProtocolPhase::FallbackDeferred);
         assert!(shutdown.next.active_session.is_none());
         assert!(shutdown.effects.is_empty());

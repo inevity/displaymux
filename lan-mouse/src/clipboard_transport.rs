@@ -848,23 +848,21 @@ mod tests {
         let fingerprint = "00:01:02:03:04:05:06:07:08:09:0a:0b:0c:0d:0e:0f:10:11:12:13:14:15:16:17:18:19:1a:1b:1c:1d:1e:1f";
         let authorized = HashMap::from([(fingerprint.to_string(), "win-desktop".to_string())]);
 
-        let (peers, authorized_peers) = configured_peers(
-            vec![client("win-desktop", SwitchHost::Windows)],
-            &authorized,
-        );
+        let (peers, authorized_peers) =
+            configured_peers(vec![client("win-desktop", SwitchHost::Left)], &authorized);
 
         assert_eq!(peers.len(), 1);
-        assert_eq!(peers[0].host_id, HostId::from("windows"));
+        assert_eq!(peers[0].host_id, HostId::from("left"));
         assert_eq!(
             authorized_peers.host_for(CertificateFingerprint::parse(fingerprint).unwrap()),
-            Some(HostId::from("windows"))
+            Some(HostId::from("left"))
         );
     }
 
     #[test]
     fn unmatched_fingerprint_is_not_authorized_for_clipboard() {
         let (peers, authorized_peers) = configured_peers(
-            vec![client("win-desktop", SwitchHost::Windows)],
+            vec![client("win-desktop", SwitchHost::Left)],
             &HashMap::new(),
         );
 

@@ -307,8 +307,9 @@ passed Linux, macOS, and Windows native tests and builds, installed it on all
 three hosts, and restarted only the managed services. macOS used its configured
 debug profile and Windows used release. The two spoke task sequences executed
 in parallel under one Ansible process. Each target binary contains its native
-notification backend; `lan_mouse_server_host` selects the emitting instance
-without an external notification executable.
+notification backend; the `controller` entry in
+`displaymux_host_assignments` selects the emitting instance without an external
+notification executable.
 
 Owner: main plan.
 

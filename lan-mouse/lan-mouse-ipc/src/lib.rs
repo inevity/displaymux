@@ -131,17 +131,17 @@ impl TryFrom<&str> for Position {
 #[derive(Debug, Eq, PartialEq, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SwitchHost {
-    Linux,
-    Mac,
-    Windows,
+    Controller,
+    Right,
+    Left,
 }
 
 impl std::fmt::Display for SwitchHost {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
-            Self::Linux => "linux",
-            Self::Mac => "mac",
-            Self::Windows => "windows",
+            Self::Controller => "controller",
+            Self::Right => "right",
+            Self::Left => "left",
         })
     }
 }
@@ -151,9 +151,9 @@ impl std::str::FromStr for SwitchHost {
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value {
-            "linux" => Ok(Self::Linux),
-            "mac" => Ok(Self::Mac),
-            "windows" => Ok(Self::Windows),
+            "controller" => Ok(Self::Controller),
+            "right" => Ok(Self::Right),
+            "left" => Ok(Self::Left),
             _ => Err(format!("unknown switch host: {value}")),
         }
     }

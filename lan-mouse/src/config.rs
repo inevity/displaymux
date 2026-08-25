@@ -801,8 +801,8 @@ mod tests {
         SwitchControllerToml {
             url: "http://127.0.0.1:9876".to_string(),
             token: "test-token".to_string(),
-            local_host: SwitchHost::Linux,
-            server_host: SwitchHost::Linux,
+            local_host: SwitchHost::Controller,
+            server_host: SwitchHost::Controller,
             http_timeout_ms: 500,
             request_timeout_ms: 2_000,
             poll_interval_ms: 100,
@@ -817,7 +817,7 @@ mod tests {
         let controller = SwitchControllerConfig::try_from(controller_toml()).unwrap();
 
         assert_eq!(controller.url.as_str(), "http://127.0.0.1:9876/");
-        assert_eq!(controller.server_host, SwitchHost::Linux);
+        assert_eq!(controller.server_host, SwitchHost::Controller);
     }
 
     #[test]

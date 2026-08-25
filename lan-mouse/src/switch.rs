@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
-const PROTOCOL_VERSION: u16 = 1;
+const PROTOCOL_VERSION: u16 = 2;
 // Controller responses contain one state record. Capping them prevents a
 // broken or unauthenticated endpoint from turning control traffic into an
 // unbounded allocation.
@@ -1095,7 +1095,7 @@ mod tests {
     fn edge_key(handle: ClientHandle, session_epoch: u64) -> EdgeIntentKey {
         EdgeIntentKey {
             handle,
-            target: SwitchHost::Mac,
+            target: SwitchHost::Right,
             peer_session_epoch: session_epoch,
         }
     }
@@ -1168,7 +1168,7 @@ mod tests {
         manager
             .reserve(
                 4,
-                SwitchHost::Windows,
+                SwitchHost::Left,
                 "request-1".to_string(),
                 "lease-1".to_string(),
                 22,
@@ -1192,7 +1192,7 @@ mod tests {
 
         let result = manager.reserve(
             4,
-            SwitchHost::Windows,
+            SwitchHost::Left,
             "request-1".to_string(),
             "lease-1".to_string(),
             22,
@@ -1212,7 +1212,7 @@ mod tests {
 
         let result = manager.reserve(
             5,
-            SwitchHost::Mac,
+            SwitchHost::Right,
             "request-2".to_string(),
             "lease-2".to_string(),
             31,
@@ -1378,11 +1378,11 @@ mod tests {
     #[test]
     fn parses_versioned_grant_envelope() {
         let envelope: ApiEnvelope<RemoteEnterRequest> = serde_json::from_value(serde_json::json!({
-            "protocol_version": 1,
+            "protocol_version": 2,
             "server_now_ms": 1000,
             "data": {
                 "request_id": "request-1",
-                "target": "windows",
+                "target": "left",
                 "request_epoch": 7,
                 "lease": {
                     "lease_id": "lease-1",
@@ -1401,7 +1401,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(envelope.protocol_version, PROTOCOL_VERSION);
-        assert_eq!(envelope.data.target, SwitchHost::Windows);
+        assert_eq!(envelope.data.target, SwitchHost::Left);
         assert_eq!(envelope.data.grant.unwrap().grant_epoch, 9);
     }
 
@@ -1409,10 +1409,10 @@ mod tests {
     async fn native_controller_runs_fenced_request_lifecycle() {
         let responses = vec![
             json!({
-                "protocol_version": 1,
+                "protocol_version": 2,
                 "server_now_ms": 1_000,
                 "data": {
-                    "host": "windows",
+                    "host": "left",
                     "readiness": {
                         "online": true,
                         "keyboard_ready": true,
@@ -1424,7 +1424,7 @@ mod tests {
             enter_envelope("grant", 5_000, Some(4_000)),
             enter_envelope("committed", 6_000, Some(4_000)),
             json!({
-                "protocol_version": 1,
+                "protocol_version": 2,
                 "server_now_ms": 1_000,
                 "data": {
                     "renewed": true,
@@ -1438,8 +1438,8 @@ mod tests {
         let controller = SwitchController::new(SwitchControllerConfig {
             url: base_url,
             token: "test-token".to_string(),
-            local_host: SwitchHost::Linux,
-            server_host: SwitchHost::Linux,
+            local_host: SwitchHost::Controller,
+            server_host: SwitchHost::Controller,
             http_timeout_ms: 1_000,
             request_timeout_ms: 2_000,
             poll_interval_ms: 10,
@@ -1450,7 +1450,7 @@ mod tests {
         .unwrap();
         let context = GateContext {
             handle: 4,
-            target: SwitchHost::Windows,
+            target: SwitchHost::Left,
             lease: LeaseIdentity {
                 request_id: "request-1".to_string(),
                 lease_id: "lease-1".to_string(),
@@ -1498,8 +1498,8 @@ mod tests {
         assert_eq!(
             request_lines,
             [
-                "POST /internal/readiness/windows HTTP/1.1",
-                "POST /enter/windows HTTP/1.1",
+                "POST /internal/readiness/left HTTP/1.1",
+                "POST /enter/left HTTP/1.1",
                 "POST /enter/request/request-1/commit HTTP/1.1",
                 "POST /internal/enter/request/request-1/renew HTTP/1.1",
                 "POST /internal/enter/request/request-1/cancel HTTP/1.1",
@@ -1519,10 +1519,10 @@ mod tests {
     #[tokio::test]
     async fn manual_recovery_uses_target_scoped_internal_endpoint() {
         let responses = vec![json!({
-            "protocol_version": 1,
+            "protocol_version": 2,
             "server_now_ms": 1_000,
             "data": {
-                "target": "windows",
+                "target": "left",
                 "armed": true
             }
         })];
@@ -1530,8 +1530,8 @@ mod tests {
         let controller = SwitchController::new(SwitchControllerConfig {
             url: base_url,
             token: "test-token".to_string(),
-            local_host: SwitchHost::Linux,
-            server_host: SwitchHost::Linux,
+            local_host: SwitchHost::Controller,
+            server_host: SwitchHost::Controller,
             http_timeout_ms: 1_000,
             request_timeout_ms: 2_000,
             poll_interval_ms: 10,
@@ -1542,14 +1542,14 @@ mod tests {
         .unwrap();
 
         controller
-            .arm_manual_recovery(SwitchHost::Windows, &CancellationToken::new())
+            .arm_manual_recovery(SwitchHost::Left, &CancellationToken::new())
             .await
             .unwrap();
 
         let requests = server.await.unwrap();
         assert_eq!(
             requests[0].lines().next().unwrap(),
-            "POST /internal/manual-recovery/windows HTTP/1.1"
+            "POST /internal/manual-recovery/left HTTP/1.1"
         );
         assert!(
             requests[0]
@@ -1560,11 +1560,11 @@ mod tests {
 
     fn enter_envelope(status: &str, lease_expires_at_ms: u64, grant: Option<u64>) -> Value {
         json!({
-            "protocol_version": 1,
+            "protocol_version": 2,
             "server_now_ms": 1_000,
             "data": {
                 "request_id": "request-1",
-                "target": "windows",
+                "target": "left",
                 "request_epoch": 7,
                 "lease": {
                     "lease_id": "lease-1",
