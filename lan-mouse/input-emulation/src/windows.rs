@@ -38,9 +38,33 @@ const DEFAULT_REPEAT_INTERVAL: Duration = Duration::from_millis(32);
 
 pub(crate) struct WindowsEmulation {
     display_selector: Option<String>,
+    pointer_motion: PointerMotionAccumulator,
     repeat_task: Option<AbortHandle>,
     error_tx: mpsc::Sender<EmulationError>,
     error_rx: mpsc::Receiver<EmulationError>,
+}
+
+#[derive(Default)]
+struct PointerMotionAccumulator {
+    residual_x: f64,
+    residual_y: f64,
+}
+
+impl PointerMotionAccumulator {
+    fn accumulate(&mut self, dx: f64, dy: f64) -> (i32, i32) {
+        self.residual_x += dx;
+        self.residual_y += dy;
+
+        let whole_x = self.residual_x.trunc() as i32;
+        let whole_y = self.residual_y.trunc() as i32;
+        self.residual_x -= whole_x as f64;
+        self.residual_y -= whole_y as f64;
+        (whole_x, whole_y)
+    }
+
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
 }
 
 impl WindowsEmulation {
@@ -51,6 +75,7 @@ impl WindowsEmulation {
         let (error_tx, error_rx) = mpsc::channel(1);
         Ok(Self {
             display_selector: display_selector.map(ToOwned::to_owned),
+            pointer_motion: PointerMotionAccumulator::default(),
             repeat_task: None,
             error_tx,
             error_rx,
@@ -64,7 +89,10 @@ impl Emulation for WindowsEmulation {
         match event {
             Event::Pointer(pointer_event) => match pointer_event {
                 PointerEvent::Motion { time: _, dx, dy } => {
-                    rel_mouse(dx as i32, dy as i32)?;
+                    let (dx, dy) = self.pointer_motion.accumulate(dx, dy);
+                    if dx != 0 || dy != 0 {
+                        rel_mouse(dx, dy)?;
+                    }
                 }
                 PointerEvent::Button {
                     time: _,
@@ -100,14 +128,19 @@ impl Emulation for WindowsEmulation {
 
     async fn create(&mut self, _handle: EmulationHandle) {}
 
-    async fn destroy(&mut self, _handle: EmulationHandle) {}
+    async fn destroy(&mut self, _handle: EmulationHandle) {
+        self.pointer_motion.reset();
+    }
 
-    async fn terminate(&mut self) {}
+    async fn terminate(&mut self) {
+        self.pointer_motion.reset();
+    }
 
     fn center_pointer(&mut self, _handle: EmulationHandle) -> Result<(), EmulationError> {
         let rect = resolve_display_rect(self.display_selector.as_deref())?;
         let center = rect_center(rect);
         unsafe { SetCursorPos(center.x, center.y) }.map_err(windows_io_error)?;
+        self.pointer_motion.reset();
         Ok(())
     }
 
@@ -435,6 +468,28 @@ mod tests {
         });
 
         assert_eq!(center, POINT { x: -960, y: 540 });
+    }
+
+    #[test]
+    fn fractional_pointer_motion_is_preserved_across_samples() {
+        let mut motion = PointerMotionAccumulator::default();
+
+        assert_eq!(motion.accumulate(0.4, -0.4), (0, 0));
+        assert_eq!(motion.accumulate(0.4, -0.4), (0, 0));
+        assert_eq!(motion.accumulate(0.4, -0.4), (1, -1));
+        assert!((motion.residual_x - 0.2).abs() < f64::EPSILON * 4.0);
+        assert!((motion.residual_y + 0.2).abs() < f64::EPSILON * 4.0);
+    }
+
+    #[test]
+    fn pointer_motion_reset_discards_only_cross_session_residual() {
+        let mut motion = PointerMotionAccumulator::default();
+        assert_eq!(motion.accumulate(0.75, 0.0), (0, 0));
+
+        motion.reset();
+
+        assert_eq!(motion.accumulate(0.5, 0.0), (0, 0));
+        assert_eq!(motion.accumulate(0.5, 0.0), (1, 0));
     }
 
     #[test]
