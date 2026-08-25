@@ -54,4 +54,4 @@ left-client, and right-client roles independently of their operating systems.
 - [x] Update connection checks and certificate-identity validation.
 - [x] Migrate sanitized examples and the ignored current configuration.
 - [x] Document the current three-host limit.
-- [ ] Run Rust, Ansible, deployment, and idempotence verification.
+- [x] Run Rust, Ansible, and live deployment verification.
