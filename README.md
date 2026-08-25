@@ -2,7 +2,7 @@
 
 Osswitch coordinates keyboard, pointer, clipboard, and a shared LG WebOS
 display as one host-switch transaction. It combines a generalized Lan Mouse
-fork with a TV controller daemon and native deployment automation.
+fork with a display-controller daemon and native deployment automation.
 
 ## Capabilities
 
@@ -52,9 +52,9 @@ automatic fallback while resolving an active switch transaction.
   implementation plans, and formal safety/liveness models.
 
 Lan Mouse talks to `tv-multiview` through its authenticated HTTP controller
-client. Only `tv-multiview` talks LG SSAP to the TV. Input ownership remains on
-the configured Lan Mouse server until the controller verifies the display and
-remote-input readiness transition.
+client. Only `tv-multiview` talks LG SSAP to the display. Input ownership
+remains on the configured Lan Mouse server until the controller verifies the
+display and remote-input readiness transition.
 
 ## Platform Support
 
@@ -69,29 +69,34 @@ remote-input readiness transition.
 The architecture colocates `tv-multiview` with the configured Lan Mouse
 hub/server host; controller ownership is not intrinsically tied to Linux. The
 current deployment selects Linux as that server and currently packages the
-controller service only for Linux. macOS and Windows controller service/release
-integration remains separate from the architecture.
+display-controller service only for Linux. macOS and Windows display-controller
+service/release integration remains separate from the architecture.
 
-## Current Scope and Implementation Status
+## Current Display Support and Implementation Status
 
-TV integration currently supports LG OLED webOS televisions that expose
-multiple HDMI inputs through SSAP. Other TV brands, non-webOS LG televisions,
-and displays without the required HDMI/SSAP capabilities are not currently
-supported.
+The current display adapter supports only LG OLED webOS displays that expose
+multiple HDMI inputs through SSAP. Other display families and displays without
+the required HDMI/SSAP capabilities are not currently supported. The LG device
+is a display in the Osswitch domain; being a television does not define its
+architectural role.
 
 `tv-multiview` controller progress is distinct from Lan Mouse peer support:
 
-- **Linux controller:** implemented, built and tested in CI, packaged as the
-  current controller release asset, and integrated with systemd deployment.
-- **macOS controller:** the architecture does not forbid it, but there is no
-  macOS controller CI job, release asset, service integration, or live runtime
-  validation yet.
-- **Windows controller:** the source contains a non-Unix runtime path, but there
-  is no Windows controller CI job, release asset, service integration, or live
-  runtime validation yet.
+- **Linux integration:** implemented, built and tested in CI, packaged as the
+  current display-controller release asset, and integrated with systemd
+  deployment.
 
-Therefore macOS and Windows are currently supported as Lan Mouse peers, not as
-completed `tv-multiview` controller platforms.
+Required controller-platform TODOs:
+
+- [ ] Implement and pass native macOS `tv-multiview` CI builds and tests.
+- [ ] Add macOS display-controller service supervision, release assets, and live
+  validation.
+- [ ] Implement and pass native Windows `tv-multiview` CI builds and tests.
+- [ ] Add Windows display-controller service supervision, release assets, and
+  live validation.
+
+Until these TODOs are complete, macOS and Windows operate as Lan Mouse peers
+but are not completed display-controller platforms.
 
 ## Build and Test
 
@@ -131,9 +136,9 @@ cp group_vars/all.example.yml group_vars/all.yml
 ansible-playbook -i inventory.ini playbook.yml
 ```
 
-Real inventory, credentials, fingerprints, TV addresses, and display mappings
-remain ignored local files. See `deploy/README.md` for native-build and immutable
-release-manifest deployment semantics.
+Real inventory, credentials, fingerprints, display addresses, and display
+mappings remain ignored local files. See `deploy/README.md` for native-build and
+immutable release-manifest deployment semantics.
 
 The playbook supports two installation modes:
 
@@ -143,7 +148,7 @@ The playbook supports two installation modes:
   downloaded asset digest before installation.
 
 Deployment is intentionally separate from publication. Creating a GitHub
-Release does not install binaries, restart services, or change the TV input.
+Release does not install binaries, restart services, or change the display input.
 
 ## Configuration and Network Boundary
 
@@ -158,7 +163,7 @@ The default deployment uses UDP port `4243` for Lan Mouse input transport and
 authenticated TCP port `8765` for controller requests. Firewall policy for the
 current Linux deployment host remains operator-owned.
 
-Do not commit passwords, controller tokens, certificate fingerprints, TV
+Do not commit passwords, controller tokens, certificate fingerprints, display
 addresses, display identifiers, or real inventory. The repository ignore rules
 cover the standard local configuration and generated native-build artifacts.
 
@@ -184,6 +189,7 @@ new staging run and a new final version tag.
 
 ## Engineering Documentation
 
+- [Domain language](CONTEXT.md)
 - [Display-switch implementation plan](docs/plan_main_fullscreen_multiview_switch_implementation.md)
 - [Atomic Lan Mouse input gate](docs/plan_lan_mouse_atomic_input_gate.md)
 - [Clipboard handoff plan](docs/clipboardplan.md)
