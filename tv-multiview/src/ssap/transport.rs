@@ -230,32 +230,38 @@ async fn run_connected_session<S: SsapSocket>(
 
     let mut keepalive = tokio::time::interval(Duration::from_millis(config.timeouts.keepalive_ms));
     keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let mut last_received = Instant::now();
+    let mut pending_keepalive_since = None;
     loop {
         tokio::select! {
             biased;
             effect = effects.safety.recv() => {
                 let Some(effect) = effect else { return Ok(()); };
                 execute_effect(socket, &mut next_id, config, coordinator, effect).await?;
-                last_received = Instant::now();
+                pending_keepalive_since = None;
             }
             message = socket.read_message() => {
                 let message = message?;
                 if let Some(value) = decode_message(socket, message).await? {
                     handle_unsolicited(value, coordinator, &config.inputs).await?;
                 }
-                last_received = Instant::now();
+                pending_keepalive_since = None;
             }
             effect = effects.ordinary.recv() => {
                 let Some(effect) = effect else { return Ok(()); };
                 execute_effect(socket, &mut next_id, config, coordinator, effect).await?;
-                last_received = Instant::now();
+                pending_keepalive_since = None;
             }
             _ = keepalive.tick() => {
-                if last_received.elapsed() >= Duration::from_millis(config.timeouts.keepalive_timeout_ms) {
+                if pending_keepalive_since.is_some_and(|started: Instant| {
+                    started.elapsed()
+                        >= Duration::from_millis(config.timeouts.keepalive_timeout_ms)
+                }) {
                     return Err(SsapError::Timeout("keepalive"));
                 }
-                socket.write_message(Message::Ping(Vec::new().into())).await?;
+                if pending_keepalive_since.is_none() {
+                    socket.write_message(Message::Ping(Vec::new().into())).await?;
+                    pending_keepalive_since = Some(Instant::now());
+                }
             }
         }
     }
