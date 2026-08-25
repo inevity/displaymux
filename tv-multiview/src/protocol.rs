@@ -736,6 +736,7 @@ pub fn apply(
             if let Some(request) = next.active_request.as_ref() {
                 if request.deadline_ms <= now_ms {
                     let waking = request.status == RequestStatus::Waking;
+                    let restore_display = display_restore_required(&next);
                     let mut request = next.active_request.take().expect("active request");
                     if request.target != next.server_host {
                         next.manual_recovery_target = Some(request.target);
@@ -747,7 +748,14 @@ pub fn apply(
                         next.phase = ProtocolPhase::Idle;
                         next.phase_deadline_ms = None;
                     } else {
-                        begin_fallback(&mut next, &mut effects, now_ms, timing, "request_deadline");
+                        begin_fallback_with_restore(
+                            &mut next,
+                            &mut effects,
+                            now_ms,
+                            timing,
+                            "request_deadline",
+                            restore_display,
+                        );
                     }
                 }
             }
@@ -918,6 +926,17 @@ fn begin_fallback(
     reason: &str,
 ) {
     let restore_display = display_restore_required(state);
+    begin_fallback_with_restore(state, effects, now_ms, timing, reason, restore_display);
+}
+
+fn begin_fallback_with_restore(
+    state: &mut ProtocolState,
+    effects: &mut Vec<Effect>,
+    now_ms: u64,
+    timing: ProtocolTiming,
+    reason: &str,
+    restore_display: bool,
+) {
     if let Some(target) = state
         .active_request
         .as_ref()
@@ -1807,6 +1826,32 @@ mod tests {
             observed.active_request.as_ref().unwrap().status,
             RequestStatus::Grant
         );
+    }
+
+    #[test]
+    fn expired_grant_restores_server_display_before_manual_recovery() {
+        let state = ready_peer(&synchronized(), Host::Mac, 11);
+        let granted = grant_mac(&state);
+        let deadline = granted.active_request.as_ref().unwrap().deadline_ms;
+
+        let expired = apply(&granted, Event::Tick, deadline, TIMING).unwrap();
+
+        assert_eq!(expired.next.keyboard_owner, Host::Linux);
+        assert_eq!(expired.next.pointer_owner, Host::Linux);
+        assert_eq!(expired.next.manual_recovery_target, Some(Host::Mac));
+        assert_eq!(expired.next.phase, ProtocolPhase::FallbackCommandPending);
+        assert!(expired.next.fallback_required);
+        assert!(matches!(
+            expired.effects.as_slice(),
+            [Effect::SetInput {
+                target: Host::Linux,
+                fallback: true,
+                ..
+            }]
+        ));
+        let request = expired.next.request("request-1").unwrap();
+        assert_eq!(request.status, RequestStatus::Expired);
+        assert_eq!(request.reason.as_deref(), Some("request_deadline"));
     }
 
     #[test]

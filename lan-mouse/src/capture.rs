@@ -468,6 +468,10 @@ impl CaptureTask {
                     CaptureRequest::ResumeIfFocused(handle) => {
                         if capture.resume_if_focused(handle).await? {
                             log::info!("resuming still-focused edge for client {handle}");
+                        } else {
+                            log::info!(
+                                "capture grant for client {handle} is waiting for a new edge crossing"
+                            );
                         }
                     }
                 },
