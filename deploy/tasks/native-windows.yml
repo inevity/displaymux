@@ -461,7 +461,7 @@
     description: "Supervises lan-mouse at user logon and re-enables input emulation after unlock"
     actions:
       - path: "{{ win_pwsh.stdout | trim }}"
-        arguments: '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "{{ win_wrapper }}"'
+        arguments: '-NoLogo -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File "{{ win_wrapper }}"'
     triggers:
       - type: logon
         user_id: "{{ ansible_facts.netbios_name }}\\{{ ansible_user }}"
@@ -532,9 +532,12 @@
       Get-CimInstance Win32_Process -Filter "ProcessId = $($process.ParentProcessId)"
     }
     $task = Get-ScheduledTask -TaskName LanMouseDaemon
+    $taskAction = $task.Actions[0]
     $supervised = $process -and
       $parent.Name -eq "pwsh.exe" -and
       $parent.CommandLine -like "*$expectedWrapper*" -and
+      $parent.CommandLine -match '(?i)(^|\s)-WindowStyle\s+Hidden(\s|$)' -and
+      $taskAction.Arguments -match '(?i)(^|\s)-WindowStyle\s+Hidden(\s|$)' -and
       $task.State -eq "Running"
 
     if (-not $supervised) {
@@ -586,7 +589,14 @@
     if (-not $parent -or $parent.Name -ne "pwsh.exe" -or $parent.CommandLine -notlike "*$expectedWrapper*") {
       throw "lan-mouse.exe is not supervised by the scheduled wrapper"
     }
-    if ((Get-ScheduledTask -TaskName LanMouseDaemon).State -ne "Running") {
+    if ($parent.CommandLine -notmatch '(?i)(^|\s)-WindowStyle\s+Hidden(\s|$)') {
+      throw "lan-mouse supervisor is not running with a hidden window"
+    }
+    $task = Get-ScheduledTask -TaskName LanMouseDaemon
+    if ($task.Actions[0].Arguments -notmatch '(?i)(^|\s)-WindowStyle\s+Hidden(\s|$)') {
+      throw "LanMouseDaemon action does not require a hidden window"
+    }
+    if ($task.State -ne "Running") {
       throw "LanMouseDaemon scheduled task is not running"
     }
     Write-Output $process.ExecutablePath

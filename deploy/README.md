@@ -160,11 +160,11 @@ consumed by this playbook.
 - macOS runs the native daemon as `com.feschber.lan-mouse`; persistent logs
   are `~/Library/Logs/lan-mouse.log` and `lan-mouse.err.log`, each with five
   10 MiB backups.
-- Windows installs the native daemon at `D:\lanmouse\lan-mouse.exe` and runs it through
-  `LanMouseDaemon`; native build assets are kept under
-  `D:\lanmouse\build`. The task starts at interactive user logon. A
-  parallel unlock-triggered invocation asks the existing daemon to re-enable
-  input emulation without replacing its supervised process. The wrapper keeps
+- Windows installs the native daemon at `D:\lanmouse\lan-mouse.exe` and runs it
+  through the hidden-window `LanMouseDaemon` supervisor; native build assets
+  are kept under `D:\lanmouse\build`. The task starts at interactive user
+  logon. A parallel unlock-triggered invocation asks the existing daemon to
+  re-enable input emulation without replacing its supervised process. The wrapper keeps
   the daemon alive across genuine process exits, while temporary Windows input
   denial leaves the daemon connected and not-ready until input emulation
   recovers. Bounded persistent logs remain under
