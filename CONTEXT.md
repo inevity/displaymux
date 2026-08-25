@@ -1,6 +1,6 @@
-# Osswitch
+# DisplayMux
 
-Osswitch coordinates input ownership and display routing across a set of
+DisplayMux coordinates input ownership and display routing across a set of
 connected hosts.
 
 ## Language

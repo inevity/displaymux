@@ -1,6 +1,6 @@
-# osswitch
+# DisplayMux
 
-Osswitch coordinates keyboard, pointer, clipboard, and a shared LG WebOS
+DisplayMux coordinates keyboard, pointer, clipboard, and a shared multi-input
 display as one host-switch transaction. It combines a generalized Lan Mouse
 fork with a display-controller daemon and native deployment automation.
 
@@ -8,7 +8,7 @@ fork with a display-controller daemon and native deployment automation.
 
 - Share keyboard and pointer input across Linux, macOS, and Windows hosts.
 - Transfer clipboard text through an authenticated peer transport.
-- Coordinate LG WebOS input selection with remote-input readiness.
+- Coordinate display input selection with remote-input readiness.
 - Keep keyboard and pointer ownership local until the requested switch is
   verified and committed.
 - Recover to the configured server when a request expires, a peer disconnects,
@@ -25,7 +25,7 @@ Lan Mouse edge intent
 authenticated controller request
         |
         v
-tv-multiview observes LG WebOS + peer readiness
+tv-multiview observes display state + peer readiness
         |
         v
 verified grant and atomic input commit
@@ -34,17 +34,17 @@ verified grant and atomic input commit
 remote host receives keyboard, pointer, and clipboard ownership
 ```
 
-The display route and input owner are separate state. A user may select a TV
-input manually while the server retains input ownership; Osswitch only performs
-automatic fallback while resolving an active switch transaction.
+The display route and input owner are separate state. A user may select a
+display input manually while the server retains input ownership; DisplayMux
+only performs automatic fallback while resolving an active switch transaction.
 
 ## Repository Components
 
 - [`lan-mouse/`](lan-mouse/README.md): cross-platform input and clipboard
   transport. The default build retains the GTK application; no-GTK binaries
   are additional service assets.
-- [`tv-multiview/`](tv-multiview/README.md): controller daemon that owns LG
-  SSAP observation, HDMI input changes, two-phase switch grants, and fail-local
+- [`tv-multiview/`](tv-multiview/README.md): controller daemon that owns display
+  observation, display input changes, two-phase switch grants, and fail-local
   recovery.
 - [`deploy/`](deploy/README.md): Ansible native-build and verified
   GitHub-release deployment modes for Linux, macOS, and Windows hosts.
@@ -52,9 +52,9 @@ automatic fallback while resolving an active switch transaction.
   implementation plans, and formal safety/liveness models.
 
 Lan Mouse talks to `tv-multiview` through its authenticated HTTP controller
-client. Only `tv-multiview` talks LG SSAP to the display. Input ownership
-remains on the configured Lan Mouse server until the controller verifies the
-display and remote-input readiness transition.
+client. Only `tv-multiview` talks the device-specific control protocol to the
+display. Input ownership remains on the configured Lan Mouse server until the
+controller verifies the display and remote-input readiness transition.
 
 ## Platform Support
 
@@ -74,11 +74,11 @@ service/release integration remains separate from the architecture.
 
 ## Current Display Support and Implementation Status
 
-The current display adapter supports only LG OLED webOS displays that expose
-multiple HDMI inputs through SSAP. Other display families and displays without
-the required HDMI/SSAP capabilities are not currently supported. The LG device
-is a display in the Osswitch domain; being a television does not define its
-architectural role.
+The current display adapter supports only LG webOS TVs, specifically OLED
+models that expose multiple HDMI inputs through SSAP. Other display families
+and displays without the required HDMI/SSAP capabilities are not currently
+supported. The TV is a display in the DisplayMux domain; being a television
+does not define its architectural role.
 
 `tv-multiview` controller progress is distinct from Lan Mouse peer support:
 
@@ -172,9 +172,8 @@ cover the standard local configuration and generated native-build artifacts.
 One release tag identifies the workspace source and complete native artifact
 set. Default GTK archives remain available alongside no-GTK Linux, Windows, and
 macOS assets. The initial controller asset is Linux x86_64 only. Every archive
-contains applicable license and README material, and
-`osswitch-release-manifest.json` binds the release ID, tag commit, names, sizes,
-and SHA-256 digests.
+contains applicable license and README material, and the generated release
+manifest binds the release ID, tag commit, names, sizes, and SHA-256 digests.
 
 Release automation creates and verifies a draft before publication. It does not
 deploy binaries or restart hosts.
@@ -213,7 +212,7 @@ sanitized example inventory. Never use a real inventory in CI.
 
 ## License and Attribution
 
-The repository's original osswitch components are licensed under
-GPL-3.0-or-later; see `LICENSE`. The imported Lan Mouse history, attribution,
-and component license are retained under `lan-mouse/`. Third-party dependencies
-remain governed by their own licenses.
+DisplayMux's original components are licensed under GPL-3.0-or-later; see
+`LICENSE`. The imported Lan Mouse history, attribution, and component license
+are retained under `lan-mouse/`. Third-party dependencies remain governed by
+their own licenses.

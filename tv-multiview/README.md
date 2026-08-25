@@ -1,9 +1,9 @@
 # tv-multiview
 
-`tv-multiview` is the display-controller daemon for an osswitch installation. It
-maintains the LG WebOS SSAP session, observes display state and signal presence,
-coordinates two-phase Lan Mouse switch requests, and converges failures to the
-configured Lan Mouse server host.
+`tv-multiview` is the display-controller daemon for a DisplayMux installation.
+It maintains the device-specific display session, observes display state and
+signal presence, coordinates two-phase Lan Mouse switch requests, and converges
+failures to the configured Lan Mouse server host.
 
 The architecture colocates the daemon with that configured hub/server host; it
 does not define Linux as the permanent controller owner. The current deployment
@@ -13,9 +13,9 @@ packaged.
 
 ## Current display support
 
-- The current display adapter supports only LG OLED webOS displays with
-  multiple HDMI inputs and the required SSAP capabilities. The LG device is a
-  display in the Osswitch domain, not the definition of the display role.
+- The current display adapter supports only LG webOS TVs, specifically OLED
+  models with multiple HDMI inputs and the required SSAP capabilities. The TV
+  is a display in the DisplayMux domain, not the definition of the display role.
 - Linux display-controller build, test, release, systemd deployment, and runtime
   paths are implemented.
 
@@ -40,4 +40,4 @@ cargo build --locked --release -p tv-multiview
 ```
 
 Runtime configuration and service deployment are documented under `deploy/`.
-The daemon is licensed under GPL-3.0-or-later as part of osswitch.
+The daemon is licensed under GPL-3.0-or-later as part of DisplayMux.
