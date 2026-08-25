@@ -18,13 +18,15 @@ packaged.
   is a display in the DisplayMux domain, not the definition of the display role.
 - Linux display-controller build, test, release, systemd deployment, and runtime
   paths are implemented.
+- Native controller check/test jobs are configured for Windows x86_64, macOS
+  Intel, and macOS Apple Silicon; their first GitHub-hosted results are pending.
 
 ## Required controller TODOs
 
-- [ ] Add native macOS display-controller CI builds and tests.
+- [ ] Obtain passing native macOS display-controller CI build/test evidence.
 - [ ] Add macOS display-controller service supervision, release assets, and live
   validation.
-- [ ] Add native Windows display-controller CI builds and tests.
+- [ ] Obtain passing native Windows display-controller CI build/test evidence.
 - [ ] Add Windows display-controller service supervision, release assets, and
   live validation.
 

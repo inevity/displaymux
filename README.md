@@ -65,6 +65,7 @@ transition.
 | Lan Mouse GTK application | Yes | Yes | Yes |
 | Lan Mouse no-GTK service | Yes | Yes | Yes |
 | Clipboard transport | Yes | Yes | Yes |
+| Native `tv-multiview` CI | Yes | Configured | Configured |
 | Packaged `tv-multiview` service | Yes | Not yet | Not yet |
 | Native Ansible deployment | Yes | Yes | Yes |
 
@@ -88,13 +89,16 @@ support:
 - **Linux integration:** implemented, built and tested in CI, packaged as the
   current display-controller release asset, and integrated with systemd
   deployment.
+- **Native controller CI:** configured for Linux x86_64, Windows x86_64, macOS
+  Intel, and macOS Apple Silicon. The macOS/Windows results remain pending until
+  the first GitHub-hosted run completes.
 
 Required controller-platform TODOs:
 
-- [ ] Implement and pass native macOS `tv-multiview` CI builds and tests.
+- [ ] Obtain passing native macOS `tv-multiview` CI build/test evidence.
 - [ ] Add macOS display-controller service supervision, release assets, and live
   validation.
-- [ ] Implement and pass native Windows `tv-multiview` CI builds and tests.
+- [ ] Obtain passing native Windows `tv-multiview` CI build/test evidence.
 - [ ] Add Windows display-controller service supervision, release assets, and
   live validation.
 

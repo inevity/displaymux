@@ -159,7 +159,19 @@ jobs:
   tv-multiview:
     needs: changes
     if: needs.changes.outputs.rust == 'true'
-    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            lint: true
+          - os: windows-2025
+            lint: false
+          - os: macos-15-intel
+            lint: false
+          - os: macos-15
+            lint: false
+    runs-on: ${{ matrix.os }}
     steps:
       - name: Check out the exact event commit
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -170,6 +182,7 @@ jobs:
       - name: Test tv-multiview
         run: cargo test --locked -p tv-multiview
       - name: Lint tv-multiview
+        if: matrix.lint
         run: cargo clippy --locked -p tv-multiview --all-targets -- -D warnings
 
   deployment:
