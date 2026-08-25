@@ -294,6 +294,12 @@ cargo test --locked -p tv-multiview
 
 ## Deployment
 
+The display controller is a deployment role, not a Linux-owned component. The
+deployment model must colocate `tv-multiview` with the configured Lan Mouse
+hub/server host regardless of that host's operating system. The current
+Ansible implementation still realizes that role only on Linux; Windows and
+macOS controller service deployment remains an implementation TODO.
+
 The Ansible playbook reconciles one DisplayMux topology: a Linux Lan Mouse hub
 and display controller plus macOS and Windows Lan Mouse peers. It installs the
 selected binaries, renders authenticated hub/spoke configuration, reconciles
@@ -349,7 +355,8 @@ ansible-playbook -i inventory.ini playbook.yml
 In `github_release` mode, Ansible deploys no-GTK Lan Mouse archives on Linux,
 macOS, and Windows and the `tv-multiview-linux-x86_64.tar.gz` controller on the
 Linux hub. The published Windows and macOS `tv-multiview` archives are not yet
-deployed as services. Every download is checked against
+deployed as services. This is a current playbook limitation, not an
+architectural controller-location constraint. Every download is checked against
 `osswitch-release-manifest.json`; release identity is recorded on each host and
 resolved again after deployment to reject a release that changed mid-run.
 
