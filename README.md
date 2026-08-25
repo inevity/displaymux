@@ -65,7 +65,7 @@ transition.
 | Lan Mouse GTK application | Yes | Yes | Yes |
 | Lan Mouse no-GTK service | Yes | Yes | Yes |
 | Clipboard transport | Yes | Yes | Yes |
-| Native `tv-multiview` CI | Yes | Configured | Configured |
+| Native `tv-multiview` CI | Yes | Yes | Yes |
 | Native `tv-multiview` release archive | Yes | Yes | Yes |
 | Packaged `tv-multiview` service | Yes | Not yet | Not yet |
 | Native Ansible deployment | Yes | Yes | Yes |
