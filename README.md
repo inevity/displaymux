@@ -43,8 +43,8 @@ automatic fallback while resolving an active switch transaction.
 - [`lan-mouse/`](lan-mouse/README.md): cross-platform input and clipboard
   transport. The default build retains the GTK application; no-GTK binaries
   are additional service assets.
-- [`tv-multiview/`](tv-multiview/README.md): Linux controller that owns LG SSAP
-  observation, HDMI input changes, two-phase switch grants, and fail-local
+- [`tv-multiview/`](tv-multiview/README.md): controller daemon that owns LG
+  SSAP observation, HDMI input changes, two-phase switch grants, and fail-local
   recovery.
 - [`deploy/`](deploy/README.md): Ansible native-build and verified
   GitHub-release deployment modes for Linux, macOS, and Windows hosts.
@@ -63,11 +63,14 @@ remote-input readiness transition.
 | Lan Mouse GTK application | Yes | Yes | Yes |
 | Lan Mouse no-GTK service | Yes | Yes | Yes |
 | Clipboard transport | Yes | Yes | Yes |
-| `tv-multiview` controller | Yes | No | No |
+| Packaged `tv-multiview` service | Yes | Not yet | Not yet |
 | Native Ansible deployment | Yes | Yes | Yes |
 
-The Linux controller is the only host that communicates with the LG WebOS TV.
-Windows and macOS run Lan Mouse peers; they do not run `tv-multiview`.
+The architecture colocates `tv-multiview` with the configured Lan Mouse
+hub/server host; controller ownership is not intrinsically tied to Linux. The
+current deployment selects Linux as that server and currently packages the
+controller service only for Linux. macOS and Windows controller service/release
+integration remains separate from the architecture.
 
 ## Build and Test
 
@@ -132,7 +135,7 @@ deploy/group_vars/all.example.yml -> deploy/group_vars/all.yml
 
 The default deployment uses UDP port `4243` for Lan Mouse input transport and
 authenticated TCP port `8765` for controller requests. Firewall policy for the
-Linux controller remains operator-owned.
+current Linux deployment host remains operator-owned.
 
 Do not commit passwords, controller tokens, certificate fingerprints, TV
 addresses, display identifiers, or real inventory. The repository ignore rules
