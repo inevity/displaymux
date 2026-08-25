@@ -34,9 +34,10 @@ verified grant and atomic input commit
 remote host receives keyboard, pointer, and clipboard ownership
 ```
 
-The display route and input owner are separate state. A user may select a
-display input manually while the server retains input ownership; DisplayMux
-only performs automatic fallback while resolving an active switch transaction.
+The active display route and keyboard/pointer ownership are separate pieces of
+state. A user may select a display input manually while the server retains
+keyboard/pointer ownership; DisplayMux only performs automatic fallback while
+resolving an active switch transaction.
 
 ## Repository Components
 
@@ -45,7 +46,7 @@ only performs automatic fallback while resolving an active switch transaction.
   are additional service assets.
 - [`tv-multiview/`](tv-multiview/README.md): controller daemon that owns display
   observation, display input changes, two-phase switch grants, and fail-local
-  recovery.
+  recovery. Its current display adapter supports LG OLED webOS displays.
 - [`deploy/`](deploy/README.md): Ansible native-build and verified
   GitHub-release deployment modes for Linux, macOS, and Windows hosts.
 - [`docs/`](docs/) and [`tla/`](tla/README.md): architecture decisions,
@@ -53,8 +54,9 @@ only performs automatic fallback while resolving an active switch transaction.
 
 Lan Mouse talks to `tv-multiview` through its authenticated HTTP controller
 client. Only `tv-multiview` talks the device-specific control protocol to the
-display. Input ownership remains on the configured Lan Mouse server until the
-controller verifies the display and remote-input readiness transition.
+display. Keyboard/pointer ownership remains on the configured Lan Mouse server
+until the controller verifies the display and remote-input readiness
+transition.
 
 ## Platform Support
 
@@ -80,7 +82,8 @@ and displays without the required HDMI/SSAP capabilities are not currently
 supported. The TV is a display in the DisplayMux domain; being a television
 does not define its architectural role.
 
-`tv-multiview` controller progress is distinct from Lan Mouse peer support:
+`tv-multiview` display-controller progress is distinct from Lan Mouse peer
+support:
 
 - **Linux integration:** implemented, built and tested in CI, packaged as the
   current display-controller release asset, and integrated with systemd
@@ -97,6 +100,142 @@ Required controller-platform TODOs:
 
 Until these TODOs are complete, macOS and Windows operate as Lan Mouse peers
 but are not completed display-controller platforms.
+
+## Usage
+
+### 1. Configure Lan Mouse
+
+Lan Mouse reads `config.toml` from these default locations:
+
+- Linux and macOS: `~/.config/lan-mouse/config.toml`
+- Windows: `%LOCALAPPDATA%\lan-mouse\config.toml`
+
+Each host needs the same controller URL/token and must authorize the TLS
+fingerprints of hosts that may connect to it. The client `position` is where
+that client is located relative to the machine whose file you are editing.
+
+Example server configuration with a macOS host on the right and a Windows host
+on the left:
+
+```toml
+port = 4243
+release_bind = ["KeyA", "KeyS", "KeyD", "KeyF"]
+emulation_display = "REPLACE_SERVER_DISPLAY_NAME"
+
+[clipboard]
+enabled = true
+max_bytes = 3145728
+
+[switch_controller]
+url = "http://REPLACE_CONTROLLER_ADDRESS:8765"
+token = "REPLACE_CONTROLLER_TOKEN"
+local_host = "linux"
+server_host = "linux"
+http_timeout_ms = 3000
+request_timeout_ms = 75000
+poll_interval_ms = 250
+edge_double_tap_ms = 3000
+lease_ttl_ms = 90000
+renew_interval_ms = 5000
+
+[authorized_fingerprints]
+"REPLACE_MACOS_TLS_FINGERPRINT" = "mac-host"
+"REPLACE_WINDOWS_TLS_FINGERPRINT" = "windows-host"
+
+[[clients]]
+hostname = "mac-host"
+ips = ["REPLACE_MACOS_ADDRESS"]
+port = 4243
+position = "right"
+activate_on_startup = true
+switch_target = "mac"
+
+[[clients]]
+hostname = "windows-host"
+ips = ["REPLACE_WINDOWS_ADDRESS"]
+port = 4243
+position = "left"
+activate_on_startup = true
+switch_target = "windows"
+```
+
+Example configuration for the macOS peer, where the server is to its left:
+
+```toml
+port = 4243
+emulation_display = "REPLACE_MACOS_DISPLAY_NAME"
+
+[clipboard]
+enabled = true
+max_bytes = 3145728
+
+[switch_controller]
+url = "http://REPLACE_CONTROLLER_ADDRESS:8765"
+token = "REPLACE_CONTROLLER_TOKEN"
+local_host = "mac"
+server_host = "linux"
+http_timeout_ms = 3000
+request_timeout_ms = 75000
+poll_interval_ms = 250
+edge_double_tap_ms = 3000
+lease_ttl_ms = 90000
+renew_interval_ms = 5000
+
+[authorized_fingerprints]
+"REPLACE_SERVER_TLS_FINGERPRINT" = "server-host"
+
+[[clients]]
+hostname = "server-host"
+ips = ["REPLACE_SERVER_ADDRESS"]
+port = 4243
+position = "left"
+activate_on_startup = true
+switch_target = "linux"
+```
+
+For the Windows peer on the server's left, use the same peer configuration with
+`local_host = "windows"`, the Windows display name, and `position = "right"`
+for its server client.
+
+The fingerprint shown by Lan Mouse on one host must be placed in
+`authorized_fingerprints` on the host accepting that connection. See the
+[Lan Mouse connection guide](lan-mouse/README.md#usage) for the authorization
+flow. Start each configured instance with:
+
+```bash
+lan-mouse daemon
+```
+
+The Ansible deployment under [`deploy/`](deploy/README.md) renders these files
+from sanitized inventory and group-variable examples when managing all hosts.
+
+### 2. Move between hosts
+
+With the example layout:
+
+- Move toward the server's **right** edge to target macOS.
+- Move toward the server's **left** edge to target Windows.
+- On macOS, move left to return to the server.
+- On Windows, move right to return to the server.
+
+Leaving the server for a non-server host uses a deliberate two-crossing guard:
+
+1. Push through the configured edge once. DisplayMux primes the intent, releases
+   capture, and performs no controller switch.
+2. Move away from that edge. The native capture backend must report the retreat.
+3. Push through the same edge again within `edge_double_tap_ms` (3000 ms in the
+   example).
+4. DisplayMux verifies that the same target and peer session are still current,
+   and that the peer is online with both keyboard and pointer emulation ready.
+5. For a target with a display route, the controller verifies the selected route
+   and signal before issuing a bounded grant. A route-free peer skips the display
+   command but retains the readiness and lease gates.
+6. Lan Mouse revalidates the grant and peer-session identity at commit time, then
+   transfers keyboard and pointer ownership together.
+
+If any check fails or expires, keyboard/pointer ownership stays on or returns to
+the configured server. A manual display selection made while no switch
+transaction is active remains authoritative and is not automatically undone.
 
 ## Build and Test
 
