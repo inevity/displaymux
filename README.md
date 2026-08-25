@@ -120,13 +120,11 @@ the archive if the values differ.
 
 ### 2. Install a `.tar.gz` archive
 
-After validation, extract the archive and follow the included `README.md` to
-install its contents.
+After validation, extract the archive into your chosen installation directory.
 
 ### 3. Install a `.zip` archive
 
-After validation, extract the archive and follow the included `README.md` to
-install its contents.
+After validation, extract the archive into your chosen installation directory.
 
 ### 4. Configure Lan Mouse
 
