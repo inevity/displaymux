@@ -169,7 +169,9 @@
     argv: [cargo, test, --frozen, -p, tv-multiview]
     chdir: "{{ playbook_dir }}/.."
   changed_when: false
-  when: lan_mouse_install_method == 'native_build'
+  when:
+    - displaymux_host_role == lan_mouse_server_host
+    - lan_mouse_install_method == 'native_build'
   tags: [tv_multiview_mutation]
 
 - name: Build tv-multiview daemon
@@ -177,16 +179,22 @@
     argv: [cargo, build, --frozen, --release, -p, tv-multiview]
     chdir: "{{ playbook_dir }}/.."
   changed_when: false
-  when: lan_mouse_install_method == 'native_build'
+  when:
+    - displaymux_host_role == lan_mouse_server_host
+    - lan_mouse_install_method == 'native_build'
   tags: [tv_multiview_mutation]
 
 - name: Select native tv-multiview release candidate
   ansible.builtin.set_fact:
     tv_multiview_release_candidate: "{{ playbook_dir }}/../target/release/tv-multiview"
-  when: lan_mouse_install_method == 'native_build'
+  when:
+    - displaymux_host_role == lan_mouse_server_host
+    - lan_mouse_install_method == 'native_build'
 
 - name: Download tv-multiview GitHub Release asset
-  when: lan_mouse_install_method == 'github_release'
+  when:
+    - displaymux_host_role == lan_mouse_server_host
+    - lan_mouse_install_method == 'github_release'
   vars:
     tv_multiview_release_archive: tv-multiview-linux-x86_64.tar.gz
     tv_multiview_release_dir: "{{ lan_mouse_build_cache }}/tv-multiview-linux-x86_64"
@@ -229,6 +237,7 @@
     mode: "0755"
     remote_src: "{{ lan_mouse_install_method == 'github_release' }}"
   register: tv_multiview_binary_install
+  when: displaymux_host_role == lan_mouse_server_host
   tags: [tv_multiview_mutation]
 
 - name: Record installed GitHub release identity on Linux
@@ -273,18 +282,32 @@
     state: directory
     mode: "0700"
   tags: [tv_multiview_mutation]
+  when: displaymux_host_role == lan_mouse_server_host
+
+- name: Select Linux controller client-key path
+  ansible.builtin.set_fact:
+    effective_tv_multiview_client_key_path: >-
+      {{ (tv_multiview_client_key_paths | default({})).get(
+           displaymux_host_role,
+           ansible_facts.env.HOME ~ '/.config/lg-buddy/.aiopylgtv.sqlite'
+         ) }}
+  when: displaymux_host_role == lan_mouse_server_host
 
 - name: Verify shared LG client-key database exists
   ansible.builtin.stat:
-    path: "{{ tv_multiview_client_key_path }}"
+    path: "{{ effective_tv_multiview_client_key_path }}"
   register: tv_client_key
+  when: displaymux_host_role == lan_mouse_server_host
   tags: [tv_multiview_mutation]
 
 - name: Require existing LG client-key database
   ansible.builtin.assert:
     that: tv_client_key.stat.exists
-    fail_msg: "Missing LG client-key database at {{ tv_multiview_client_key_path }}"
+    fail_msg: >-
+      Missing LG client-key database at
+      {{ effective_tv_multiview_client_key_path }}
   tags: [tv_multiview_mutation]
+  when: displaymux_host_role == lan_mouse_server_host
 
 - name: Deploy authenticated tv-multiview configuration
   ansible.builtin.template:
@@ -294,10 +317,20 @@
   register: daemon_config_template
   no_log: true
   tags: [tv_multiview_mutation]
+  when: displaymux_host_role == lan_mouse_server_host
 
-- name: Deploy lan-mouse hub configuration
+- name: Remove stale Linux controller configuration
+  ansible.builtin.file:
+    path: "{{ tv_multiview_config_path }}"
+    state: absent
+  when: displaymux_host_role != lan_mouse_server_host
+
+- name: Deploy role-selected lan-mouse configuration on Linux
   ansible.builtin.template:
-    src: templates/hub-config.toml.j2
+    src: >-
+      {{ 'templates/hub-config.toml.j2'
+         if displaymux_host_role == lan_mouse_server_host
+         else 'templates/spoke-config.toml.j2' }}
     dest: "{{ ansible_facts.env.HOME }}/.config/lan-mouse/config.toml"
     mode: "0600"
   register: hub_config_template
@@ -329,15 +362,35 @@
   vars:
     tv_multiview_binary: "{{ ansible_facts.env.HOME }}/.local/bin/tv-multiview"
   register: daemon_service_template
+  when: displaymux_host_role == lan_mouse_server_host
   tags: [tv_multiview_mutation]
+
+- name: Check for a stale Linux controller unit
+  ansible.builtin.stat:
+    path: "{{ ansible_facts.env.HOME }}/.config/systemd/user/tv-multiview.service"
+  register: stale_tv_multiview_unit
+  when: displaymux_host_role != lan_mouse_server_host
+
+- name: Stop and disable a stale Linux controller service
+  ansible.builtin.systemd:
+    name: tv-multiview.service
+    scope: user
+    enabled: false
+    state: stopped
+  environment:
+    XDG_RUNTIME_DIR: "/run/user/{{ ansible_facts.user_uid }}"
+  when:
+    - displaymux_host_role != lan_mouse_server_host
+    - stale_tv_multiview_unit.stat.exists
 
 - name: Define Linux runtime change boundaries
   ansible.builtin.set_fact:
     lan_mouse_linux_runtime_changed: true
     tv_multiview_runtime_changed: >-
-      {{ (tv_multiview_binary_install.changed | default(false))
+      {{ displaymux_host_role == lan_mouse_server_host
+         and ((tv_multiview_binary_install.changed | default(false))
          or (daemon_config_template.changed | default(false))
-         or (daemon_service_template.changed | default(false)) }}
+         or (daemon_service_template.changed | default(false))) }}
 
 - name: Reload systemd user daemon for changed units
   ansible.builtin.systemd:
@@ -378,7 +431,7 @@
     XDG_RUNTIME_DIR: "/run/user/{{ ansible_facts.user_uid }}"
   when: lan_mouse_linux_runtime_changed or tv_multiview_runtime_changed
 
-- name: Ensure both Linux services are enabled and started
+- name: Ensure selected Linux services are enabled and started
   ansible.builtin.systemd:
     name: "{{ item }}"
     scope: user
@@ -386,9 +439,10 @@
     state: started
   environment:
     XDG_RUNTIME_DIR: "/run/user/{{ ansible_facts.user_uid }}"
-  loop:
-    - tv-multiview.service
-    - lan-mouse.service
+  loop: >-
+    {{ ['tv-multiview.service', 'lan-mouse.service']
+       if displaymux_host_role == lan_mouse_server_host
+       else ['lan-mouse.service'] }}
 
 - name: Verify services are running
   ansible.builtin.command:
@@ -397,24 +451,28 @@
     XDG_RUNTIME_DIR: "/run/user/{{ ansible_facts.user_uid }}"
   register: service_status
   failed_when: service_status.rc != 0 or service_status.stdout | trim != 'active'
-  loop:
-    - tv-multiview.service
-    - lan-mouse.service
+  loop: >-
+    {{ ['tv-multiview.service', 'lan-mouse.service']
+       if displaymux_host_role == lan_mouse_server_host
+       else ['lan-mouse.service'] }}
   changed_when: false
 
 - name: Verify daemon health endpoint
   ansible.builtin.uri:
-    url: "http://{{ hostvars[groups['linux_desktop'][0]].ansible_host }}:{{ daemon_port }}/health"
+    url: >-
+      http://{{ hostvars[displaymux_inventory_hosts[lan_mouse_server_host]].ansible_host }}:{{ daemon_port }}/health
     status_code: 200
   register: daemon_health
   retries: 10
   delay: 1
   until: daemon_health.status == 200
   changed_when: false
+  when: displaymux_host_role == lan_mouse_server_host
 
 - name: Require synchronized daemon readiness after Linux deployment
   ansible.builtin.uri:
-    url: "http://{{ hostvars[groups['linux_desktop'][0]].ansible_host }}:{{ daemon_port }}/ready"
+    url: >-
+      http://{{ hostvars[displaymux_inventory_hosts[lan_mouse_server_host]].ansible_host }}:{{ daemon_port }}/ready
     headers:
       Authorization: "Bearer {{ lookup('ansible.builtin.file', lan_mouse_controller_token_file) | trim }}"
     status_code: 200
@@ -429,6 +487,7 @@
     and not (daemon_ready.json.data.fallback_required | default(true) | bool)
   changed_when: false
   no_log: true
+  when: displaymux_host_role == lan_mouse_server_host
 
 # Firewall policy remains externally owned. The Linux host must admit UDP
 # and TCP {{ lan_mouse_port }}, plus authenticated controller TCP

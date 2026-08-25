@@ -312,22 +312,51 @@
         dest: "{{ ansible_facts.env.HOME }}/Library/Application Support/osswitch/release.json"
         mode: "0600"
 
-- name: Add Linux host to /etc/hosts
+- name: Add configured hub host to macOS hosts file
   become: true
   ansible.builtin.lineinfile:
     path: /etc/hosts
-    line: "{{ hostvars[groups['linux_desktop'][0]].ansible_host }} {{ groups['linux_desktop'][0] }}"
+    line: >-
+      {{ hostvars[displaymux_inventory_hosts[lan_mouse_server_host]].ansible_host }}
+      {{ displaymux_inventory_hosts[lan_mouse_server_host] }}
     state: present
 
-- name: Deploy lan-mouse macOS spoke configuration
+- name: Deploy role-selected lan-mouse configuration on macOS
   ansible.builtin.template:
-    src: templates/spoke-config.toml.j2
+    src: >-
+      {{ 'templates/hub-config.toml.j2'
+         if displaymux_host_role == lan_mouse_server_host
+         else 'templates/spoke-config.toml.j2' }}
     dest: "{{ ansible_facts.env.HOME }}/.config/lan-mouse/config.toml"
     mode: "0600"
-  vars:
-    spoke_position: "{{ mac_spoke_position }}"
-    spoke_host: mac
   no_log: true
+
+- name: Ensure selected macOS controller config directory exists
+  ansible.builtin.file:
+    path: "{{ ansible_facts.env.HOME }}/.config/tv-multiview"
+    state: directory
+    mode: "0700"
+  when: displaymux_host_role == lan_mouse_server_host
+
+- name: Deploy selected macOS controller configuration
+  ansible.builtin.template:
+    src: templates/tv-multiview-config.toml.j2
+    dest: "{{ tv_multiview_config_path }}"
+    mode: "0600"
+  vars:
+    effective_tv_multiview_client_key_path: >-
+      {{ (tv_multiview_client_key_paths | default({})).get(
+           displaymux_host_role,
+           ansible_facts.env.HOME ~ '/.config/lg-buddy/.aiopylgtv.sqlite'
+         ) }}
+  no_log: true
+  when: displaymux_host_role == lan_mouse_server_host
+
+- name: Remove stale macOS controller configuration
+  ansible.builtin.file:
+    path: "{{ tv_multiview_config_path }}"
+    state: absent
+  when: displaymux_host_role != lan_mouse_server_host
 
 - name: Deploy bounded macOS log wrapper
   ansible.builtin.template:

@@ -2,12 +2,11 @@
 
 ## Aim and scope
 
-This Ansible playbook deploys the current three-host DisplayMux topology. It
-installs a no-GTK Lan Mouse daemon on the Linux hub and the macOS and Windows
-peers, installs `tv-multiview` on the Linux controller host, renders the
-authenticated configurations, reconciles peer trust, configures native service
-supervision and bounded logs, restarts changed runtimes, and verifies service
-health and peer connectivity.
+This Ansible playbook manages one Linux, one macOS, and one Windows DisplayMux
+host. `lan_mouse_server_host` selects which generated configuration is the
+Lan Mouse hub/controller and which two are clients. The selected host receives
+the hub and `tv-multiview` configuration; every other host receives a client
+configuration that points to it.
 
 Two binary sources are supported:
 
@@ -49,7 +48,8 @@ cp group_vars/all.example.yml group_vars/all.yml
 
 - `inventory.ini` contains real hostnames, addresses, and users.
 - `group_vars/all.yml` contains the TV address, input mapping, server host,
-  fingerprints, controller timeouts, install method, and native build features.
+  fingerprints, pairwise edge positions, controller key paths and timeouts,
+  install method, and native build features.
 - Keep `lan_mouse_rust_toolchain` aligned with the version pinned by the root
   `rust-toolchain.toml` so native builds and release builds use the same compiler.
 - Windows SSH credentials — keep them in Ansible Vault or pass them as extra
@@ -74,7 +74,12 @@ The default native-build configuration is:
 
 ```yaml
 lan_mouse_install_method: native_build
+lan_mouse_server_host: linux  # linux|mac|windows
 ```
+
+After the host-specific values are populated once, changing only
+`lan_mouse_server_host` regenerates one hub/controller configuration and two
+client configurations. No inventory group or task file is selected manually.
 
 To deploy published artifacts instead, use:
 
@@ -129,9 +134,10 @@ consumed by this playbook.
 
 ## After running (one-time manual steps)
 
-1. **LG client key**: the Linux host must already have
-   `~/.config/lg-buddy/.aiopylgtv.sqlite`. The playbook deliberately fails
-   instead of opening an unattended TV pairing flow.
+1. **LG client key**: place the paired client-key database at the configured
+   `tv_multiview_client_key_paths` location for each host that may be selected.
+   The managed Linux service deliberately fails instead of opening an
+   unattended display-pairing flow.
 2. **macOS Accessibility**: System Settings → Privacy & Security →
    Accessibility → enable it for lan-mouse once. The playbook creates and
    reuses a persistent local code-signing identity, so later rebuilt binaries
@@ -144,8 +150,9 @@ consumed by this playbook.
 
 ## Runtime and logs
 
-- Linux runs `tv-multiview.service` and `lan-mouse.service` as systemd user
-  units. Inspect them with `journalctl --user -u tv-multiview -u lan-mouse`.
+- Linux runs `lan-mouse.service` as a systemd user unit. When Linux is the
+  selected controller, it also runs `tv-multiview.service`. Inspect them with
+  `journalctl --user -u tv-multiview -u lan-mouse`.
 - macOS runs the native daemon as `com.feschber.lan-mouse`; persistent logs
   are `~/Library/Logs/lan-mouse.log` and `lan-mouse.err.log`, each with five
   10 MiB backups.

@@ -13,7 +13,7 @@ enabled = {{ lan_mouse_clipboard_enabled | lower }}
 max_bytes = {{ lan_mouse_clipboard_max_bytes }}
 
 [switch_controller]
-url = "http://{{ hostvars[groups['linux_desktop'][0]].ansible_host }}:{{ daemon_port }}"
+url = "http://{{ hostvars[displaymux_inventory_hosts[lan_mouse_server_host]].ansible_host }}:{{ daemon_port }}"
 token = "{{ lookup('ansible.builtin.file', lan_mouse_controller_token_file) | trim }}"
 local_host = "{{ lan_mouse_server_host }}"
 server_host = "{{ lan_mouse_server_host }}"
@@ -27,22 +27,16 @@ renew_interval_ms = {{ lan_mouse_controller_renew_interval_ms }}
 # list of authorized tls certificate fingerprints that
 # are accepted for incoming traffic
 [authorized_fingerprints]
-"{{ mac_fingerprint }}" = "{{ groups['mac_desktop'][0] }}"
-"{{ windows_fingerprint }}" = "{{ groups['windows_desktop'][0] }}"
+{% for peer_role in displaymux_host_roles if peer_role != lan_mouse_server_host %}
+"{{ displaymux_host_fingerprints[peer_role] }}" = "{{ displaymux_inventory_hosts[peer_role] }}"
+{% endfor %}
 
-
+{% for peer_role in displaymux_host_roles if peer_role != lan_mouse_server_host %}
 [[clients]]
-hostname = "{{ groups['mac_desktop'][0] }}"
-ips = [ "{{ hostvars[groups['mac_desktop'][0]].ansible_host }}" ]
+hostname = "{{ displaymux_inventory_hosts[peer_role] }}"
+ips = [ "{{ hostvars[displaymux_inventory_hosts[peer_role]].ansible_host }}" ]
 port = {{ lan_mouse_port }}
-position = "right"
+position = "{{ displaymux_host_positions[lan_mouse_server_host][peer_role] }}"
 activate_on_startup = true
-switch_target = "mac"
-
-[[clients]]
-hostname = "{{ groups['windows_desktop'][0] }}"
-ips = [ "{{ hostvars[groups['windows_desktop'][0]].ansible_host }}" ]
-port = {{ lan_mouse_port }}
-position = "left"
-activate_on_startup = true
-switch_target = "windows"
+switch_target = "{{ peer_role }}"
+{% endfor %}

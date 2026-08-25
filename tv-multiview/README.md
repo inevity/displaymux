@@ -5,9 +5,11 @@ It maintains the device-specific display session, observes display state and
 signal presence, coordinates two-phase Lan Mouse switch requests, and converges
 failures to the configured Lan Mouse server host.
 
-The current deployment packages the display-controller service only for Linux.
-Display-controller archives are available for macOS and Windows, but managed
-service integration is not yet provided on those platforms.
+Managed display-controller service integration is currently available only for
+Linux. Display-controller archives are available for macOS and Windows, but
+managed service integration is not yet provided on those platforms. Ansible
+generates the controller configuration on the host selected by
+`lan_mouse_server_host`.
 
 ## Current display support
 
@@ -31,9 +33,7 @@ service integration is not yet provided on those platforms.
 - [ ] Add Windows display-controller service supervision and live validation.
 
 The macOS and Windows controller packages are available for manual use, but
-those operating systems are not completed display-controller platforms until
-their service supervision and live validation work is complete. This is an
-implementation gap, not an architectural restriction.
+their service supervision and live validation work is not yet complete.
 
 Build and test it from the repository root:
 

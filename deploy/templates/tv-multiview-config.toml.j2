@@ -1,4 +1,4 @@
-bind_address = "{{ hostvars[groups['linux_desktop'][0]].ansible_host }}:{{ daemon_port }}"
+bind_address = "{{ hostvars[displaymux_inventory_hosts[lan_mouse_server_host]].ansible_host }}:{{ daemon_port }}"
 tv_ip = "{{ tv_ip }}"
 server_host = "{{ lan_mouse_server_host }}"
 controller_token = "{{ lookup('ansible.builtin.file', lan_mouse_controller_token_file) | trim }}"

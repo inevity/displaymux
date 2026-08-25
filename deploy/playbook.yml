@@ -33,6 +33,17 @@
           lan_mouse_install_method must be native_build or github_release,
           not {{ lan_mouse_install_method }}
 
+    - name: Validate configured host roles
+      ansible.builtin.assert:
+        that:
+          - lan_mouse_server_host in ['linux', 'mac', 'windows']
+          - groups['linux_desktop'] | length == 1
+          - groups['mac_desktop'] | length == 1
+          - groups['windows_desktop'] | length == 1
+        fail_msg: >-
+          lan_mouse_server_host must be linux, mac, or windows and each desktop
+          inventory group must contain exactly one host.
+
     - name: Require a GitHub repository for release deployment
       ansible.builtin.assert:
         that: lan_mouse_github_repository | trim | length > 0
@@ -174,17 +185,79 @@
     win_msvc_dir: "{{ lan_mouse_windows_msvc_dir }}"
     win_installed_binary: "{{ win_install_dir }}\\lan-mouse.exe"
     win_wrapper: "{{ ansible_facts.env.LOCALAPPDATA | default('') }}\\lan-mouse\\run-lan-mouse.ps1"
+    displaymux_host_roles:
+      - linux
+      - mac
+      - windows
+    displaymux_inventory_hosts:
+      linux: "{{ groups['linux_desktop'][0] }}"
+      mac: "{{ groups['mac_desktop'][0] }}"
+      windows: "{{ groups['windows_desktop'][0] }}"
+    displaymux_host_fingerprints:
+      linux: "{{ hub_fingerprint }}"
+      mac: "{{ mac_fingerprint }}"
+      windows: "{{ windows_fingerprint }}"
+    displaymux_default_host_positions:
+      linux:
+        mac: right
+        windows: left
+      mac:
+        linux: left
+        windows: right
+      windows:
+        linux: right
+        mac: left
+    displaymux_host_positions: >-
+      {{ lan_mouse_host_positions | default(displaymux_default_host_positions) }}
+    displaymux_opposite_positions:
+      left: right
+      right: left
+      top: bottom
+      bottom: top
   tasks:
+    - name: Validate role-derived configuration inputs
+      ansible.builtin.assert:
+        that:
+          - lan_mouse_emulation_displays['linux'] | trim | length > 0
+          - lan_mouse_emulation_displays['mac'] | trim | length > 0
+          - lan_mouse_emulation_displays['windows'] | trim | length > 0
+          - displaymux_host_fingerprints['linux'] | trim | length > 0
+          - displaymux_host_fingerprints['mac'] | trim | length > 0
+          - displaymux_host_fingerprints['windows'] | trim | length > 0
+          - displaymux_host_positions['linux']['mac'] in displaymux_opposite_positions
+          - displaymux_host_positions['linux']['windows'] in displaymux_opposite_positions
+          - displaymux_host_positions['mac']['linux'] in displaymux_opposite_positions
+          - displaymux_host_positions['mac']['windows'] in displaymux_opposite_positions
+          - displaymux_host_positions['windows']['linux'] in displaymux_opposite_positions
+          - displaymux_host_positions['windows']['mac'] in displaymux_opposite_positions
+          - displaymux_host_positions['linux']['mac'] != displaymux_host_positions['linux']['windows']
+          - displaymux_host_positions['mac']['linux'] != displaymux_host_positions['mac']['windows']
+          - displaymux_host_positions['windows']['linux'] != displaymux_host_positions['windows']['mac']
+          - displaymux_host_positions['linux']['mac'] == displaymux_opposite_positions[displaymux_host_positions['mac']['linux']]
+          - displaymux_host_positions['linux']['windows'] == displaymux_opposite_positions[displaymux_host_positions['windows']['linux']]
+          - displaymux_host_positions['mac']['windows'] == displaymux_opposite_positions[displaymux_host_positions['windows']['mac']]
+        fail_msg: >-
+          Role-derived configuration requires displays and fingerprints for all
+          hosts plus distinct, symmetric peer positions.
+
     - name: Run Linux native build and deployment sequence
       ansible.builtin.include_tasks: tasks/native-linux.yml
+      vars:
+        displaymux_host_role: linux
       when: inventory_hostname in groups['linux_desktop']
 
     - name: Run macOS native build and deployment sequence
       ansible.builtin.include_tasks: tasks/native-macos.yml
+      vars:
+        displaymux_host_role: mac
       when: inventory_hostname in groups['mac_desktop']
 
     - name: Run Windows native build and deployment sequence
       ansible.builtin.include_tasks: tasks/native-windows.yml
+      vars:
+        displaymux_host_role: windows
+        tv_multiview_config_path: >-
+          {{ ansible_facts.env.LOCALAPPDATA }}\tv-multiview\config.toml
       when: inventory_hostname in groups['windows_desktop']
 
 - name: Revalidate the GitHub release after parallel deployment

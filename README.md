@@ -70,8 +70,8 @@ transition.
 | Packaged `tv-multiview` service | Yes | Not yet | Not yet |
 | Native Ansible deployment | Yes | Yes | Yes |
 
-The current deployment runs `tv-multiview` with the Linux Lan Mouse hub/server
-and packages its managed service only for Linux. macOS and Windows controller
+Managed `tv-multiview` service integration is currently available only when
+Linux is selected as the Lan Mouse hub/server. macOS and Windows controller
 archives are available, but managed service integration is not yet provided on
 those platforms.
 
@@ -136,92 +136,19 @@ Lan Mouse reads `config.toml` from these default locations:
 - Linux and macOS: `~/.config/lan-mouse/config.toml`
 - Windows: `%LOCALAPPDATA%\lan-mouse\config.toml`
 
-Each host needs the same controller URL/token and must authorize the TLS
-fingerprints of hosts that may connect to it. The client `position` is where
-that client is located relative to the machine whose file you are editing.
+The Ansible deployment derives every generated role from one variable in
+`deploy/group_vars/all.yml`:
 
-Example server configuration with a macOS host on the right and a Windows host
-on the left:
-
-```toml
-port = 4243
-release_bind = ["KeyA", "KeyS", "KeyD", "KeyF"]
-emulation_display = "REPLACE_SERVER_DISPLAY_NAME"
-
-[clipboard]
-enabled = true
-max_bytes = 3145728
-
-[switch_controller]
-url = "http://REPLACE_CONTROLLER_ADDRESS:8765"
-token = "REPLACE_CONTROLLER_TOKEN"
-local_host = "linux"
-server_host = "linux"
-http_timeout_ms = 3000
-request_timeout_ms = 75000
-poll_interval_ms = 250
-edge_double_tap_ms = 3000
-lease_ttl_ms = 90000
-renew_interval_ms = 5000
-
-[authorized_fingerprints]
-"REPLACE_MACOS_TLS_FINGERPRINT" = "mac-host"
-"REPLACE_WINDOWS_TLS_FINGERPRINT" = "windows-host"
-
-[[clients]]
-hostname = "mac-host"
-ips = ["REPLACE_MACOS_ADDRESS"]
-port = 4243
-position = "right"
-activate_on_startup = true
-switch_target = "mac"
-
-[[clients]]
-hostname = "windows-host"
-ips = ["REPLACE_WINDOWS_ADDRESS"]
-port = 4243
-position = "left"
-activate_on_startup = true
-switch_target = "windows"
+```yaml
+lan_mouse_server_host: linux  # linux|mac|windows
 ```
 
-Example configuration for the macOS peer, where the server is to its left:
-
-```toml
-port = 4243
-emulation_display = "REPLACE_MACOS_DISPLAY_NAME"
-
-[clipboard]
-enabled = true
-max_bytes = 3145728
-
-[switch_controller]
-url = "http://REPLACE_CONTROLLER_ADDRESS:8765"
-token = "REPLACE_CONTROLLER_TOKEN"
-local_host = "mac"
-server_host = "linux"
-http_timeout_ms = 3000
-request_timeout_ms = 75000
-poll_interval_ms = 250
-edge_double_tap_ms = 3000
-lease_ttl_ms = 90000
-renew_interval_ms = 5000
-
-[authorized_fingerprints]
-"REPLACE_SERVER_TLS_FINGERPRINT" = "server-host"
-
-[[clients]]
-hostname = "server-host"
-ips = ["REPLACE_SERVER_ADDRESS"]
-port = 4243
-position = "left"
-activate_on_startup = true
-switch_target = "linux"
-```
-
-For the Windows peer on the server's left, use the same peer configuration with
-`local_host = "windows"`, the Windows display name, and `position = "right"`
-for its server client.
+After the inventory, displays, fingerprints, and controller key paths have been
+configured once, changing only `lan_mouse_server_host` causes the selected host
+to receive the Lan Mouse hub and `tv-multiview` configuration. The other two
+hosts receive Lan Mouse client configurations that point to the selected host.
+Controller URLs, bind address, trust entries, client identities, and edge
+positions are generated from the same selector.
 
 The fingerprint shown by Lan Mouse on one host must be placed in
 `authorized_fingerprints` on the host accepting that connection. See the
@@ -233,16 +160,13 @@ lan-mouse daemon
 ```
 
 The Ansible deployment under [`deploy/`](deploy/README.md) renders these files
-from sanitized inventory and group-variable examples when managing all hosts.
+from the sanitized inventory and group-variable examples.
 
 ### 5. Move between hosts
 
-With the example layout:
-
-- Move toward the server's **right** edge to target macOS.
-- Move toward the server's **left** edge to target Windows.
-- On macOS, move left to return to the server.
-- On Windows, move right to return to the server.
+Movement follows `lan_mouse_host_positions` in the Ansible configuration. The
+selected hub uses its row for both clients; each generated client uses the
+inverse entry to return to the hub.
 
 Leaving the server for a non-server host uses a deliberate two-crossing guard:
 
@@ -292,11 +216,12 @@ cargo test --locked -p tv-multiview
 
 ## Deployment
 
-The Ansible playbook reconciles one DisplayMux topology: a Linux Lan Mouse hub
-and display controller plus macOS and Windows Lan Mouse peers. It installs the
-selected binaries, renders authenticated hub/spoke configuration, reconciles
-certificate trust, configures native service supervision and logs, restarts
-changed runtimes, and verifies service health and peer connectivity.
+The Ansible playbook manages one Linux, one macOS, and one Windows host. The
+`lan_mouse_server_host` variable selects which generated configuration is the
+hub/controller and which two are clients. The playbook installs selected
+binaries, renders authenticated configuration, reconciles certificate trust,
+configures native service supervision and logs, restarts changed runtimes, and
+verifies the implemented service paths.
 
 Install the required Ansible collections, then create ignored local
 configuration from the sanitized examples:
@@ -345,16 +270,18 @@ ansible-playbook -i inventory.ini playbook.yml
 ```
 
 In `github_release` mode, Ansible deploys no-GTK Lan Mouse archives on Linux,
-macOS, and Windows and the `tv-multiview-linux-x86_64.tar.gz` controller on the
-Linux hub. The published Windows and macOS `tv-multiview` archives are not yet
-deployed as services. Every download is checked against
+macOS, and Windows. When Linux is selected as `lan_mouse_server_host`, it also
+deploys the managed `tv-multiview-linux-x86_64.tar.gz` service. For macOS or
+Windows selection, Ansible generates the controller configuration but does not
+yet supervise the controller process. Every download is checked against
 `osswitch-release-manifest.json`; release identity is recorded on each host and
 resolved again after deployment to reject a release that changed mid-run.
 
-After deployment, Linux must report both user services active; macOS must have
-the LaunchAgent loaded; and Windows must have the `LanMouseDaemon` scheduled
-task. Detailed prerequisites, one-time permissions, install locations, logs,
-and recovery checks are in [`deploy/README.md`](deploy/README.md).
+After deployment, Linux must report Lan Mouse active and, when Linux is the
+selected controller, `tv-multiview` active. macOS must have the LaunchAgent
+loaded, and Windows must have the `LanMouseDaemon` scheduled task. Detailed
+prerequisites, one-time permissions, install locations, logs, and recovery
+checks are in [`deploy/README.md`](deploy/README.md).
 
 Deployment is intentionally separate from publication. Creating a GitHub
 Release does not install binaries, restart services, or change the display input.
@@ -369,8 +296,8 @@ deploy/group_vars/all.example.yml -> deploy/group_vars/all.yml
 ```
 
 The default deployment uses UDP port `4243` for Lan Mouse input transport and
-authenticated TCP port `8765` for controller requests. Firewall policy for the
-current Linux deployment host remains operator-owned.
+authenticated TCP port `8765` for controller requests. Firewall policy on
+Linux remains operator-owned.
 
 Do not commit passwords, controller tokens, certificate fingerprints, display
 addresses, display identifiers, or real inventory. The repository ignore rules

@@ -401,10 +401,10 @@
     dest: "{{ win_install_dir }}\\release.json"
   when: lan_mouse_install_method == 'github_release'
 
-- name: Add Linux host to Windows hosts file
+- name: Add configured hub host to Windows hosts file
   ansible.windows.win_shell: |
     $hosts = "C:\Windows\System32\drivers\etc\hosts"
-    $line = "{{ hostvars[groups['linux_desktop'][0]].ansible_host }} {{ groups['linux_desktop'][0] }}"
+    $line = "{{ hostvars[displaymux_inventory_hosts[lan_mouse_server_host]].ansible_host }} {{ displaymux_inventory_hosts[lan_mouse_server_host] }}"
     $content = Get-Content $hosts -ErrorAction SilentlyContinue
     if ($content -notcontains $line) {
       Add-Content $hosts $line
@@ -413,14 +413,40 @@
   register: win_hosts_entry
   changed_when: "'created' in win_hosts_entry.stdout"
 
-- name: Deploy lan-mouse Windows spoke configuration
+- name: Deploy role-selected lan-mouse configuration on Windows
   ansible.windows.win_template:
-    src: templates/spoke-config.toml.j2
+    src: >-
+      {{ 'templates/hub-config.toml.j2'
+         if displaymux_host_role == lan_mouse_server_host
+         else 'templates/spoke-config.toml.j2' }}
     dest: "{{ ansible_facts.env.LOCALAPPDATA }}\\lan-mouse\\config.toml"
-  vars:
-    spoke_position: "{{ win_spoke_position }}"
-    spoke_host: windows
   no_log: true
+
+- name: Ensure selected Windows controller config directory exists
+  ansible.windows.win_file:
+    path: "{{ ansible_facts.env.LOCALAPPDATA }}\\tv-multiview"
+    state: directory
+  when: displaymux_host_role == lan_mouse_server_host
+
+- name: Deploy selected Windows controller configuration
+  ansible.windows.win_template:
+    src: templates/tv-multiview-config.toml.j2
+    dest: "{{ tv_multiview_config_path }}"
+  vars:
+    effective_tv_multiview_client_key_path: >-
+      {{ (tv_multiview_client_key_paths | default({})).get(
+           displaymux_host_role,
+           ((ansible_facts.env.LOCALAPPDATA | replace('\\', '/'))
+             ~ '/lg-buddy/.aiopylgtv.sqlite')
+         ) }}
+  no_log: true
+  when: displaymux_host_role == lan_mouse_server_host
+
+- name: Remove stale Windows controller configuration
+  ansible.windows.win_file:
+    path: "{{ tv_multiview_config_path }}"
+    state: absent
+  when: displaymux_host_role != lan_mouse_server_host
 
 - name: Deploy bounded Windows log wrapper
   ansible.windows.win_template:
@@ -614,23 +640,28 @@
     mode: "0600"
   delegate_to: localhost
 
-- name: Gather Linux hub facts for trust reconciliation
+- name: Gather selected Unix hub facts for trust reconciliation
   ansible.builtin.setup:
-  delegate_to: "{{ groups['linux_desktop'][0] }}"
+  delegate_to: "{{ displaymux_inventory_hosts[lan_mouse_server_host] }}"
   delegate_facts: true
+  when: lan_mouse_server_host in ['linux', 'mac']
 
-- name: Reconcile Windows trust in the Linux hub configuration
+- name: Reconcile Windows trust in the selected Unix hub configuration
   ansible.builtin.template:
     src: templates/hub-config.toml.j2
     dest: >-
-      {{ hostvars[groups['linux_desktop'][0]].ansible_facts.env.HOME
+      {{ hostvars[displaymux_inventory_hosts[lan_mouse_server_host]].ansible_facts.env.HOME
          }}/.config/lan-mouse/config.toml
     mode: "0600"
   vars:
-    windows_fingerprint: "{{ win_certificate_fingerprint.stdout | trim }}"
+    displaymux_host_fingerprints:
+      linux: "{{ hub_fingerprint }}"
+      mac: "{{ mac_fingerprint }}"
+      windows: "{{ win_certificate_fingerprint.stdout | trim }}"
   register: reconciled_hub_config
   no_log: true
-  delegate_to: "{{ groups['linux_desktop'][0] }}"
+  delegate_to: "{{ displaymux_inventory_hosts[lan_mouse_server_host] }}"
+  when: lan_mouse_server_host in ['linux', 'mac']
 
 - name: Restore managed HDMI2 route in the Linux TV controller configuration
   ansible.builtin.template:
@@ -646,6 +677,7 @@
   register: reconciled_tv_config
   no_log: true
   delegate_to: "{{ groups['linux_desktop'][0] }}"
+  when: lan_mouse_server_host == 'linux'
 
 - name: Restart changed Linux TV controller configuration
   ansible.builtin.systemd:
@@ -655,7 +687,9 @@
   environment:
     XDG_RUNTIME_DIR: >-
       /run/user/{{ hostvars[groups['linux_desktop'][0]].ansible_facts.user_uid }}
-  when: reconciled_tv_config.changed
+  when:
+    - lan_mouse_server_host == 'linux'
+    - reconciled_tv_config.changed | default(false)
   delegate_to: "{{ groups['linux_desktop'][0] }}"
 
 - name: Restart changed Linux Lan Mouse trust configuration
@@ -666,22 +700,136 @@
   environment:
     XDG_RUNTIME_DIR: >-
       /run/user/{{ hostvars[groups['linux_desktop'][0]].ansible_facts.user_uid }}
-  when: reconciled_hub_config.changed
+  when:
+    - lan_mouse_server_host == 'linux'
+    - reconciled_hub_config.changed | default(false)
   delegate_to: "{{ groups['linux_desktop'][0] }}"
 
-- name: Wait for authenticated Windows connection to the Linux hub
+- name: Reload changed macOS hub trust configuration
+  ansible.builtin.command:
+    argv:
+      - launchctl
+      - unload
+      - "{{ hostvars[displaymux_inventory_hosts['mac']].ansible_facts.env.HOME }}/Library/LaunchAgents/com.feschber.lan-mouse.plist"
+  failed_when: false
+  changed_when: true
+  when:
+    - lan_mouse_server_host == 'mac'
+    - reconciled_hub_config.changed | default(false)
+  delegate_to: "{{ displaymux_inventory_hosts['mac'] }}"
+
+- name: Load changed macOS hub trust configuration
+  ansible.builtin.command:
+    argv:
+      - launchctl
+      - load
+      - -w
+      - "{{ hostvars[displaymux_inventory_hosts['mac']].ansible_facts.env.HOME }}/Library/LaunchAgents/com.feschber.lan-mouse.plist"
+  changed_when: true
+  when:
+    - lan_mouse_server_host == 'mac'
+    - reconciled_hub_config.changed | default(false)
+  delegate_to: "{{ displaymux_inventory_hosts['mac'] }}"
+
+- name: Gather Unix spoke facts for a Windows hub
+  ansible.builtin.setup:
+  loop:
+    - "{{ displaymux_inventory_hosts['linux'] }}"
+    - "{{ displaymux_inventory_hosts['mac'] }}"
+  delegate_to: "{{ item }}"
+  delegate_facts: true
+  when: lan_mouse_server_host == 'windows'
+
+- name: Reconcile Windows hub trust in the Linux spoke configuration
+  ansible.builtin.template:
+    src: templates/spoke-config.toml.j2
+    dest: >-
+      {{ hostvars[displaymux_inventory_hosts['linux']].ansible_facts.env.HOME
+         }}/.config/lan-mouse/config.toml
+    mode: "0600"
+  vars:
+    displaymux_host_role: linux
+    displaymux_host_fingerprints:
+      linux: "{{ hub_fingerprint }}"
+      mac: "{{ mac_fingerprint }}"
+      windows: "{{ win_certificate_fingerprint.stdout | trim }}"
+  register: reconciled_linux_spoke_config
+  no_log: true
+  delegate_to: "{{ displaymux_inventory_hosts['linux'] }}"
+  when: lan_mouse_server_host == 'windows'
+
+- name: Reconcile Windows hub trust in the macOS spoke configuration
+  ansible.builtin.template:
+    src: templates/spoke-config.toml.j2
+    dest: >-
+      {{ hostvars[displaymux_inventory_hosts['mac']].ansible_facts.env.HOME
+         }}/.config/lan-mouse/config.toml
+    mode: "0600"
+  vars:
+    displaymux_host_role: mac
+    displaymux_host_fingerprints:
+      linux: "{{ hub_fingerprint }}"
+      mac: "{{ mac_fingerprint }}"
+      windows: "{{ win_certificate_fingerprint.stdout | trim }}"
+  register: reconciled_mac_spoke_config
+  no_log: true
+  delegate_to: "{{ displaymux_inventory_hosts['mac'] }}"
+  when: lan_mouse_server_host == 'windows'
+
+- name: Restart changed Linux spoke trust configuration
+  ansible.builtin.systemd:
+    name: lan-mouse.service
+    scope: user
+    state: restarted
+  environment:
+    XDG_RUNTIME_DIR: >-
+      /run/user/{{ hostvars[displaymux_inventory_hosts['linux']].ansible_facts.user_uid }}
+  when:
+    - lan_mouse_server_host == 'windows'
+    - reconciled_linux_spoke_config.changed | default(false)
+  delegate_to: "{{ displaymux_inventory_hosts['linux'] }}"
+
+- name: Unload changed macOS spoke trust configuration
+  ansible.builtin.command:
+    argv:
+      - launchctl
+      - unload
+      - "{{ hostvars[displaymux_inventory_hosts['mac']].ansible_facts.env.HOME }}/Library/LaunchAgents/com.feschber.lan-mouse.plist"
+  failed_when: false
+  changed_when: true
+  when:
+    - lan_mouse_server_host == 'windows'
+    - reconciled_mac_spoke_config.changed | default(false)
+  delegate_to: "{{ displaymux_inventory_hosts['mac'] }}"
+
+- name: Load changed macOS spoke trust configuration
+  ansible.builtin.command:
+    argv:
+      - launchctl
+      - load
+      - -w
+      - "{{ hostvars[displaymux_inventory_hosts['mac']].ansible_facts.env.HOME }}/Library/LaunchAgents/com.feschber.lan-mouse.plist"
+  changed_when: true
+  when:
+    - lan_mouse_server_host == 'windows'
+    - reconciled_mac_spoke_config.changed | default(false)
+  delegate_to: "{{ displaymux_inventory_hosts['mac'] }}"
+
+- name: Wait for authenticated Windows connection to the configured hub
   ansible.windows.win_shell: |
     $clients = & "{{ win_installed_binary }}" cli list --json | ConvertFrom-Json
     if ($LASTEXITCODE -ne 0) { throw "Lan Mouse status exited with code $LASTEXITCODE" }
-    $linux = $clients | Where-Object { $_.hostname -eq "{{ groups['linux_desktop'][0] }}" }
-    if (-not $linux -or -not $linux.alive) {
-      throw 'Windows Lan Mouse is not connected to the Linux hub'
+    $hub = $clients | Where-Object { $_.hostname -eq "{{ displaymux_inventory_hosts[lan_mouse_server_host] }}" }
+    if (-not $hub -or -not $hub.alive) {
+      throw 'Windows Lan Mouse is not connected to the configured hub'
     }
   register: win_hub_connection
   retries: 20
   delay: 1
   until: win_hub_connection.rc == 0
-  when: win_interactive_desktop_available
+  when:
+    - win_interactive_desktop_available
+    - displaymux_host_role != lan_mouse_server_host
   changed_when: false
 
 - name: Remove obsolete per-user Windows installation after replacement

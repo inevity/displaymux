@@ -16,7 +16,7 @@ lan_mouse_windows_build_cache: "{{ lan_mouse_windows_root }}\\build"
 lan_mouse_windows_msvc_dir: "{{ lan_mouse_windows_build_cache }}\\msvc"
 lan_mouse_linux_features: "layer_shell_capture,libei_capture,x11_capture,wlroots_emulation,libei_emulation,x11_emulation,rdp_emulation"
 lan_mouse_log_filter: "lan_mouse=info,lan_mouse::clipboard=debug,lan_mouse::clipboard_transport=debug,lan_mouse_clipboard=debug"
-lan_mouse_server_host: linux
+lan_mouse_server_host: linux  # linux|mac|windows; selects hub/controller configs
 lan_mouse_emulation_displays:
   linux: "REPLACE_LINUX_DISPLAY_NAME"
   mac: "REPLACE_MACOS_DISPLAY_NAME"
@@ -35,11 +35,14 @@ lan_mouse_log_backups: 5
 lan_mouse_controller_token_file: "{{ lookup('env', 'HOME') }}/.local/state/lan-mouse-deploy/controller-token"
 lan_mouse_windows_fingerprint_file: "{{ lan_mouse_windows_root }}\\peer-fingerprints.toml"
 
-# tv-multiview runs only on the Linux controller host.
+# Display-controller configuration.
 tv_ip: "REPLACE_TV_ADDRESS"
 daemon_port: 8765
 tv_multiview_log_level: info  # debug|info|warn|error|trace
-tv_multiview_client_key_path: "{{ ansible_facts.env.HOME }}/.config/lg-buddy/.aiopylgtv.sqlite"
+tv_multiview_client_key_paths:
+  linux: "/home/REPLACE_LINUX_USER/.config/lg-buddy/.aiopylgtv.sqlite"
+  mac: "/Users/REPLACE_MACOS_USER/.config/lg-buddy/.aiopylgtv.sqlite"
+  windows: "C:/Users/REPLACE_WINDOWS_USER/AppData/Local/lg-buddy/.aiopylgtv.sqlite"
 tv_multiview_command_timeout_ms: 10000
 tv_multiview_observation_timeout_ms: 5000
 tv_multiview_grant_timeout_ms: 5000
@@ -53,9 +56,18 @@ tv_inputs:
   mac: REPLACE_MACOS_TV_INPUT
   windows: REPLACE_WINDOWS_TV_INPUT
 
-# Position of the Linux controller relative to each spoke.
-mac_spoke_position: left
-win_spoke_position: right
+# Pairwise edge used to reach each possible peer. Changing only
+# lan_mouse_server_host selects the matching hub row and inverse spoke entries.
+lan_mouse_host_positions:
+  linux:
+    mac: right
+    windows: left
+  mac:
+    linux: left
+    windows: right
+  windows:
+    linux: right
+    mac: left
 
 # Wake-on-LAN addresses.
 mac_mac_address: "REPLACE_MACOS_MAC_ADDRESS"
