@@ -22,7 +22,9 @@ remote-input readiness transition.
 
 ## Build And Test
 
-The repository is one Cargo workspace with one lockfile:
+The repository is one Cargo workspace with one lockfile. Rustup reads the root
+`rust-toolchain.toml` and installs the pinned Rust toolchain and required
+components:
 
 ```bash
 cargo check --locked --workspace

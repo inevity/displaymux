@@ -6,7 +6,7 @@ lan_mouse_repo_url: "https://github.com/OWNER/osswitch.git"
 lan_mouse_install_method: native_build  # native_build|github_release
 lan_mouse_github_repository: "OWNER/osswitch"
 lan_mouse_github_release_tag: latest  # latest or an immutable release tag
-lan_mouse_rust_toolchain: stable
+lan_mouse_rust_toolchain: "1.95.0"
 lan_mouse_macos_build_profile: debug  # debug|release
 lan_mouse_macos_codesign_identity: "Lan Mouse Local Code Signing"
 lan_mouse_macos_codesign_identifier: "org.example.lan-mouse"

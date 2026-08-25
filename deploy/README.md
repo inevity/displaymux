@@ -28,6 +28,8 @@ cp group_vars/all.example.yml group_vars/all.yml
 - `inventory.ini` contains real hostnames, addresses, and users.
 - `group_vars/all.yml` contains the TV address, input mapping, server host,
   fingerprints, controller timeouts, install method, and native build features.
+- Keep `lan_mouse_rust_toolchain` aligned with the version pinned by the root
+  `rust-toolchain.toml` so native builds and release builds use the same compiler.
 - Windows SSH credentials — keep them in Ansible Vault or pass them as extra
   variables instead of committing new plaintext credentials.
 - Native-build mode uses the osswitch repository containing this `deploy/`

@@ -57,7 +57,7 @@ jobs:
             if [[ -n "$base" ]]; then
               while IFS= read -r path; do
                 case "$path" in
-                  Cargo.toml|Cargo.lock|lan-mouse/*|tv-multiview/*|.github/workflows/*)
+                  Cargo.toml|Cargo.lock|rust-toolchain.toml|lan-mouse/*|tv-multiview/*|.github/workflows/*)
                     rust=true
                     ;;
                 esac
