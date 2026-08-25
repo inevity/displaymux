@@ -5,11 +5,9 @@ It maintains the device-specific display session, observes display state and
 signal presence, coordinates two-phase Lan Mouse switch requests, and converges
 failures to the configured Lan Mouse server host.
 
-The architecture colocates the daemon with that configured hub/server host; it
-does not define Linux as the permanent controller owner. The current deployment
-and release workflow package the display-controller service only for Linux.
-Display-controller service integration on macOS and Windows is not yet
-packaged.
+The current deployment packages the display-controller service only for Linux.
+Display-controller archives are available for macOS and Windows, but managed
+service integration is not yet provided on those platforms.
 
 ## Current display support
 

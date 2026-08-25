@@ -2,12 +2,6 @@
 
 ## Aim and scope
 
-The controller host is a configured role. It must not be selected by operating
-system: `tv-multiview` belongs on the configured Lan Mouse hub/server host,
-whether that host runs Linux, macOS, or Windows. The current task implementation
-below supports the controller service only on Linux; completing the macOS and
-Windows service paths is a known implementation gap.
-
 This Ansible playbook deploys the current three-host DisplayMux topology. It
 installs a no-GTK Lan Mouse daemon on the Linux hub and the macOS and Windows
 peers, installs `tv-multiview` on the Linux controller host, renders the
@@ -26,8 +20,7 @@ Release mode deploys no-GTK Lan Mouse on Linux x86_64/ARM64, macOS
 Intel/Apple Silicon, and Windows x86_64. It deploys `tv-multiview` only on the
 Linux x86_64 controller. The Windows and macOS controller archives are
 published for manual use but are not yet installed or supervised by this
-playbook. That limitation does not change controller-role ownership in the
-deployment model.
+playbook.
 
 ## Before running
 
