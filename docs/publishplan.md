@@ -69,9 +69,9 @@ Open external values required before publication:
    head.
 7. The existing GTK Lan Mouse application remains the default-feature build.
    No-GTK native assets remain additional release artifacts.
-8. `tv-multiview` initially publishes only the Linux archive used by its current
-   service deployment. Windows and macOS controller assets are deferred until
-   controller service integration exists on those systems.
+8. `tv-multiview` publishes native archives for Linux x86_64, Windows x86_64,
+   macOS Intel, and macOS Apple Silicon. Linux remains the only platform with
+   completed controller service deployment and live validation.
 9. Deployment publishes no binary archive. It is versioned source contained in
    every repository tag.
 10. Native-build and GitHub-release deployment remain two supported choices.
@@ -398,7 +398,7 @@ successful secret scan does not prove artifact compatibility.
 - Preserving secret or machine-specific historical blob contents
 - Combining all Rust packages into one package
 - Rewriting Lan Mouse internal crate APIs solely for repository layout
-- Adding Windows or macOS `tv-multiview` services or release assets
+- Adding Windows or macOS `tv-multiview` services
 - Publishing deployment as a binary, container, package, or archive
 - Adding installers, package-manager repositories, code notarization, SBOMs, or
   artifact signing in the first publication

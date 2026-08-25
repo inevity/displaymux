@@ -26,6 +26,9 @@ EXPECTED_ASSETS = frozenset(
         "lan-mouse-no-gtk-macos-x86_64.zip",
         "lan-mouse-no-gtk-macos-aarch64.zip",
         "tv-multiview-linux-x86_64.tar.gz",
+        "tv-multiview-windows-x86_64.zip",
+        "tv-multiview-macos-x86_64.zip",
+        "tv-multiview-macos-aarch64.zip",
     }
 )
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")

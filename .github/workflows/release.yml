@@ -323,7 +323,23 @@ jobs:
 
   tv-multiview:
     needs: release-inputs
-    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            artifact: tv-multiview-linux-x86_64
+            archive: tv-multiview-linux-x86_64.tar.gz
+          - runner: windows-2025
+            artifact: tv-multiview-windows-x86_64
+            archive: tv-multiview-windows-x86_64.zip
+          - runner: macos-15-intel
+            artifact: tv-multiview-macos-x86_64
+            archive: tv-multiview-macos-x86_64.zip
+          - runner: macos-15
+            artifact: tv-multiview-macos-aarch64
+            archive: tv-multiview-macos-aarch64.zip
+    runs-on: ${{ matrix.runner }}
     steps:
       - name: Check out the release commit
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -331,24 +347,45 @@ jobs:
           ref: ${{ needs.release-inputs.outputs.commit }}
           persist-credentials: false
       - name: Verify checked-out commit
+        shell: bash
         run: test "$(git rev-parse HEAD)" = '${{ needs.release-inputs.outputs.commit }}'
       - name: Test controller
         run: cargo test --locked -p tv-multiview
       - name: Build controller
         run: cargo build --locked --release -p tv-multiview
-      - name: Package controller archive
+      - name: Package controller Linux archive
+        if: runner.os == 'Linux'
         run: |
-          stage=tv-multiview-linux-x86_64
+          stage='${{ matrix.artifact }}'
           mkdir "$stage"
           cp target/release/tv-multiview "$stage/tv-multiview"
           cp LICENSE "$stage/LICENSE"
           cp tv-multiview/README.md "$stage/README.md"
-          tar -czf "$stage.tar.gz" "$stage"
+          tar -czf '${{ matrix.archive }}' "$stage"
+      - name: Package controller Windows archive
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $stage = '${{ matrix.artifact }}'
+          New-Item -ItemType Directory -Path $stage
+          Copy-Item 'target\release\tv-multiview.exe' "$stage\tv-multiview.exe"
+          Copy-Item 'LICENSE' "$stage\LICENSE"
+          Copy-Item 'tv-multiview\README.md' "$stage\README.md"
+          Compress-Archive -Path "$stage\*" -DestinationPath '${{ matrix.archive }}'
+      - name: Package controller macOS archive
+        if: runner.os == 'macOS'
+        run: |
+          stage='${{ matrix.artifact }}'
+          mkdir "$stage"
+          cp target/release/tv-multiview "$stage/tv-multiview"
+          cp LICENSE "$stage/LICENSE"
+          cp tv-multiview/README.md "$stage/README.md"
+          zip -r '${{ matrix.archive }}' "$stage"
       - name: Upload controller archive
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: tv-multiview-linux-x86_64
-          path: tv-multiview-linux-x86_64.tar.gz
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.archive }}
           if-no-files-found: error
 
   publish-draft:

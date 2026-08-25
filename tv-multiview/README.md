@@ -20,19 +20,22 @@ packaged.
   paths are implemented.
 - Native controller check/test jobs are configured for Windows x86_64, macOS
   Intel, and macOS Apple Silicon.
+- Native controller release archives are configured for Linux x86_64, Windows
+  x86_64, macOS Intel, and macOS Apple Silicon.
 
 ## Controller-platform implementation progress
 
 - [x] Add native macOS display-controller CI builds and tests.
-- [ ] Add macOS display-controller service supervision, release assets, and live
-  validation.
+- [x] Add native macOS display-controller release assets.
+- [ ] Add macOS display-controller service supervision and live validation.
 - [x] Add native Windows display-controller CI builds and tests.
-- [ ] Add Windows display-controller service supervision, release assets, and
-  live validation.
+- [x] Add native Windows display-controller release assets.
+- [ ] Add Windows display-controller service supervision and live validation.
 
-Until this work is complete, macOS and Windows are Lan Mouse peer platforms but
-not completed display-controller platforms. This is an implementation gap, not
-an architectural restriction.
+The macOS and Windows controller packages are available for manual use, but
+those operating systems are not completed display-controller platforms until
+their service supervision and live validation work is complete. This is an
+implementation gap, not an architectural restriction.
 
 Build and test it from the repository root:
 

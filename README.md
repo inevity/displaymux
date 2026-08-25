@@ -91,18 +91,21 @@ support:
   deployment.
 - **Native controller CI:** configured for Linux x86_64, Windows x86_64, macOS
   Intel, and macOS Apple Silicon.
+- **Native controller release packages:** configured for Linux x86_64, Windows
+  x86_64, macOS Intel, and macOS Apple Silicon.
 
 Controller-platform implementation progress:
 
 - [x] Add native macOS `tv-multiview` CI builds and tests.
-- [ ] Add macOS display-controller service supervision, release assets, and live
-  validation.
+- [x] Add native macOS `tv-multiview` release assets.
+- [ ] Add macOS display-controller service supervision and live validation.
 - [x] Add native Windows `tv-multiview` CI builds and tests.
-- [ ] Add Windows display-controller service supervision, release assets, and
-  live validation.
+- [x] Add native Windows `tv-multiview` release assets.
+- [ ] Add Windows display-controller service supervision and live validation.
 
-Until these TODOs are complete, macOS and Windows operate as Lan Mouse peers
-but are not completed display-controller platforms.
+The macOS and Windows controller packages are available for manual use, but
+those operating systems are not completed display-controller platforms until
+their service supervision and live validation TODOs are complete.
 
 ## Usage
 
