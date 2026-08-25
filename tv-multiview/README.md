@@ -10,6 +10,16 @@ does not define Linux as the permanent controller owner. The current deployment
 and release workflow package the controller service only for Linux. Controller
 service integration on macOS and Windows is not yet packaged.
 
+## Current support
+
+- TV support is currently limited to LG OLED webOS televisions with multiple
+  HDMI inputs and the required SSAP capabilities.
+- Linux controller build, test, release, systemd deployment, and runtime paths
+  are implemented.
+- macOS and Windows controller operation is not currently supported: native CI,
+  release artifacts, service supervision, and live validation are still
+  missing. This is an implementation gap, not an architectural restriction.
+
 Build and test it from the repository root:
 
 ```bash

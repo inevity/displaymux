@@ -2,7 +2,7 @@
 
 Osswitch coordinates keyboard, pointer, clipboard, and a shared LG WebOS
 display as one host-switch transaction. It combines a generalized Lan Mouse
-fork with a Linux TV controller and native deployment automation.
+fork with a TV controller daemon and native deployment automation.
 
 ## Capabilities
 
@@ -71,6 +71,27 @@ hub/server host; controller ownership is not intrinsically tied to Linux. The
 current deployment selects Linux as that server and currently packages the
 controller service only for Linux. macOS and Windows controller service/release
 integration remains separate from the architecture.
+
+## Current Scope and Implementation Status
+
+TV integration currently supports LG OLED webOS televisions that expose
+multiple HDMI inputs through SSAP. Other TV brands, non-webOS LG televisions,
+and displays without the required HDMI/SSAP capabilities are not currently
+supported.
+
+`tv-multiview` controller progress is distinct from Lan Mouse peer support:
+
+- **Linux controller:** implemented, built and tested in CI, packaged as the
+  current controller release asset, and integrated with systemd deployment.
+- **macOS controller:** the architecture does not forbid it, but there is no
+  macOS controller CI job, release asset, service integration, or live runtime
+  validation yet.
+- **Windows controller:** the source contains a non-Unix runtime path, but there
+  is no Windows controller CI job, release asset, service integration, or live
+  runtime validation yet.
+
+Therefore macOS and Windows are currently supported as Lan Mouse peers, not as
+completed `tv-multiview` controller platforms.
 
 ## Build and Test
 
