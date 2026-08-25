@@ -99,7 +99,14 @@ jobs:
       - name: Validate workspace metadata and lockfile
         run: |
           test "$(find . -path ./target -prune -o -name Cargo.lock -print | wc -l)" -eq 1
-          test "$(rg --glob Cargo.toml '^\[workspace\]$' | wc -l)" -eq 1
+          workspace_count="$(
+            find . \
+              -path ./.git -prune -o \
+              -path ./target -prune -o \
+              -name Cargo.toml -exec grep -l '^\[workspace\]$' {} + \
+              | wc -l
+          )"
+          test "$workspace_count" -eq 1
           cargo metadata --locked --no-deps --format-version 1 >/dev/null
       - name: Check the root workspace
         run: cargo check --locked --workspace
