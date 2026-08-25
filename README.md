@@ -120,11 +120,16 @@ the archive if the values differ.
 
 ### 2. Install a `.tar.gz` archive
 
-After validation, extract the archive into your chosen installation directory.
+After validation, extract the archive. On Linux, `/usr/local/bin` is the
+suggested destination for a standalone executable; install any included Debian
+package or AppImage using its normal system location.
 
 ### 3. Install a `.zip` archive
 
-After validation, extract the archive into your chosen installation directory.
+After validation, extract the archive. On macOS, use `/usr/local/bin` for a
+standalone executable or `/Applications` for an application bundle. On Windows,
+use `%LOCALAPPDATA%\DisplayMux\<component>` and keep bundled DLL files beside
+the executable.
 
 ### 4. Configure Lan Mouse
 
