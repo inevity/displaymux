@@ -7,17 +7,16 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Existing v-prefixed tag to build
+        description: Existing staging-prefixed tag to build
         required: true
         type: string
-      prerelease:
-        description: Publish as a prerelease
-        required: true
-        default: true
-        type: boolean
 
 permissions:
   contents: read
+
+concurrency:
+  group: release-${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+  cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
@@ -40,25 +39,25 @@ jobs:
         shell: bash
         env:
           EVENT_NAME: ${{ github.event_name }}
+          EVENT_REF: ${{ github.ref }}
           EVENT_TAG: ${{ github.ref_name }}
           EVENT_SHA: ${{ github.sha }}
           INPUT_TAG: ${{ inputs.tag }}
-          INPUT_PRERELEASE: ${{ inputs.prerelease }}
         run: |
           if [[ "$EVENT_NAME" == push ]]; then
             tag="$EVENT_TAG"
             prerelease=false
+            [[ "$tag" == v* ]]
           else
             tag="$INPUT_TAG"
-            prerelease="$INPUT_PRERELEASE"
+            prerelease=true
+            [[ "$tag" == staging-* ]]
           fi
-          [[ "$tag" == v* ]]
+          test "$EVENT_REF" = "refs/tags/$tag"
           git show-ref --verify --quiet "refs/tags/$tag"
           commit="$(git rev-list -n 1 "refs/tags/$tag")"
           [[ "$commit" =~ ^[0-9a-f]{40}$ ]]
-          if [[ "$EVENT_NAME" == push ]]; then
-            test "$commit" = "$EVENT_SHA"
-          fi
+          test "$commit" = "$EVENT_SHA"
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "commit=$commit" >> "$GITHUB_OUTPUT"
           echo "prerelease=$prerelease" >> "$GITHUB_OUTPUT"
