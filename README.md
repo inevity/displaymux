@@ -66,6 +66,7 @@ transition.
 | Lan Mouse no-GTK service | Yes | Yes | Yes |
 | Clipboard transport | Yes | Yes | Yes |
 | Native `tv-multiview` CI | Yes | Configured | Configured |
+| Native `tv-multiview` release archive | Yes | Yes | Yes |
 | Packaged `tv-multiview` service | Yes | Not yet | Not yet |
 | Native Ansible deployment | Yes | Yes | Yes |
 
@@ -73,7 +74,8 @@ The architecture colocates `tv-multiview` with the configured Lan Mouse
 hub/server host; controller ownership is not intrinsically tied to Linux. The
 current deployment selects Linux as that server and currently packages the
 display-controller service only for Linux. macOS and Windows display-controller
-service/release integration remains separate from the architecture.
+service integration remains separate from their portable release archives and
+from the architecture.
 
 ## Current Display Support and Implementation Status
 
@@ -109,7 +111,136 @@ their service supervision and live validation TODOs are complete.
 
 ## Usage
 
-### 1. Configure Lan Mouse
+### 1. Download and validate a release archive
+
+Always download one explicit release tag and validate the archive before
+extracting it. On Linux or macOS, install GitHub CLI and `jq`, then replace the
+tag and asset below:
+
+```bash
+TAG='REPLACE_WITH_RELEASE_TAG'
+ASSET='REPLACE_WITH_ASSET_FILENAME'
+DOWNLOAD_DIR='displaymux-release'
+
+mkdir -p "$DOWNLOAD_DIR"
+gh release download "$TAG" \
+  --repo inevity/displaymux \
+  --pattern "$ASSET" \
+  --pattern osswitch-release-manifest.json \
+  --dir "$DOWNLOAD_DIR"
+cd "$DOWNLOAD_DIR"
+
+jq -e \
+  --arg repository 'inevity/displaymux' \
+  --arg tag "$TAG" \
+  '.repository == $repository and .tag == $tag' \
+  osswitch-release-manifest.json >/dev/null
+jq -er \
+  --arg asset "$ASSET" \
+  '.assets[] | select(.name == $asset) | "\(.sha256)  \(.name)"' \
+  osswitch-release-manifest.json > "$ASSET.sha256"
+
+case "$(uname -s)" in
+  Linux)  sha256sum -c "$ASSET.sha256" ;;
+  Darwin) shasum -a 256 -c "$ASSET.sha256" ;;
+  *)      echo 'unsupported verification host' >&2; exit 1 ;;
+esac
+```
+
+On Windows, use PowerShell after installing GitHub CLI:
+
+```powershell
+$Tag = 'REPLACE_WITH_RELEASE_TAG'
+$Asset = 'REPLACE_WITH_ASSET_FILENAME'
+$DownloadDir = Join-Path $PWD 'displaymux-release'
+
+New-Item -ItemType Directory -Force -Path $DownloadDir | Out-Null
+gh release download $Tag `
+  --repo inevity/displaymux `
+  --pattern $Asset `
+  --pattern osswitch-release-manifest.json `
+  --dir $DownloadDir
+
+$ManifestPath = Join-Path $DownloadDir 'osswitch-release-manifest.json'
+$Manifest = Get-Content -LiteralPath $ManifestPath -Raw | ConvertFrom-Json
+if ($Manifest.repository -ne 'inevity/displaymux' -or $Manifest.tag -ne $Tag) {
+    throw 'release manifest identity mismatch'
+}
+$Entries = @($Manifest.assets | Where-Object { $_.name -eq $Asset })
+if ($Entries.Count -ne 1) {
+    throw 'selected asset is absent or duplicated in the release manifest'
+}
+$ArchivePath = Join-Path $DownloadDir $Asset
+$ActualHash = (Get-FileHash -LiteralPath $ArchivePath -Algorithm SHA256).Hash.ToLowerInvariant()
+if ($ActualHash -ne $Entries[0].sha256) {
+    throw 'release archive SHA-256 mismatch'
+}
+```
+
+The manifest binds the release tag and commit to every expected asset name,
+byte size, and SHA-256 digest. It detects incomplete, mixed, or corrupted
+downloads; it is not a code-signing or notarization signature.
+
+### 2. Install a `.tar.gz` archive
+
+Linux `.tar.gz` archives extract into a directory named after the archive.
+Validate first, then extract it and install the executable it contains:
+
+```bash
+ARCHIVE='REPLACE_WITH_ARCHIVE.tar.gz'
+PAYLOAD="${ARCHIVE%.tar.gz}"
+COMMAND='REPLACE_WITH_BINARY_NAME'
+
+tar -xzf "$ARCHIVE"
+sudo install -Dm0755 "$PAYLOAD/$COMMAND" "/usr/local/bin/$COMMAND"
+```
+
+If the extracted payload contains a Debian package or AppImage, install or
+enable that package instead of copying the standalone binary:
+
+```bash
+sudo apt install "./$PAYLOAD/"*.deb
+chmod +x "$PAYLOAD/"*.AppImage
+```
+
+### 3. Install a `.zip` archive
+
+On macOS, `.zip` archives extract into a directory named after the archive.
+Install a command-line executable into a command directory, or copy an
+application bundle into `/Applications`:
+
+```bash
+ARCHIVE='REPLACE_WITH_ARCHIVE.zip'
+PAYLOAD="${ARCHIVE%.zip}"
+COMMAND='REPLACE_WITH_BINARY_NAME'
+
+unzip "$ARCHIVE"
+sudo install -d /usr/local/bin
+sudo install -m 0755 "$PAYLOAD/$COMMAND" "/usr/local/bin/$COMMAND"
+
+# Application-bundle alternative:
+cp -R "$PAYLOAD/REPLACE_WITH_APPLICATION.app" /Applications/
+```
+
+Windows `.zip` files store their payload at the archive root. Extract each
+archive into its own installation directory. Keep all DLL files beside the
+executable:
+
+```powershell
+$Asset = 'REPLACE_WITH_ARCHIVE.zip'
+$DownloadDir = Join-Path $PWD 'displaymux-release'
+$PackageName = [IO.Path]::GetFileNameWithoutExtension($Asset)
+$InstallDir = Join-Path $env:LOCALAPPDATA "DisplayMux\$PackageName"
+
+New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
+Expand-Archive `
+  -LiteralPath (Join-Path $DownloadDir $Asset) `
+  -DestinationPath $InstallDir `
+  -Force
+& (Join-Path $InstallDir 'REPLACE_WITH_EXECUTABLE.exe')
+```
+
+### 4. Configure Lan Mouse
 
 Lan Mouse reads `config.toml` from these default locations:
 
@@ -215,7 +346,7 @@ lan-mouse daemon
 The Ansible deployment under [`deploy/`](deploy/README.md) renders these files
 from sanitized inventory and group-variable examples when managing all hosts.
 
-### 2. Move between hosts
+### 5. Move between hosts
 
 With the example layout:
 
