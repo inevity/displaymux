@@ -141,7 +141,7 @@ jobs:
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: C:\gtk-build\gtk\x64\release\**
-          key: gvsbuild-2026.6.0-vs18-gtk4-libadwaita-librsvg
+          key: gvsbuild-2026.6.0-vs2026-gtk4-libadwaita-librsvg
       - name: Build Windows GTK dependencies
         if: steps.gtk-cache.outputs.cache-hit != 'true'
         shell: pwsh
@@ -149,7 +149,7 @@ jobs:
           python -m pip install --disable-pip-version-check gvsbuild==2026.6.0
           Move-Item 'C:\Program Files\Git\usr\bin' 'C:\Program Files\Git\usr\notbin'
           Move-Item 'C:\Program Files\Git\bin' 'C:\Program Files\Git\notbin'
-          gvsbuild build --msys-dir=C:\msys64 --vs-ver 18 gtk4 libadwaita librsvg
+          gvsbuild build --msys-dir=C:\msys64 --vs-ver vs2026 gtk4 libadwaita librsvg
           Move-Item 'C:\Program Files\Git\usr\notbin' 'C:\Program Files\Git\usr\bin'
           Move-Item 'C:\Program Files\Git\notbin' 'C:\Program Files\Git\bin'
       - name: Configure Windows GTK environment
